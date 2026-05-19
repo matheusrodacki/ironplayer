@@ -11,6 +11,7 @@ pub mod error;
 pub mod packet;
 pub mod pcr;
 pub mod section;
+pub mod tables;
 
 pub use adaptation::{pcr_to_duration, AdaptationField};
 pub use crc::{crc32_mpeg2, verify_crc32_mpeg2};

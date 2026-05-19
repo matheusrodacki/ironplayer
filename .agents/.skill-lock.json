@@ -1,0 +1,149 @@
+{
+  "version": 2,
+  "skills": {
+    "best-practices": {
+      "name": "best-practices",
+      "source": "local",
+      "contentHash": "2abba650ba22a819e67f8c2fb09d0f5f33a24d66d945ee2ef824751bc97151ce",
+      "installedAt": "2026-05-19T12:10:34.706Z",
+      "updatedAt": "2026-05-19T12:10:34.706Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "codenavi": {
+      "name": "codenavi",
+      "source": "local",
+      "contentHash": "23ac05b7f2d8df8311129d41432eba248bdcf14e9ace3f17c581976f7d888ada",
+      "installedAt": "2026-05-19T12:10:34.715Z",
+      "updatedAt": "2026-05-19T12:10:34.715Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "coding-guidelines": {
+      "name": "coding-guidelines",
+      "source": "local",
+      "contentHash": "28a414c715d3c41aae28a25e2f109813ec3f246f76b5567c1e7d6a128cd289ff",
+      "installedAt": "2026-05-19T12:10:34.720Z",
+      "updatedAt": "2026-05-19T12:10:34.720Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "create-adr": {
+      "name": "create-adr",
+      "source": "local",
+      "contentHash": "47ec663c849e8c1620c6f33a7be0055acdcf838c27ab7c16f44260244b80195a",
+      "installedAt": "2026-05-19T12:10:34.726Z",
+      "updatedAt": "2026-05-19T12:10:34.726Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "create-rfc": {
+      "name": "create-rfc",
+      "source": "local",
+      "contentHash": "3f391b6c4397bb1590bbad511eca95c297dd0467e65385fa28b3724851c42ea8",
+      "installedAt": "2026-05-19T12:10:34.742Z",
+      "updatedAt": "2026-05-19T12:10:34.742Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "docs-writer": {
+      "name": "docs-writer",
+      "source": "local",
+      "contentHash": "c49827c59d2e27d313731dfd36314cfde0e8dbf15be0e8f813d2f8b751546b0c",
+      "installedAt": "2026-05-19T12:10:34.756Z",
+      "updatedAt": "2026-05-19T12:10:34.756Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "security-best-practices": {
+      "name": "security-best-practices",
+      "source": "local",
+      "contentHash": "6fec09f7e43bb297ad6097e13469e85aa5b5d671a839b4f7e7871ef8eaa76c4e",
+      "installedAt": "2026-05-19T12:10:34.776Z",
+      "updatedAt": "2026-05-19T12:10:34.776Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "security-ownership-map": {
+      "name": "security-ownership-map",
+      "source": "local",
+      "contentHash": "d6231f21029bc14fc776dbef909f631a6b39d7d1b46b11b25dbfe51c51dd7141",
+      "installedAt": "2026-05-19T12:10:34.790Z",
+      "updatedAt": "2026-05-19T12:10:34.790Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "skill-architect": {
+      "name": "skill-architect",
+      "source": "local",
+      "contentHash": "349b256153447631c3ed356996c3a62fec52493d07ba75e37b12c458f9fbf6bb",
+      "installedAt": "2026-05-19T12:10:34.801Z",
+      "updatedAt": "2026-05-19T12:10:34.801Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "tactical-ddd": {
+      "name": "tactical-ddd",
+      "source": "local",
+      "contentHash": "c3dfaf45e8cb784f18d9c460c7f005c4ee9dbb430f21ee8af6913bbfea66a75b",
+      "installedAt": "2026-05-19T12:10:34.808Z",
+      "updatedAt": "2026-05-19T12:10:34.808Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "technical-design-doc-creator": {
+      "name": "technical-design-doc-creator",
+      "source": "local",
+      "contentHash": "d05974df076f695f96b4e4c263ad19f2aaffe8ee6248c1b07a634dd9ed0ea51e",
+      "installedAt": "2026-05-19T12:10:34.815Z",
+      "updatedAt": "2026-05-19T12:10:34.815Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    },
+    "tlc-spec-driven": {
+      "name": "tlc-spec-driven",
+      "source": "local",
+      "contentHash": "69867b0e19be1fb556d2e697f0f18f1de0363d1aa2de9d36754d5b107156357c",
+      "installedAt": "2026-05-19T12:10:34.845Z",
+      "updatedAt": "2026-05-19T12:10:34.845Z",
+      "agents": [
+        "github-copilot"
+      ],
+      "method": "copy",
+      "global": false
+    }
+  }
+}

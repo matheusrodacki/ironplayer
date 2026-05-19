@@ -1,0 +1,28 @@
+# ------------------------------------------------------------------------------
+# Rust / Cargo
+# ------------------------------------------------------------------------------
+
+# Diretório onde o Cargo salva os artefatos de compilação (binários, dependências, etc.)
+/target/
+
+# Arquivos de backup gerados pelo formatador oficial (rustfmt)
+**/*.rs.bk
+
+# Arquivos de símbolos de debug gerados no Windows (MSVC)
+*.pdb
+
+# ------------------------------------------------------------------------------
+# Arquivos de Ambiente (Opcional, mas recomendado)
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ------------------------------------------------------------------------------
+# IDEs e Editores (Opcional)
+# ------------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+PRD.md
+progress.txt

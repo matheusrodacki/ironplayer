@@ -8,6 +8,34 @@ crossbeam-channel = "0.5"
 bytes             = "1"
 byteorder         = "1"
 serde             = { version = "1", features = ["derive"] }
+toml              = "0.8"
 tracing           = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow            = "1"
 thiserror         = "2"
+libloading        = "0.8"
+
+[package]
+name    = "ironplayer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ironplayer"
+path = "src/main.rs"
+
+[dependencies]
+serde             = { workspace = true }
+toml              = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow            = { workspace = true }
+crossbeam-channel = { workspace = true }
+bytes             = { workspace = true }
+libloading        = { workspace = true }
+eframe            = "0.29"
+ts                = { path = "crates/ts" }
+net               = { path = "crates/net" }
+
+[dev-dependencies]
+tempfile = "3"

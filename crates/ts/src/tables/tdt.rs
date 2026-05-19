@@ -26,12 +26,7 @@ use super::TableError;
 /// ```
 ///
 /// SPEC-TABLE-006
-pub(crate) fn decode_mjd_bcd(
-    mjd: u16,
-    hh: u8,
-    mm: u8,
-    ss: u8,
-) -> Option<NaiveDateTime> {
+pub(crate) fn decode_mjd_bcd(mjd: u16, hh: u8, mm: u8, ss: u8) -> Option<NaiveDateTime> {
     let mjd_f = mjd as f64;
 
     let y = ((mjd_f - 15078.2) / 365.25).floor() as i64;
@@ -42,13 +37,13 @@ pub(crate) fn decode_mjd_bcd(
         - (m as f64 * 30.6001).floor() as i64;
 
     let k = if m == 14 || m == 15 { 1i64 } else { 0i64 };
-    let year  = (y + k + 1900) as i32;
+    let year = (y + k + 1900) as i32;
     let month = (m - 1 - k * 12) as u32;
-    let day   = d as u32;
+    let day = d as u32;
 
     let hour = bcd_byte(hh)?;
-    let min  = bcd_byte(mm)?;
-    let sec  = bcd_byte(ss)?;
+    let min = bcd_byte(mm)?;
+    let sec = bcd_byte(ss)?;
 
     NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)
 }
@@ -100,29 +95,28 @@ impl Tdt {
         if section.len() < EXPECTED {
             return Err(TableError::InsufficientData {
                 expected: EXPECTED,
-                found:    section.len(),
+                found: section.len(),
             });
         }
 
         if section[0] != 0x70 {
             return Err(TableError::WrongTableId {
                 expected: 0x70,
-                found:    section[0],
+                found: section[0],
             });
         }
 
         let mjd = u16::from_be_bytes([section[3], section[4]]);
-        let hh  = section[5];
-        let mm  = section[6];
-        let ss  = section[7];
+        let hh = section[5];
+        let mm = section[6];
+        let ss = section[7];
 
-        let utc_time = decode_mjd_bcd(mjd, hh, mm, ss)
-            .ok_or(TableError::InsufficientData {
-                // Re-usa InsufficientData como indicador de parse failure;
-                // BCD inválido é tratado como dados malformados.
-                expected: EXPECTED,
-                found:    0,
-            })?;
+        let utc_time = decode_mjd_bcd(mjd, hh, mm, ss).ok_or(TableError::InsufficientData {
+            // Re-usa InsufficientData como indicador de parse failure;
+            // BCD inválido é tratado como dados malformados.
+            expected: EXPECTED,
+            found: 0,
+        })?;
 
         Ok(Tdt { utc_time })
     }
@@ -134,8 +128,7 @@ impl Tdt {
     ///
     /// SPEC-TABLE-006
     pub fn offset_from_system(&self) -> i64 {
-        let unix_epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
-            .expect("data fixa; nunca falha");
+        let unix_epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("data fixa; nunca falha");
         let days = self
             .utc_time
             .date()
@@ -205,8 +198,7 @@ mod tests {
     /// SPEC-TABLE-006
     #[test]
     fn spec_table_006_mjd_decode_known_date() {
-        let dt = decode_mjd_bcd(58626, 0x14, 0x30, 0x45)
-            .expect("deve decodificar data conhecida");
+        let dt = decode_mjd_bcd(58626, 0x14, 0x30, 0x45).expect("deve decodificar data conhecida");
 
         assert_eq!(dt.year(), 2019);
         assert_eq!(dt.month(), 5);
@@ -234,7 +226,10 @@ mod tests {
         let err = Tdt::parse(&data).unwrap_err();
         assert!(matches!(
             err,
-            TableError::WrongTableId { expected: 0x70, found: 0x42 }
+            TableError::WrongTableId {
+                expected: 0x70,
+                found: 0x42
+            }
         ));
     }
 

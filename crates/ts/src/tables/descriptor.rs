@@ -50,8 +50,8 @@ pub enum KnownDescriptor {
     /// SPEC-TABLE-004 · SPEC-TABLE-008b
     Service {
         service_type: u8,
-        provider:     String,
-        name:         String,
+        provider: String,
+        name: String,
     },
 
     /// Tag 0x4D — nome curto e descrição de evento (EIT).
@@ -67,9 +67,9 @@ pub enum KnownDescriptor {
     ///
     /// SPEC-TABLE-003
     SatelliteDelivery {
-        frequency_hz:  u64,
-        polarization:  Polarization,
-        symbol_rate:   u32,
+        frequency_hz: u64,
+        polarization: Polarization,
+        symbol_rate: u32,
     },
 
     /// Tag 0x44 — entrega via cabo.
@@ -77,8 +77,8 @@ pub enum KnownDescriptor {
     /// SPEC-TABLE-003
     CableDelivery {
         frequency_hz: u64,
-        modulation:   u8,
-        symbol_rate:  u32,
+        modulation: u8,
+        symbol_rate: u32,
     },
 
     /// Tag 0x5A — entrega terrestre.
@@ -86,7 +86,7 @@ pub enum KnownDescriptor {
     /// SPEC-TABLE-003
     TerrestrialDelivery {
         centre_frequency_hz: u64,
-        bandwidth_hz:        u32,
+        bandwidth_hz: u32,
     },
 
     /// Descriptor desconhecido — carrega tag e dados brutos.
@@ -117,7 +117,10 @@ impl Descriptor {
     ///
     /// SPEC-TABLE-008
     pub fn new(tag: u8, data: impl Into<Bytes>) -> Self {
-        Self { tag, data: data.into() }
+        Self {
+            tag,
+            data: data.into(),
+        }
     }
 
     /// Lê uma lista de descriptors de um slice, retornando quantos foram
@@ -196,7 +199,11 @@ impl Descriptor {
                 // symbol_rate: 7 BCD digits (28 bits) → 100 sym/s units
                 let sr_bcd = u32::from_be_bytes([data[7], data[8], data[9], data[10]]) >> 4;
                 let symbol_rate = (bcd32_to_u64(sr_bcd) * 100) as u32;
-                KnownDescriptor::SatelliteDelivery { frequency_hz, polarization, symbol_rate }
+                KnownDescriptor::SatelliteDelivery {
+                    frequency_hz,
+                    polarization,
+                    symbol_rate,
+                }
             }
 
             // ── 0x44: CableDeliverySystem ────────────────────────────────
@@ -212,7 +219,11 @@ impl Descriptor {
                 // symbol_rate: 7 BCD digits (28 bits) → 100 sym/s
                 let sr_bcd = u32::from_be_bytes([data[7], data[8], data[9], data[10]]) >> 4;
                 let symbol_rate = (bcd32_to_u64(sr_bcd) * 100) as u32;
-                KnownDescriptor::CableDelivery { frequency_hz, modulation, symbol_rate }
+                KnownDescriptor::CableDelivery {
+                    frequency_hz,
+                    modulation,
+                    symbol_rate,
+                }
             }
 
             // ── 0x47: BouquetName ────────────────────────────────────────
@@ -250,7 +261,11 @@ impl Descriptor {
 
                 // service_name
                 if pos >= data.len() {
-                    return KnownDescriptor::Service { service_type, provider, name: String::new() };
+                    return KnownDescriptor::Service {
+                        service_type,
+                        provider,
+                        name: String::new(),
+                    };
                 }
                 let name_len = data[pos] as usize;
                 pos += 1;
@@ -260,7 +275,11 @@ impl Descriptor {
                     String::new()
                 };
 
-                KnownDescriptor::Service { service_type, provider, name }
+                KnownDescriptor::Service {
+                    service_type,
+                    provider,
+                    name,
+                }
             }
 
             // ── 0x4D: ShortEvent ─────────────────────────────────────────
@@ -315,7 +334,10 @@ impl Descriptor {
                     3 => 5_000_000,
                     _ => 0,
                 };
-                KnownDescriptor::TerrestrialDelivery { centre_frequency_hz, bandwidth_hz }
+                KnownDescriptor::TerrestrialDelivery {
+                    centre_frequency_hz,
+                    bandwidth_hz,
+                }
             }
 
             // ── Desconhecido ─────────────────────────────────────────────
@@ -325,7 +347,10 @@ impl Descriptor {
 
     /// Cria um `KnownDescriptor::Unknown` a partir deste descriptor.
     fn unknown(&self) -> KnownDescriptor {
-        KnownDescriptor::Unknown { tag: self.tag, data: self.data.clone() }
+        KnownDescriptor::Unknown {
+            tag: self.tag,
+            data: self.data.clone(),
+        }
     }
 }
 
@@ -458,7 +483,11 @@ mod tests {
 
         let desc = Descriptor::new(0x48, data);
         match desc.decode() {
-            KnownDescriptor::Service { service_type, provider, name } => {
+            KnownDescriptor::Service {
+                service_type,
+                provider,
+                name,
+            } => {
                 assert_eq!(service_type, 0x01);
                 assert_eq!(provider, "ABC");
                 assert_eq!(name, "Canal1");
@@ -548,13 +577,17 @@ mod tests {
         // symbol_rate (28 bits BCD): 0x06875000 >> 4 = 0x0687500
         let data = vec![
             0x03, 0x66, 0x00, 0x00, // frequency BCD
-            0x00, 0x00,             // reserved + FEC_outer
-            0x03,                   // modulation
+            0x00, 0x00, // reserved + FEC_outer
+            0x03, // modulation
             0x06, 0x87, 0x50, 0x00, // symbol_rate BCD (28 bits) + FEC_inner
         ];
         let desc = Descriptor::new(0x44, data);
         match desc.decode() {
-            KnownDescriptor::CableDelivery { frequency_hz, modulation, symbol_rate: _ } => {
+            KnownDescriptor::CableDelivery {
+                frequency_hz,
+                modulation,
+                symbol_rate: _,
+            } => {
                 assert_eq!(modulation, 0x03);
                 // frequency_hz = bcd32(0x03660000) * 100
                 // bcd32(0x03660000): nibbles 0,0,0,0,6,6,3,0 → 0+0+0+0+60000+600000+3000000+0 = 3660000

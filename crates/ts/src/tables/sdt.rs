@@ -105,7 +105,7 @@ impl Sdt {
         if section.len() < MIN_LEN {
             return Err(TableError::InsufficientData {
                 expected: MIN_LEN,
-                found:    section.len(),
+                found: section.len(),
             });
         }
 
@@ -125,12 +125,12 @@ impl Sdt {
         if body.len() < MIN_BODY {
             return Err(TableError::InsufficientData {
                 expected: MIN_BODY,
-                found:    body.len(),
+                found: body.len(),
             });
         }
 
         let transport_stream_id = u16::from_be_bytes([body[0], body[1]]);
-        let version             = (body[2] >> 1) & 0x1F;
+        let version = (body[2] >> 1) & 0x1F;
         // body[3] = section_number, body[4] = last_section_number (ignorados)
         let original_network_id = u16::from_be_bytes([body[5], body[6]]);
         // body[7] = reserved byte
@@ -145,26 +145,26 @@ impl Sdt {
             if pos + SVC_HEADER > body.len() {
                 return Err(TableError::InsufficientData {
                     expected: pos + SVC_HEADER,
-                    found:    body.len(),
+                    found: body.len(),
                 });
             }
 
-            let service_id             = u16::from_be_bytes([body[pos], body[pos + 1]]);
-            let eit_flags              = body[pos + 2];
-            let eit_schedule_flag      = eit_flags & 0x02 != 0;
-            let eit_present_following  = eit_flags & 0x01 != 0;
-            let running_hi             = body[pos + 3];
-            let desc_loop_len_lo       = body[pos + 4];
+            let service_id = u16::from_be_bytes([body[pos], body[pos + 1]]);
+            let eit_flags = body[pos + 2];
+            let eit_schedule_flag = eit_flags & 0x02 != 0;
+            let eit_present_following = eit_flags & 0x01 != 0;
+            let running_hi = body[pos + 3];
+            let desc_loop_len_lo = body[pos + 4];
             let running_status = RunningStatus::from_bits(running_hi >> 5);
-            let free_ca_mode   = (running_hi >> 4) & 0x01 != 0;
-            let desc_loop_len  =
+            let free_ca_mode = (running_hi >> 4) & 0x01 != 0;
+            let desc_loop_len =
                 (((running_hi as u16 & 0x0F) << 8) | desc_loop_len_lo as u16) as usize;
             pos += SVC_HEADER;
 
             if pos + desc_loop_len > body.len() {
                 return Err(TableError::InsufficientData {
                     expected: pos + desc_loop_len,
-                    found:    body.len(),
+                    found: body.len(),
                 });
             }
 
@@ -172,8 +172,7 @@ impl Sdt {
             pos += desc_loop_len;
 
             // Extrair service_name, provider_name, service_type do Service descriptor
-            let (service_name, provider_name, service_type) =
-                extract_service_info(&descriptors);
+            let (service_name, provider_name, service_type) = extract_service_info(&descriptors);
 
             services.push(SdtService {
                 service_id,
@@ -212,7 +211,11 @@ fn extract_service_info(
         {
             return (
                 if name.is_empty() { None } else { Some(name) },
-                if provider.is_empty() { None } else { Some(provider) },
+                if provider.is_empty() {
+                    None
+                } else {
+                    Some(provider)
+                },
                 Some(service_type),
             );
         }
@@ -307,7 +310,10 @@ mod tests {
     fn spec_table_004_running_status_all_values() {
         assert_eq!(RunningStatus::from_bits(0), RunningStatus::Undefined);
         assert_eq!(RunningStatus::from_bits(1), RunningStatus::NotRunning);
-        assert_eq!(RunningStatus::from_bits(2), RunningStatus::StartsInFewSeconds);
+        assert_eq!(
+            RunningStatus::from_bits(2),
+            RunningStatus::StartsInFewSeconds
+        );
         assert_eq!(RunningStatus::from_bits(3), RunningStatus::Pausing);
         assert_eq!(RunningStatus::from_bits(4), RunningStatus::Running);
         assert_eq!(RunningStatus::from_bits(5), RunningStatus::ServiceOffAir);

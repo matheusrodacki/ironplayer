@@ -77,7 +77,7 @@ impl Nit {
         if section.len() < MIN_LEN {
             return Err(TableError::InsufficientData {
                 expected: MIN_LEN,
-                found:    section.len(),
+                found: section.len(),
             });
         }
 
@@ -97,12 +97,12 @@ impl Nit {
         if body.len() < MIN_BODY {
             return Err(TableError::InsufficientData {
                 expected: MIN_BODY,
-                found:    body.len(),
+                found: body.len(),
             });
         }
 
-        let network_id  = u16::from_be_bytes([body[0], body[1]]);
-        let version     = (body[2] >> 1) & 0x1F;
+        let network_id = u16::from_be_bytes([body[0], body[1]]);
+        let version = (body[2] >> 1) & 0x1F;
         // body[3] = section_number, body[4] = last_section_number (ignorados)
 
         let net_desc_len = (u16::from_be_bytes([body[5], body[6]]) & 0x0FFF) as usize;
@@ -111,7 +111,7 @@ impl Nit {
         if body.len() < net_desc_end + 2 {
             return Err(TableError::InsufficientData {
                 expected: net_desc_end + 2,
-                found:    body.len(),
+                found: body.len(),
             });
         }
 
@@ -127,15 +127,15 @@ impl Nit {
         });
 
         // ── Transport stream loop ─────────────────────────────────────────────
-        let ts_loop_len = (u16::from_be_bytes([body[net_desc_end], body[net_desc_end + 1]])
-            & 0x0FFF) as usize;
+        let ts_loop_len =
+            (u16::from_be_bytes([body[net_desc_end], body[net_desc_end + 1]]) & 0x0FFF) as usize;
         let ts_loop_start = net_desc_end + 2;
-        let ts_loop_end   = ts_loop_start + ts_loop_len;
+        let ts_loop_end = ts_loop_start + ts_loop_len;
 
         if body.len() < ts_loop_end {
             return Err(TableError::InsufficientData {
                 expected: ts_loop_end,
-                found:    body.len(),
+                found: body.len(),
             });
         }
 
@@ -149,14 +149,12 @@ impl Nit {
             if pos + TS_HEADER > ts_data.len() {
                 return Err(TableError::InsufficientData {
                     expected: pos + TS_HEADER,
-                    found:    ts_data.len(),
+                    found: ts_data.len(),
                 });
             }
 
-            let transport_stream_id =
-                u16::from_be_bytes([ts_data[pos], ts_data[pos + 1]]);
-            let original_network_id =
-                u16::from_be_bytes([ts_data[pos + 2], ts_data[pos + 3]]);
+            let transport_stream_id = u16::from_be_bytes([ts_data[pos], ts_data[pos + 1]]);
+            let original_network_id = u16::from_be_bytes([ts_data[pos + 2], ts_data[pos + 3]]);
             let desc_len =
                 (u16::from_be_bytes([ts_data[pos + 4], ts_data[pos + 5]]) & 0x0FFF) as usize;
             pos += TS_HEADER;
@@ -164,7 +162,7 @@ impl Nit {
             if pos + desc_len > ts_data.len() {
                 return Err(TableError::InsufficientData {
                     expected: pos + desc_len,
-                    found:    ts_data.len(),
+                    found: ts_data.len(),
                 });
             }
 
@@ -245,7 +243,7 @@ mod tests {
         let data = include_bytes!("../../tests/fixtures/nit_cable.bin");
         let mut patched = data.to_vec();
         patched[0] = 0x41; // mudar para NIT other
-        // Recalcular CRC
+                           // Recalcular CRC
         let crc = crate::crc32_mpeg2(&patched[..patched.len() - 4]);
         let len = patched.len();
         patched[len - 4] = (crc >> 24) as u8;

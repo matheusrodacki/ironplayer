@@ -64,15 +64,19 @@ fn spec_tables_t11_pat_pmt_register_pmt_pid_flow() {
 
     // section_body = sem os 3 bytes de cabeçalho PSI e sem os 4 bytes de CRC-32
     let pat_body = &pat_bytes[3..pat_bytes.len() - 4];
-    let pat = Pat::from_section_body(pat_body)
-        .expect("PAT deve parsear sem erro a partir da fixture");
+    let pat =
+        Pat::from_section_body(pat_body).expect("PAT deve parsear sem erro a partir da fixture");
 
     assert_eq!(pat.transport_stream_id, 1, "transport_stream_id deve ser 1");
     assert_eq!(pat.version, 1, "versão deve ser 1");
     assert!(pat.current_next, "current_next deve ser true");
 
     let pmt_pids: Vec<u16> = pat.pmt_pids().collect();
-    assert_eq!(pmt_pids, vec![0x0100], "deve haver exatamente um PMT PID: 0x0100");
+    assert_eq!(
+        pmt_pids,
+        vec![0x0100],
+        "deve haver exatamente um PMT PID: 0x0100"
+    );
 
     // NIT PID identificado corretamente
     assert_eq!(pat.nit_pid(), Some(0x0010), "NIT PID deve ser 0x0010");
@@ -119,8 +123,7 @@ fn spec_tables_t11_pat_pmt_register_pmt_pid_flow() {
         "seção deve ter pelo menos 3 bytes de cabeçalho PSI"
     );
 
-    let declared_len =
-        (((section_slice[1] & 0x0F) as usize) << 8) | section_slice[2] as usize;
+    let declared_len = (((section_slice[1] & 0x0F) as usize) << 8) | section_slice[2] as usize;
     let body_end = 3 + declared_len - 4; // −4 para excluir CRC-32
 
     assert!(
@@ -136,7 +139,11 @@ fn spec_tables_t11_pat_pmt_register_pmt_pid_flow() {
     // ── 6. Verificar campos da PMT ────────────────────────────────────────────
     assert_eq!(pmt.program_number, 1, "program_number deve ser 1");
     assert_eq!(pmt.pcr_pid, 0x0110, "PCR PID deve ser 0x0110");
-    assert_eq!(pmt.streams.len(), 2, "PMT deve conter 2 streams elementares");
+    assert_eq!(
+        pmt.streams.len(),
+        2,
+        "PMT deve conter 2 streams elementares"
+    );
 
     let video = &pmt.streams[0];
     assert_eq!(video.stream_type, 0x1B, "stream 0 deve ser H.264 (0x1B)");

@@ -26,7 +26,7 @@ pub fn stream_type_label(st: u8) -> &'static str {
         0x24 => "H.265 / HEVC Video",
         0x81 => "AC-3 Audio (ATSC)",
         0x86 => "SCTE-35 Splice",
-        _    => "Unknown",
+        _ => "Unknown",
     }
 }
 
@@ -120,28 +120,27 @@ impl SectionParser for Pmt {
         if section_body.len() < MIN_LEN {
             return Err(TableError::InsufficientData {
                 expected: MIN_LEN,
-                found:    section_body.len(),
+                found: section_body.len(),
             });
         }
 
         let program_number = u16::from_be_bytes([section_body[0], section_body[1]]);
-        let version        = (section_body[2] >> 1) & 0x1F;
-        let current_next   = section_body[2] & 0x01 != 0;
+        let version = (section_body[2] >> 1) & 0x1F;
+        let current_next = section_body[2] & 0x01 != 0;
         // section_body[3] = section_number  (ignorado)
         // section_body[4] = last_section_number (ignorado)
 
-        let pcr_pid =
-            u16::from_be_bytes([section_body[5], section_body[6]]) & 0x1FFF;
+        let pcr_pid = u16::from_be_bytes([section_body[5], section_body[6]]) & 0x1FFF;
         let program_info_length =
             (u16::from_be_bytes([section_body[7], section_body[8]]) & 0x0FFF) as usize;
 
         let prog_info_start = 9usize;
-        let prog_info_end   = prog_info_start + program_info_length;
+        let prog_info_end = prog_info_start + program_info_length;
 
         if section_body.len() < prog_info_end {
             return Err(TableError::InsufficientData {
                 expected: prog_info_end,
-                found:    section_body.len(),
+                found: section_body.len(),
             });
         }
 
@@ -149,7 +148,7 @@ impl SectionParser for Pmt {
             Descriptor::parse_list(&section_body[prog_info_start..prog_info_end]);
 
         // ── Parsear stream entries ────────────────────────────────────────────
-        let mut pos     = prog_info_end;
+        let mut pos = prog_info_end;
         let mut streams = Vec::new();
 
         while pos < section_body.len() {
@@ -159,17 +158,16 @@ impl SectionParser for Pmt {
             if pos + STREAM_HEADER > section_body.len() {
                 return Err(TableError::InsufficientData {
                     expected: pos + STREAM_HEADER,
-                    found:    section_body.len(),
+                    found: section_body.len(),
                 });
             }
 
             let stream_type = section_body[pos];
             let elementary_pid =
-                u16::from_be_bytes([section_body[pos + 1], section_body[pos + 2]])
-                    & 0x1FFF;
+                u16::from_be_bytes([section_body[pos + 1], section_body[pos + 2]]) & 0x1FFF;
             let es_info_length =
-                (u16::from_be_bytes([section_body[pos + 3], section_body[pos + 4]])
-                    & 0x0FFF) as usize;
+                (u16::from_be_bytes([section_body[pos + 3], section_body[pos + 4]]) & 0x0FFF)
+                    as usize;
 
             pos += STREAM_HEADER;
             let es_end = pos + es_info_length;
@@ -177,7 +175,7 @@ impl SectionParser for Pmt {
             if section_body.len() < es_end {
                 return Err(TableError::InsufficientData {
                     expected: es_end,
-                    found:    section_body.len(),
+                    found: section_body.len(),
                 });
             }
 
@@ -284,9 +282,9 @@ mod tests {
     fn spec_table_002_empty_streams_parses_ok() {
         let section_body: &[u8] = &[
             0x00, 0x01, // program_number = 1
-            0xC3,       // reserved|version=1|current_next=1
-            0x00,       // section_number
-            0x00,       // last_section_number
+            0xC3, // reserved|version=1|current_next=1
+            0x00, // section_number
+            0x00, // last_section_number
             0xE1, 0x10, // reserved|PCR_PID = 0x0110
             0xF0, 0x00, // reserved|program_info_length = 0
         ];
@@ -317,9 +315,9 @@ mod tests {
         // Descriptor tag=0x09 (CA), length=4, dados=[0x00, 0x26, 0xE1, 0x00]
         let section_body: &[u8] = &[
             0x00, 0x01, // program_number = 1
-            0xC3,       // reserved|version=1|current_next=1
-            0x00,       // section_number
-            0x00,       // last_section_number
+            0xC3, // reserved|version=1|current_next=1
+            0x00, // section_number
+            0x00, // last_section_number
             0xE1, 0x10, // reserved|PCR_PID = 0x0110
             0xF0, 0x06, // reserved|program_info_length = 6
             // program descriptor: tag=0x09, length=4

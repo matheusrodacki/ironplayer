@@ -33,7 +33,7 @@ fn make_ts_packet(seq: u8) -> Vec<u8> {
 fn make_rtp_packet(seq: u16, payload: &[u8]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(12 + payload.len());
     pkt.push(0x80); // V=2, P=0, X=0, CC=0
-    pkt.push(33);   // M=0, PT=33
+    pkt.push(33); // M=0, PT=33
     pkt.push((seq >> 8) as u8);
     pkt.push(seq as u8);
     pkt.extend_from_slice(&[0u8; 4]); // timestamp
@@ -213,5 +213,8 @@ fn spec_net_t07_loopback_rtp_strip() {
     handle.stop();
     let _ = jh.join();
 
-    assert_eq!(stripped, N, "esperados {N} payloads, processados {stripped}");
+    assert_eq!(
+        stripped, N,
+        "esperados {N} payloads, processados {stripped}"
+    );
 }

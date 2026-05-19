@@ -55,7 +55,7 @@ impl Bat {
         if section.len() < MIN_LEN {
             return Err(TableError::InsufficientData {
                 expected: MIN_LEN,
-                found:    section.len(),
+                found: section.len(),
             });
         }
 
@@ -63,7 +63,7 @@ impl Bat {
         if table_id != 0x4A {
             return Err(TableError::WrongTableId {
                 expected: 0x4A,
-                found:    table_id,
+                found: table_id,
             });
         }
 
@@ -76,12 +76,12 @@ impl Bat {
         if body.len() < MIN_BODY {
             return Err(TableError::InsufficientData {
                 expected: MIN_BODY,
-                found:    body.len(),
+                found: body.len(),
             });
         }
 
         let bouquet_id = u16::from_be_bytes([body[0], body[1]]);
-        let version    = (body[2] >> 1) & 0x1F;
+        let version = (body[2] >> 1) & 0x1F;
         // body[3] = section_number, body[4] = last_section_number (ignorados)
 
         let bouquet_desc_len = (u16::from_be_bytes([body[5], body[6]]) & 0x0FFF) as usize;
@@ -90,7 +90,7 @@ impl Bat {
         if body.len() < bouquet_desc_end + 2 {
             return Err(TableError::InsufficientData {
                 expected: bouquet_desc_end + 2,
-                found:    body.len(),
+                found: body.len(),
             });
         }
 
@@ -109,12 +109,12 @@ impl Bat {
         let ts_loop_len = (u16::from_be_bytes([body[bouquet_desc_end], body[bouquet_desc_end + 1]])
             & 0x0FFF) as usize;
         let ts_loop_start = bouquet_desc_end + 2;
-        let ts_loop_end   = ts_loop_start + ts_loop_len;
+        let ts_loop_end = ts_loop_start + ts_loop_len;
 
         if body.len() < ts_loop_end {
             return Err(TableError::InsufficientData {
                 expected: ts_loop_end,
-                found:    body.len(),
+                found: body.len(),
             });
         }
 
@@ -128,14 +128,12 @@ impl Bat {
             if pos + TS_HEADER > ts_data.len() {
                 return Err(TableError::InsufficientData {
                     expected: pos + TS_HEADER,
-                    found:    ts_data.len(),
+                    found: ts_data.len(),
                 });
             }
 
-            let transport_stream_id =
-                u16::from_be_bytes([ts_data[pos], ts_data[pos + 1]]);
-            let original_network_id =
-                u16::from_be_bytes([ts_data[pos + 2], ts_data[pos + 3]]);
+            let transport_stream_id = u16::from_be_bytes([ts_data[pos], ts_data[pos + 1]]);
+            let original_network_id = u16::from_be_bytes([ts_data[pos + 2], ts_data[pos + 3]]);
             let desc_len =
                 (u16::from_be_bytes([ts_data[pos + 4], ts_data[pos + 5]]) & 0x0FFF) as usize;
             pos += TS_HEADER;
@@ -143,7 +141,7 @@ impl Bat {
             if pos + desc_len > ts_data.len() {
                 return Err(TableError::InsufficientData {
                     expected: pos + desc_len,
-                    found:    ts_data.len(),
+                    found: ts_data.len(),
                 });
             }
 
@@ -191,13 +189,13 @@ mod tests {
         let mut ts_entry = Vec::new();
         ts_entry.extend_from_slice(&[0x00u8, 0x01]); // ts_id = 1
         ts_entry.extend_from_slice(&[0x00u8, 0x64]); // orig_net_id = 100
-        // desc_loop_len = 0: reserved(4b)=1111, len=0 → 0xF000 & 0x0000
+                                                     // desc_loop_len = 0: reserved(4b)=1111, len=0 → 0xF000 & 0x0000
         ts_entry.push(0xF0u8);
         ts_entry.push(0x00u8);
         // ts_entry = 6 bytes
 
         let bouquet_desc_len = bname_desc.len() as u16; // 8
-        let ts_loop_len      = ts_entry.len() as u16;   // 6
+        let ts_loop_len = ts_entry.len() as u16; // 6
 
         // section_length = 5 (PSI common) + 2 (bouquet_desc_len) + bouquet_desc_len
         //                + 2 (ts_loop_len) + ts_loop_len + 4 (CRC)
@@ -209,7 +207,8 @@ mod tests {
         sec.push((section_length & 0xFF) as u8);
 
         // PSI common header (5 bytes): bouquet_id + version/flags + sec_num + last_sec_num
-        sec.push(0x00); sec.push(0x2A); // bouquet_id = 42
+        sec.push(0x00);
+        sec.push(0x2A); // bouquet_id = 42
         sec.push(0xC3); // reserved(2b)|version=1|current_next=1
         sec.push(0x00); // section_number = 0
         sec.push(0x00); // last_section_number = 0
@@ -260,13 +259,16 @@ mod tests {
         sec.push(0xB0 | ((section_length >> 8) as u8 & 0x0F));
         sec.push((section_length & 0xFF) as u8);
 
-        sec.push(0x00); sec.push(0x01); // bouquet_id = 1
+        sec.push(0x00);
+        sec.push(0x01); // bouquet_id = 1
         sec.push(0xC1); // version=0, current_next=1
         sec.push(0x00);
         sec.push(0x00);
 
-        sec.push(0xF0); sec.push(0x00); // bouquet_desc_len = 0
-        sec.push(0xF0); sec.push(0x00); // ts_loop_len = 0
+        sec.push(0xF0);
+        sec.push(0x00); // bouquet_desc_len = 0
+        sec.push(0xF0);
+        sec.push(0x00); // ts_loop_len = 0
 
         let crc = crate::crc32_mpeg2(&sec);
         sec.extend_from_slice(&crc.to_be_bytes());

@@ -103,13 +103,12 @@ impl SectionParser for Pat {
         if section_body.len() < HEADER_LEN {
             return Err(TableError::InsufficientData {
                 expected: HEADER_LEN,
-                found:    section_body.len(),
+                found: section_body.len(),
             });
         }
 
-        let transport_stream_id =
-            u16::from_be_bytes([section_body[0], section_body[1]]);
-        let version      = (section_body[2] >> 1) & 0x1F;
+        let transport_stream_id = u16::from_be_bytes([section_body[0], section_body[1]]);
+        let version = (section_body[2] >> 1) & 0x1F;
         let current_next = section_body[2] & 0x01 != 0;
         // section_body[3] = section_number  (ignorado — não necessário para parsing)
         // section_body[4] = last_section_number (ignorado)
@@ -120,15 +119,18 @@ impl SectionParser for Pat {
         if entries.len() % 4 != 0 {
             return Err(TableError::InsufficientData {
                 expected: HEADER_LEN + (entries.len() / 4 + 1) * 4,
-                found:    section_body.len(),
+                found: section_body.len(),
             });
         }
 
         let mut programs = Vec::with_capacity(entries.len() / 4);
         for chunk in entries.chunks_exact(4) {
             let program_number = u16::from_be_bytes([chunk[0], chunk[1]]);
-            let pid            = u16::from_be_bytes([chunk[2], chunk[3]]) & 0x1FFF;
-            programs.push(PatProgram { program_number, pid });
+            let pid = u16::from_be_bytes([chunk[2], chunk[3]]) & 0x1FFF;
+            programs.push(PatProgram {
+                program_number,
+                pid,
+            });
         }
 
         Ok(Pat {
@@ -193,8 +195,14 @@ mod tests {
             version: 0,
             current_next: true,
             programs: vec![
-                PatProgram { program_number: 0,    pid: 0x0010 },
-                PatProgram { program_number: 1,    pid: 0x0100 },
+                PatProgram {
+                    program_number: 0,
+                    pid: 0x0010,
+                },
+                PatProgram {
+                    program_number: 1,
+                    pid: 0x0100,
+                },
             ],
         };
         assert_eq!(pat.nit_pid(), Some(0x0010));
@@ -210,9 +218,18 @@ mod tests {
             version: 0,
             current_next: true,
             programs: vec![
-                PatProgram { program_number: 0, pid: 0x0010 },
-                PatProgram { program_number: 1, pid: 0x0100 },
-                PatProgram { program_number: 2, pid: 0x0200 },
+                PatProgram {
+                    program_number: 0,
+                    pid: 0x0010,
+                },
+                PatProgram {
+                    program_number: 1,
+                    pid: 0x0100,
+                },
+                PatProgram {
+                    program_number: 2,
+                    pid: 0x0200,
+                },
             ],
         };
         let pmt_pids: Vec<Pid> = pat.pmt_pids().collect();
@@ -227,9 +244,9 @@ mod tests {
         // section_body apenas com cabeçalho comum, sem entradas
         let section_body = [
             0x00, 0x01, // transport_stream_id = 1
-            0xC1,       // reserved|version=0|current_next=1
-            0x00,       // section_number
-            0x00,       // last_section_number
+            0xC1, // reserved|version=0|current_next=1
+            0x00, // section_number
+            0x00, // last_section_number
         ];
         let pat = Pat::parse(&section_body).expect("PAT vazia deve parsear sem erro");
         assert_eq!(pat.programs.len(), 0);

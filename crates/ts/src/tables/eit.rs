@@ -91,7 +91,7 @@ impl Eit {
         if section.len() < MIN_LEN {
             return Err(TableError::InsufficientData {
                 expected: MIN_LEN,
-                found:    section.len(),
+                found: section.len(),
             });
         }
 
@@ -109,12 +109,12 @@ impl Eit {
         if body.len() < MIN_BODY {
             return Err(TableError::InsufficientData {
                 expected: MIN_BODY,
-                found:    body.len(),
+                found: body.len(),
             });
         }
 
-        let service_id          = u16::from_be_bytes([body[0], body[1]]);
-        let version             = (body[2] >> 1) & 0x1F;
+        let service_id = u16::from_be_bytes([body[0], body[1]]);
+        let version = (body[2] >> 1) & 0x1F;
         // body[3] = section_number, body[4] = last_section_number (ignorados)
         let transport_stream_id = u16::from_be_bytes([body[5], body[6]]);
         let original_network_id = u16::from_be_bytes([body[7], body[8]]);
@@ -131,7 +131,7 @@ impl Eit {
             if pos + EVT_HEADER > body.len() {
                 return Err(TableError::InsufficientData {
                     expected: pos + EVT_HEADER,
-                    found:    body.len(),
+                    found: body.len(),
                 });
             }
 
@@ -143,9 +143,9 @@ impl Eit {
                 None
             } else {
                 let mjd = u16::from_be_bytes([body[pos + 2], body[pos + 3]]);
-                let hh  = body[pos + 4];
-                let mm  = body[pos + 5];
-                let ss  = body[pos + 6];
+                let hh = body[pos + 4];
+                let mm = body[pos + 5];
+                let ss = body[pos + 6];
                 decode_mjd_bcd(mjd, hh, mm, ss)
             };
 
@@ -159,18 +159,17 @@ impl Eit {
                 decode_duration_bcd(dur_hh, dur_mm, dur_ss)
             };
 
-            let running_byte   = body[pos + 10];
-            let desc_len_lo    = body[pos + 11];
+            let running_byte = body[pos + 10];
+            let desc_len_lo = body[pos + 11];
             let running_status = RunningStatus::from_bits(running_byte >> 5);
-            let free_ca_mode   = (running_byte >> 4) & 0x01 != 0;
-            let desc_len =
-                (((running_byte as u16 & 0x0F) << 8) | desc_len_lo as u16) as usize;
+            let free_ca_mode = (running_byte >> 4) & 0x01 != 0;
+            let desc_len = (((running_byte as u16 & 0x0F) << 8) | desc_len_lo as u16) as usize;
             pos += EVT_HEADER;
 
             if pos + desc_len > body.len() {
                 return Err(TableError::InsufficientData {
                     expected: pos + desc_len,
-                    found:    body.len(),
+                    found: body.len(),
                 });
             }
 
@@ -260,24 +259,33 @@ mod tests {
         sec.push((section_length & 0xFF) as u8);
 
         // PSI common header (5 bytes)
-        sec.push(0x00); sec.push(0x01); // service_id = 1
+        sec.push(0x00);
+        sec.push(0x01); // service_id = 1
         sec.push(0xC1); // reserved(2b)|version=0|current_next=1
         sec.push(0x00); // section_number
         sec.push(0x01); // last_section_number
 
         // EIT-specific (6 bytes)
-        sec.push(0x00); sec.push(0x01); // transport_stream_id = 1
-        sec.push(0x00); sec.push(0x64); // original_network_id = 100
+        sec.push(0x00);
+        sec.push(0x01); // transport_stream_id = 1
+        sec.push(0x00);
+        sec.push(0x64); // original_network_id = 100
         sec.push(0x01); // segment_last_section_number
         sec.push(0x4E); // last_table_id
 
         // Event entry (12 bytes, no descriptors)
-        sec.push(0x00); sec.push(0x65); // event_id = 101
-        // start_time: MJD=0xDCAE, HH=0x20, MM=0x00, SS=0x00
-        sec.push(0xDC); sec.push(0xAE);
-        sec.push(0x20); sec.push(0x00); sec.push(0x00);
+        sec.push(0x00);
+        sec.push(0x65); // event_id = 101
+                        // start_time: MJD=0xDCAE, HH=0x20, MM=0x00, SS=0x00
+        sec.push(0xDC);
+        sec.push(0xAE);
+        sec.push(0x20);
+        sec.push(0x00);
+        sec.push(0x00);
         // duration: 01:30:00 BCD
-        sec.push(0x01); sec.push(0x30); sec.push(0x00);
+        sec.push(0x01);
+        sec.push(0x30);
+        sec.push(0x00);
         // running_status=4(100b), free_ca_mode=0, desc_loop_len=0
         // byte: (4 << 5) | (0 << 4) | 0x00 = 0x80
         sec.push(0x80);
@@ -357,7 +365,7 @@ mod tests {
     fn spec_table_wrong_table_id_eit() {
         let mut sec = build_eit_pf_section();
         sec[0] = 0x00; // PAT table_id
-        // CRC não precisa ser válido para testar o table_id check
+                       // CRC não precisa ser válido para testar o table_id check
         assert!(matches!(
             Eit::parse(&sec),
             Err(TableError::WrongTableIdMulti { .. })

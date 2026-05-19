@@ -52,7 +52,12 @@ impl UdpReceiver {
         events: Sender<NetEvent>,
         cfg: ReceiverConfig,
     ) -> Self {
-        Self { url, tx, events, cfg }
+        Self {
+            url,
+            tx,
+            events,
+            cfg,
+        }
     }
 
     /// Executa o loop de recepção na thread atual (bloqueante).
@@ -66,8 +71,8 @@ impl UdpReceiver {
         let iface_addr = iface.unwrap_or(Ipv4Addr::UNSPECIFIED);
 
         // 1. Criar socket
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-            .map_err(NetError::Io)?;
+        let socket =
+            Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(NetError::Io)?;
 
         // 2. SO_RCVBUF (SPEC-NET-002b)
         socket
@@ -96,9 +101,7 @@ impl UdpReceiver {
 
         // 3. Bind em 0.0.0.0:port
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-        socket
-            .bind(&bind_addr.into())
-            .map_err(NetError::Io)?;
+        socket.bind(&bind_addr.into()).map_err(NetError::Io)?;
 
         // 4. IP_ADD_MEMBERSHIP
         socket
@@ -198,7 +201,10 @@ mod tests {
         let (tx, _rx) = bounded::<Bytes>(16);
         let (ev_tx, ev_rx) = bounded::<NetEvent>(32);
         let (token, handle) = StopToken::new();
-        let cfg = ReceiverConfig { buf_size: 65536, timeout_ms: 100 };
+        let cfg = ReceiverConfig {
+            buf_size: 65536,
+            timeout_ms: 100,
+        };
         let recv = UdpReceiver::new(url, tx, ev_tx, cfg);
 
         let jh = thread::spawn(move || recv.run(token));

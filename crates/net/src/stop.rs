@@ -57,13 +57,19 @@ mod tests {
             // outra thread verifica o token
             token_clone.is_stopped()
         });
-        assert!(!t.join().unwrap(), "antes do stop: deve ser false em outra thread");
+        assert!(
+            !t.join().unwrap(),
+            "antes do stop: deve ser false em outra thread"
+        );
 
         handle.stop();
         assert!(token.is_stopped(), "após stop: deve ser true");
 
         let token_clone2 = token.clone();
         let t2 = thread::spawn(move || token_clone2.is_stopped());
-        assert!(t2.join().unwrap(), "após stop: deve ser true em outra thread");
+        assert!(
+            t2.join().unwrap(),
+            "após stop: deve ser true em outra thread"
+        );
     }
 }

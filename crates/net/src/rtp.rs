@@ -77,12 +77,15 @@ impl RtpStripper {
 
     fn check_sequence(&mut self, seq: u16) {
         if let Some(last) = self.last_seq {
-            let expected = if last == 0xFFFF { 0x0001 } else { last.wrapping_add(1) };
+            let expected = if last == 0xFFFF {
+                0x0001
+            } else {
+                last.wrapping_add(1)
+            };
             if seq != expected {
-                let _ = self.event_tx.try_send(RtpEvent::OutOfOrder {
-                    expected,
-                    got: seq,
-                });
+                let _ = self
+                    .event_tx
+                    .try_send(RtpEvent::OutOfOrder { expected, got: seq });
             }
         }
         self.last_seq = Some(seq);
@@ -103,9 +106,15 @@ mod tests {
             (seq >> 8) as u8,
             (seq & 0xFF) as u8,
             // timestamp (4 bytes)
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             // SSRC (4 bytes)
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
         ];
         // CSRC entries (4 bytes each)
         for _ in 0..cc {
@@ -156,7 +165,10 @@ mod tests {
         let payload = vec![0u8; 188];
         s.strip(make_rtp_packet(0xFFFF, 0, &payload));
         s.strip(make_rtp_packet(0x0001, 0, &payload));
-        assert!(rx.try_recv().is_err(), "wrap-around should not emit OutOfOrder");
+        assert!(
+            rx.try_recv().is_err(),
+            "wrap-around should not emit OutOfOrder"
+        );
     }
 
     /// SPEC-NET-003: pulo 100→102 emite OutOfOrder { expected: 101, got: 102 }

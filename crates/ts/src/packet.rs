@@ -169,7 +169,10 @@ mod tests {
     fn spec_ts_001_adaptation_only() {
         let pkt = build_packet(0x0100, 0b10, 5);
         let result = TsPacket::parse(&pkt).unwrap();
-        assert!(result.payload.is_none(), "payload deve ser None quando AFC=0b10");
+        assert!(
+            result.payload.is_none(),
+            "payload deve ser None quando AFC=0b10"
+        );
         assert!(
             result.adaptation_field.is_some(),
             "adaptation_field deve ser Some quando AFC=0b10"
@@ -186,7 +189,10 @@ mod tests {
             result.adaptation_field.is_none(),
             "adaptation_field deve ser None quando AFC=0b01"
         );
-        assert!(result.payload.is_some(), "payload deve ser Some quando AFC=0b01");
+        assert!(
+            result.payload.is_some(),
+            "payload deve ser Some quando AFC=0b01"
+        );
         // Payload deve ter 184 bytes (188 - 4 header)
         assert_eq!(result.payload.unwrap().len(), 184);
     }
@@ -204,8 +210,8 @@ mod tests {
         pkt[3] = (0b11 << 4) | 0x00; // AFC=11, CC=0
         pkt[4] = 10; // adaptation_field_length
         pkt[5] = 0x00; // flags (nenhum flag setado)
-        // bytes 6..15 = stuffing (já são 0x00)
-        // bytes 15..188 = payload
+                       // bytes 6..15 = stuffing (já são 0x00)
+                       // bytes 15..188 = payload
         let result = TsPacket::parse(&pkt).unwrap();
         assert!(result.adaptation_field.is_some());
         assert!(result.payload.is_some());

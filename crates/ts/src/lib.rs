@@ -5,9 +5,11 @@
 //! Zero FFI, zero `unsafe`. Rust 1.78 stable.
 
 pub mod adaptation;
+pub mod aggregator;
 pub mod crc;
 pub mod demux;
 pub mod error;
+pub mod metrics;
 pub mod packet;
 pub mod pcr;
 pub mod section;

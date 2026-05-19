@@ -979,6 +979,7 @@ dependencies = [
  "proptest",
  "rstest",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

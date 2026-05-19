@@ -43,34 +43,22 @@ pub enum TsEvent {
     /// Erro de Continuity Counter detectado em um PID.
     ///
     /// SPEC-TS-002b
-    CcError {
-        pid:      Pid,
-        expected: u8,
-        got:      u8,
-    },
+    CcError { pid: Pid, expected: u8, got: u8 },
 
     /// Byte de sincronização perdido; demuxer avançou no buffer para re-sincronizar.
     ///
     /// SPEC-TS-002c
-    SyncLost {
-        bytes_skipped: usize,
-    },
+    SyncLost { bytes_skipped: usize },
 
     /// CRC-32 inválido em uma seção PSI/SI montada.
     ///
     /// SPEC-TS-003b
-    CrcError {
-        pid:      Pid,
-        table_id: u8,
-    },
+    CrcError { pid: Pid, table_id: u8 },
 
     /// Pacote processado; carrega pid e tamanho (188 bytes) para cálculo de bitrate.
     ///
     /// SPEC-METRICS-001
-    Packet {
-        pid:   Pid,
-        bytes: usize,
-    },
+    Packet { pid: Pid, bytes: usize },
 }
 
 /// Eventos emitidos pelo `PcrTracker` para diagnóstico de jitter e descontinuidade.
@@ -82,7 +70,7 @@ pub enum PcrEvent {
     ///
     /// SPEC-TS-004b
     Jitter {
-        pid:         Pid,
+        pid: Pid,
         expected_us: i64,
         measured_us: i64,
     },
@@ -91,7 +79,7 @@ pub enum PcrEvent {
     ///
     /// SPEC-TS-004b
     Discontinuity {
-        pid:    Pid,
+        pid: Pid,
         reason: DiscontinuityReason,
     },
 }

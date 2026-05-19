@@ -246,12 +246,20 @@ mod tests {
 
     /// Cria um `SectionData` com PUSI=true.
     fn section_data_pusi(pid: Pid, payload: Bytes) -> SectionData {
-        SectionData { pid, pusi: true, payload }
+        SectionData {
+            pid,
+            pusi: true,
+            payload,
+        }
     }
 
     /// Cria um `SectionData` com PUSI=false.
     fn section_data_cont(pid: Pid, payload: Bytes) -> SectionData {
-        SectionData { pid, pusi: false, payload }
+        SectionData {
+            pid,
+            pusi: false,
+            payload,
+        }
     }
 
     // ── SPEC-TS-003 — Cenário 1: seção em pacote único ────────────────────────
@@ -319,7 +327,9 @@ mod tests {
         assert!(r3.is_ok());
 
         // Agora deve ter emitido.
-        let complete = rx.try_recv().expect("CompleteSection esperada no 3º pacote");
+        let complete = rx
+            .try_recv()
+            .expect("CompleteSection esperada no 3º pacote");
         assert_eq!(complete.pid, 0x0100);
         assert_eq!(complete.table_id, 0x02);
         assert_eq!(complete.data.as_ref(), &section[..section.len() - 4]);
@@ -360,8 +370,14 @@ mod tests {
 
         // Apenas a nova seção deve ser emitida.
         let complete = rx.try_recv().expect("nova seção esperada");
-        assert_eq!(complete.table_id, 0x03, "deve ser a nova seção (table_id=0x03)");
-        assert!(rx.try_recv().is_err(), "apenas uma seção deve ter sido emitida");
+        assert_eq!(
+            complete.table_id, 0x03,
+            "deve ser a nova seção (table_id=0x03)"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "apenas uma seção deve ter sido emitida"
+        );
     }
 
     // ── SPEC-TS-003 — Cenário 4: CRC inválido ────────────────────────────────
@@ -384,7 +400,10 @@ mod tests {
             .unwrap();
 
         // Nenhuma seção deve ser emitida.
-        assert!(rx.try_recv().is_err(), "seção com CRC inválido não deve ser emitida");
+        assert!(
+            rx.try_recv().is_err(),
+            "seção com CRC inválido não deve ser emitida"
+        );
 
         // Um CrcError deve ter sido emitido.
         let events: Vec<TsEvent> = evt_rx.try_iter().collect();
@@ -420,11 +439,12 @@ mod tests {
         // pointer_field=0, table_id, section_length_byte1 (com bits reservados),
         // section_length_byte2
         let payload = vec![
-            0x00u8,                                         // pointer_field
-            0x02,                                           // table_id
-            0xF0 | ((section_length >> 8) as u8 & 0x0F),  // reserved(4) | section_length_high
-            (section_length & 0xFF) as u8,                 // section_length_low
-            0x00, 0x00,                                    // bytes de preenchimento
+            0x00u8,                                      // pointer_field
+            0x02,                                        // table_id
+            0xF0 | ((section_length >> 8) as u8 & 0x0F), // reserved(4) | section_length_high
+            (section_length & 0xFF) as u8,               // section_length_low
+            0x00,
+            0x00, // bytes de preenchimento
         ];
 
         let result = asm.push(section_data_pusi(0x0010, Bytes::from(payload)));

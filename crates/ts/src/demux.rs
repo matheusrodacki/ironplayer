@@ -126,7 +126,10 @@ impl TsDemuxer {
                     .try_send(TsEvent::SyncLost { bytes_skipped })
                     .is_err()
                 {
-                    warn!("event_tx cheio; SyncLost descartado (bytes_skipped={})", bytes_skipped);
+                    warn!(
+                        "event_tx cheio; SyncLost descartado (bytes_skipped={})",
+                        bytes_skipped
+                    );
                 }
                 // Se não há mais bytes, encerrar.
                 if pos >= raw.len() {
@@ -210,7 +213,11 @@ impl TsDemuxer {
 
         if self.av_pids.contains(&pid) {
             // PID de A/V → canal PES.
-            if self.pes_tx.try_send(PesData { pid, data: payload }).is_err() {
+            if self
+                .pes_tx
+                .try_send(PesData { pid, data: payload })
+                .is_err()
+            {
                 warn!("pes_tx cheio; PesData(pid=0x{:04X}) descartado", pid);
             }
         } else if self.is_section_pid(pid) {
@@ -224,7 +231,10 @@ impl TsDemuxer {
                 })
                 .is_err()
             {
-                warn!("section_tx cheio; SectionData(pid=0x{:04X}) descartado", pid);
+                warn!(
+                    "section_tx cheio; SectionData(pid=0x{:04X}) descartado",
+                    pid
+                );
             }
         } else {
             // PID desconhecido → rotear como seção (tentativa).
@@ -326,7 +336,11 @@ mod tests {
         assert_eq!(cc_errors.len(), 1, "exatamente um CcError esperado");
 
         match cc_errors[0] {
-            TsEvent::CcError { pid: epid, expected, got } => {
+            TsEvent::CcError {
+                pid: epid,
+                expected,
+                got,
+            } => {
                 assert_eq!(*epid, pid);
                 assert_eq!(*expected, 4, "esperado CC=4");
                 assert_eq!(*got, 5, "recebido CC=5");
@@ -392,7 +406,10 @@ mod tests {
             .filter(|e| matches!(e, TsEvent::CcError { .. }))
             .collect();
 
-        assert!(cc_errors.is_empty(), "nenhum CcError esperado para null packets");
+        assert!(
+            cc_errors.is_empty(),
+            "nenhum CcError esperado para null packets"
+        );
     }
 
     // ── SPEC-TS-002b — Adaptation-only — CC não incrementa ───────────────────
@@ -428,7 +445,10 @@ mod tests {
             .filter(|e| matches!(e, TsEvent::CcError { .. }))
             .collect();
 
-        assert!(cc_errors.is_empty(), "pacote adaptation-only não deve gerar CcError");
+        assert!(
+            cc_errors.is_empty(),
+            "pacote adaptation-only não deve gerar CcError"
+        );
     }
 
     // ── SPEC-TS-002c — Recuperação de sync ───────────────────────────────────
@@ -471,7 +491,11 @@ mod tests {
 
         // O pacote após o sync deve ter sido processado (chegou ao section_tx).
         let sections: Vec<SectionData> = sec_rx.try_iter().collect();
-        assert_eq!(sections.len(), 1, "um pacote de seção esperado após re-sync");
+        assert_eq!(
+            sections.len(),
+            1,
+            "um pacote de seção esperado após re-sync"
+        );
         assert_eq!(sections[0].pid, pid);
     }
 
@@ -549,7 +573,11 @@ mod tests {
         demuxer.process_chunk(&build_payload_packet(pmt_pid, 0));
 
         let sections: Vec<SectionData> = sec_rx.try_iter().collect();
-        assert_eq!(sections.len(), 1, "PID de PMT deve ser roteado para section_tx");
+        assert_eq!(
+            sections.len(),
+            1,
+            "PID de PMT deve ser roteado para section_tx"
+        );
         assert_eq!(sections[0].pid, pmt_pid);
     }
 
@@ -586,8 +614,14 @@ mod tests {
 
         demuxer.process_chunk(&build_null_packet(0));
 
-        assert!(sec_rx.try_iter().next().is_none(), "null packet não deve chegar em section_tx");
-        assert!(pes_rx.try_iter().next().is_none(), "null packet não deve chegar em pes_tx");
+        assert!(
+            sec_rx.try_iter().next().is_none(),
+            "null packet não deve chegar em section_tx"
+        );
+        assert!(
+            pes_rx.try_iter().next().is_none(),
+            "null packet não deve chegar em pes_tx"
+        );
     }
 
     /// Pacote vazio não causa panic.
@@ -627,6 +661,9 @@ mod tests {
             .filter(|e| matches!(e, TsEvent::CcError { .. }))
             .collect();
 
-        assert!(cc_errors.is_empty(), "wrap-around CC=15→0 não deve gerar CcError");
+        assert!(
+            cc_errors.is_empty(),
+            "wrap-around CC=15→0 não deve gerar CcError"
+        );
     }
 }

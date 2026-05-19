@@ -20,7 +20,7 @@ const LARGE_JUMP_THRESHOLD_US: i64 = 100_000;
 
 /// Estado interno por PID.
 struct PcrState {
-    last_pcr:  u64,
+    last_pcr: u64,
     last_time: Instant,
 }
 
@@ -32,7 +32,7 @@ struct PcrState {
 ///
 /// SPEC-TS-004b
 pub struct PcrTracker {
-    state:    HashMap<Pid, PcrState>,
+    state: HashMap<Pid, PcrState>,
     event_tx: Sender<PcrEvent>,
 }
 
@@ -93,8 +93,7 @@ impl PcrTracker {
                         reason: DiscontinuityReason::LargeJump { delta_ms },
                     });
                 } else {
-                    let delta_real_us =
-                        now.duration_since(last_time).as_micros() as i64;
+                    let delta_real_us = now.duration_since(last_time).as_micros() as i64;
                     let jitter_us = (delta_real_us - delta_pcr_us).abs();
 
                     if jitter_us > JITTER_THRESHOLD_US {
@@ -109,7 +108,13 @@ impl PcrTracker {
         }
 
         // Sempre atualiza o estado com o novo PCR (inclusive após descontinuidade).
-        self.state.insert(pid, PcrState { last_pcr: pcr, last_time: now });
+        self.state.insert(
+            pid,
+            PcrState {
+                last_pcr: pcr,
+                last_time: now,
+            },
+        );
     }
 }
 
@@ -145,7 +150,10 @@ mod tests {
 
         tracker.update_with_time(100, 0, false, t0);
 
-        assert!(rx.try_recv().is_err(), "nenhum evento esperado no primeiro PCR");
+        assert!(
+            rx.try_recv().is_err(),
+            "nenhum evento esperado no primeiro PCR"
+        );
     }
 
     /// Jitter acima de 500 µs deve emitir `PcrEvent::Jitter`.
@@ -168,7 +176,11 @@ mod tests {
 
         let ev = rx.try_recv().expect("esperava PcrEvent::Jitter");
         match ev {
-            PcrEvent::Jitter { pid: p, expected_us, measured_us } => {
+            PcrEvent::Jitter {
+                pid: p,
+                expected_us,
+                measured_us,
+            } => {
                 assert_eq!(p, pid);
                 assert_eq!(expected_us, 1_000);
                 assert_eq!(measured_us, 2_000);
@@ -194,7 +206,10 @@ mod tests {
         tracker.update_with_time(pid, pcr0, false, t0);
         tracker.update_with_time(pid, pcr1, false, t1);
 
-        assert!(rx.try_recv().is_err(), "nenhum evento esperado com jitter baixo");
+        assert!(
+            rx.try_recv().is_err(),
+            "nenhum evento esperado com jitter baixo"
+        );
     }
 
     /// `discontinuity_indicator = true` emite `PcrEvent::Discontinuity { reason: Flag }`.
@@ -303,7 +318,13 @@ mod tests {
         // Apenas 1 evento: a descontinuidade.
         let ev = rx.try_recv().expect("esperava 1 evento");
         assert!(
-            matches!(ev, PcrEvent::Discontinuity { reason: DiscontinuityReason::Flag, .. }),
+            matches!(
+                ev,
+                PcrEvent::Discontinuity {
+                    reason: DiscontinuityReason::Flag,
+                    ..
+                }
+            ),
             "esperava Discontinuity::Flag, recebeu: {ev:?}"
         );
         assert!(rx.try_recv().is_err(), "não deve haver segundo evento");

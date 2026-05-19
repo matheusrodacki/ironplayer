@@ -1,0 +1,16 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+
+[dependencies]
+socket2           = "0.5"
+tokio             = { workspace = true }
+crossbeam-channel = { workspace = true }
+bytes             = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

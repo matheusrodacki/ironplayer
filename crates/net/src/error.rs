@@ -11,8 +11,8 @@ pub enum NetError {
     #[error("porta inválida: 0")]
     InvalidPort,
 
-    #[error("esquema de URL desconhecido: {0}")]
-    UnknownScheme(String),
+    #[error("esquema de URL não suportado: {0}")]
+    UnsupportedScheme(String),
 
     #[error("URL malformada: {0}")]
     MalformedUrl(String),

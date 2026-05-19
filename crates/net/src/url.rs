@@ -36,7 +36,7 @@ impl StreamUrl {
 
         let scheme = scheme.to_lowercase();
         if scheme != "udp" && scheme != "rtp" {
-            return Err(NetError::UnknownScheme(scheme));
+            return Err(NetError::UnsupportedScheme(scheme));
         }
 
         // Remove '@' opcional no início do host
@@ -144,11 +144,11 @@ mod tests {
         assert!(matches!(result, Err(NetError::InvalidPort)));
     }
 
-    /// SPEC-NET-001 — esquema desconhecido retorna UnknownScheme
+    /// SPEC-NET-001 — esquema não suportado retorna UnsupportedScheme
     #[test]
-    fn spec_net_001_unknown_scheme() {
+    fn spec_net_001_unsupported_scheme() {
         let result = StreamUrl::parse("http://example.com");
-        assert!(matches!(result, Err(NetError::UnknownScheme(_))));
+        assert!(matches!(result, Err(NetError::UnsupportedScheme(_))));
     }
 
     /// SPEC-NET-001 — parsing de ?iface=

@@ -92,7 +92,7 @@ impl RtpStripper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossbeam_channel::unbounded;
+    use crossbeam_channel::bounded;
 
     fn make_rtp_packet(seq: u16, cc: u8, payload: &[u8]) -> Bytes {
         let byte0 = RTP_VERSION_2 | (cc & 0x0F);
@@ -118,7 +118,7 @@ mod tests {
     /// SPEC-NET-003: RTP header válido PT=33, sem CSRC — remove 12 bytes
     #[test]
     fn spec_net_003_rtp_header_stripped() {
-        let (tx, _rx) = unbounded();
+        let (tx, _rx) = bounded(8);
         let mut s = RtpStripper::new(tx);
         let payload = vec![0x47u8; 188];
         let pkt = make_rtp_packet(1, 0, &payload);
@@ -129,7 +129,7 @@ mod tests {
     /// SPEC-NET-003: CC=2 — remove 12 + 8 = 20 bytes
     #[test]
     fn spec_net_003_csrc_count_2() {
-        let (tx, _rx) = unbounded();
+        let (tx, _rx) = bounded(8);
         let mut s = RtpStripper::new(tx);
         let payload = vec![0x47u8; 188];
         let pkt = make_rtp_packet(1, 2, &payload);
@@ -141,7 +141,7 @@ mod tests {
     /// SPEC-NET-003: sync byte 0x47 no offset 0 — passa integralmente
     #[test]
     fn spec_net_003_passthrough_raw_ts() {
-        let (tx, _rx) = unbounded();
+        let (tx, _rx) = bounded(8);
         let mut s = RtpStripper::new(tx);
         let raw = Bytes::from(vec![0x47u8; 188]);
         let result = s.strip(raw.clone());
@@ -151,7 +151,7 @@ mod tests {
     /// SPEC-NET-003: wrap-around 0xFFFF→0x0001 não emite OutOfOrder
     #[test]
     fn spec_net_003_sequence_wrap_no_out_of_order() {
-        let (tx, rx) = unbounded();
+        let (tx, rx) = bounded(8);
         let mut s = RtpStripper::new(tx);
         let payload = vec![0u8; 188];
         s.strip(make_rtp_packet(0xFFFF, 0, &payload));
@@ -162,7 +162,7 @@ mod tests {
     /// SPEC-NET-003: pulo 100→102 emite OutOfOrder { expected: 101, got: 102 }
     #[test]
     fn spec_net_003_sequence_out_of_order() {
-        let (tx, rx) = unbounded();
+        let (tx, rx) = bounded(8);
         let mut s = RtpStripper::new(tx);
         let payload = vec![0u8; 188];
         s.strip(make_rtp_packet(100, 0, &payload));

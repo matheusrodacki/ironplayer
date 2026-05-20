@@ -18,6 +18,7 @@ use crate::panels::metrics::MetricsPanel;
 use crate::panels::tables::TablesPanel;
 use crate::panels::video::VideoPanel;
 use crate::status_bar::StatusBar;
+use av::{VideoFrame, VideoRenderer};
 
 // ---------------------------------------------------------------------------
 // IronPlayerApp
@@ -52,6 +53,16 @@ pub struct IronPlayerApp {
     connection_rx: Option<Arc<RwLock<ConnectionState>>>,
     /// Eventos incrementais de tabelas PSI/SI vindos do `TableDispatcher`.
     table_events_rx: Option<Receiver<TableEvent>>,
+    /// Receptor de frames de vídeo decodificados (FfmpegDecoder → UI).
+    ///
+    /// SPEC-AV-003
+    video_frames_rx: Option<Receiver<VideoFrame>>,
+    /// Renderizador de vídeo: mantém textura GPU/CPU entre frames.
+    ///
+    /// SPEC-AV-003
+    video_renderer: Option<VideoRenderer>,
+    /// Dimensões do último frame renderizado `(width, height)`.
+    video_dims: Option<(u32, u32)>,
 }
 
 impl IronPlayerApp {
@@ -60,14 +71,33 @@ impl IronPlayerApp {
     /// `snapshot_rx`: receptor de métricas do pipeline; `None` quando o
     /// pipeline ainda não foi iniciado (modo stand-alone / testes).
     ///
-    /// SPEC-UI-001 · SPEC-UI-008
+    /// `video_frames_rx`: receptor de `VideoFrame` decodificados; `None` em
+    /// modo stand-alone. Quando `Some`, o renderer é inicializado em modo GPU
+    /// (D3D11 via wgpu) se disponível, ou modo CPU como fallback.
+    ///
+    /// SPEC-UI-001 · SPEC-UI-008 · SPEC-AV-003
     pub fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         cmd_tx: Sender<AppCommand>,
         snapshot_rx: Option<ts::aggregator::SnapshotReceiver>,
         connection_rx: Option<Arc<RwLock<ConnectionState>>>,
         table_events_rx: Option<Receiver<TableEvent>>,
+        video_frames_rx: Option<Receiver<VideoFrame>>,
     ) -> Self {
+        // Inicializa VideoRenderer em modo GPU (D3D11) quando wgpu disponível,
+        // ou em modo CPU como fallback. SPEC-AV-003 · SPEC-AV-003c
+        let video_renderer = video_frames_rx.as_ref().map(|_| {
+            if let Some(wgpu_state) = &cc.wgpu_render_state {
+                VideoRenderer::new_gpu(
+                    wgpu_state.device.clone(),
+                    wgpu_state.queue.clone(),
+                    wgpu_state.renderer.clone(),
+                )
+            } else {
+                VideoRenderer::new_cpu(cc.egui_ctx.clone())
+            }
+        });
+
         Self {
             state: AppState::default(),
             cmd_tx,
@@ -77,6 +107,9 @@ impl IronPlayerApp {
             snapshot_rx,
             connection_rx,
             table_events_rx,
+            video_frames_rx,
+            video_renderer,
+            video_dims: None,
         }
     }
 
@@ -146,6 +179,39 @@ impl IronPlayerApp {
             self.state.apply_table_event(event);
         }
     }
+
+    /// Drena frames de vídeo do canal e faz upload do mais recente ao renderer.
+    ///
+    /// Drena até 8 frames por frame de UI, retendo apenas o mais recente para
+    /// evitar acúmulo. Segue o comportamento de drop-oldest definido em
+    /// SPEC-CHAN-001 para o canal `video_frames`.
+    ///
+    /// SPEC-AV-003
+    fn poll_video_frames(&mut self) {
+        let rx = match &self.video_frames_rx {
+            Some(r) => r.clone(),
+            None => return,
+        };
+
+        // Drena até 8 frames, mantendo apenas o mais recente.
+        let mut latest: Option<VideoFrame> = None;
+        for frame in rx.try_iter().take(8) {
+            latest = Some(frame);
+        }
+
+        if let Some(frame) = latest {
+            if let Some(renderer) = &mut self.video_renderer {
+                match renderer.upload(&frame) {
+                    Ok(()) => {
+                        self.video_dims = Some((frame.width, frame.height));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "poll_video_frames: falha no upload do frame");
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for IronPlayerApp {
@@ -156,6 +222,7 @@ impl eframe::App for IronPlayerApp {
         // ── Poll de métricas do pipeline ──────────────────────────────────
         self.poll_snapshot();
         self.poll_table_events();
+        self.poll_video_frames();
 
         // ── Header: URL + botões Conectar / Desconectar ──────────────────────
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
@@ -201,11 +268,16 @@ impl eframe::App for IronPlayerApp {
         });
 
         // ── Painel esquerdo: VideoPanel (≈40%) ───────────────────────────────
+        let video_texture = self
+            .video_renderer
+            .as_ref()
+            .and_then(|r| r.texture_id())
+            .zip(self.video_dims);
         egui::SidePanel::left("video_panel")
             .resizable(true)
             .default_width(400.0)
             .show(ctx, |ui| {
-                VideoPanel::show(ui, &self.state);
+                VideoPanel::show(ui, &self.state, video_texture);
             });
 
         // ── Painel direito: MetricsPanel (≈25%) ──────────────────────────────
@@ -246,6 +318,10 @@ pub fn run(title: &str) -> eframe::Result {
     eframe::run_native(
         title,
         native_options,
-        Box::new(move |cc| Ok(Box::new(IronPlayerApp::new(cc, cmd_tx, None, None, None)))),
+        Box::new(move |cc| {
+            Ok(Box::new(IronPlayerApp::new(
+                cc, cmd_tx, None, None, None, None,
+            )))
+        }),
     )
 }

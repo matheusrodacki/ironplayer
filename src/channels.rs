@@ -61,7 +61,7 @@ pub struct BoundedSender<T> {
 }
 
 impl<T> BoundedSender<T> {
-    fn new(inner: Sender<T>, name: &'static str) -> Self {
+    pub(crate) fn new(inner: Sender<T>, name: &'static str) -> Self {
         Self { inner, name }
     }
 

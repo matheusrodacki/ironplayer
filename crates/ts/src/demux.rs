@@ -10,7 +10,8 @@ use crossbeam_channel::Sender;
 use tracing::warn;
 
 use crate::packet::TsPacket;
-use crate::{Pid, TsError, TsEvent};
+use crate::pcr::PcrTracker;
+use crate::{PcrEvent, Pid, TsError, TsEvent};
 
 // ── PIDs de seção bem conhecidos (ISO 13818-1) ───────────────────────────────
 
@@ -73,6 +74,10 @@ pub struct TsDemuxer {
     av_pids: HashSet<Pid>,
     /// Último WARN de canal cheio para eventos Packet, que são de alta frequência.
     last_packet_event_full_warn: Option<Instant>,
+    /// Rastreador de jitter e descontinuidade PCR (opcional).
+    ///
+    /// SPEC-TS-004b
+    pcr_tracker: Option<PcrTracker>,
 }
 
 impl TsDemuxer {
@@ -92,7 +97,20 @@ impl TsDemuxer {
             pmt_pids: HashSet::new(),
             av_pids: HashSet::new(),
             last_packet_event_full_warn: None,
+            pcr_tracker: None,
         }
+    }
+
+    /// Habilita rastreamento de PCR com um canal de saída de eventos.
+    ///
+    /// Deve ser chamado após `new()` e antes de processar qualquer pacote.
+    /// Quando habilitado, todo pacote TS com PCR no Adaptation Field é
+    /// processado pelo [`PcrTracker`] que emite [`PcrEvent`]s no canal.
+    ///
+    /// SPEC-TS-004b
+    pub fn with_pcr_tracker(mut self, pcr_tx: Sender<PcrEvent>) -> Self {
+        self.pcr_tracker = Some(PcrTracker::new(pcr_tx));
+        self
     }
 
     /// Registra um PID como PMT (chamado ao parsear a PAT).
@@ -210,6 +228,15 @@ impl TsDemuxer {
                 }
             }
             self.cc_state.insert(pid, pkt.continuity_counter);
+        }
+
+        // ── PCR tracking (SPEC-TS-004b) ───────────────────────────────────────
+        if let Some(ref mut tracker) = self.pcr_tracker {
+            if let Some(af) = &pkt.adaptation_field {
+                if let Some(pcr) = af.pcr {
+                    tracker.update(pid, pcr, af.discontinuity_indicator);
+                }
+            }
         }
 
         // ── Roteamento de payload (SPEC-TS-002a) ─────────────────────────────

@@ -180,12 +180,13 @@ fn main() -> eframe::Result<()> {
     let (metrics_agg, snapshot_rx) =
         MetricsAggregator::new(ch.ts_events_rx, ch.pcr_events_rx, agg_net_rx);
 
-    // 8. Instancia TsDemuxer
+    // 8. Instancia TsDemuxer com rastreamento de PCR integrado (SPEC-TS-004b)
     let ts_demuxer = TsDemuxer::new(
         ch.section_data_tx.sender(),
         ch.pes_data_tx.sender(),
         ch.ts_events_tx.sender(),
-    );
+    )
+    .with_pcr_tracker(ch.pcr_events_tx.sender());
 
     // 9. Instancia SectionAssembler
     let section_asm =
@@ -215,6 +216,8 @@ fn main() -> eframe::Result<()> {
     {
         let net_raw_rx = ch.net_raw_rx;
         let ts_raw_tx = ch.ts_raw_tx;
+        // Clone antes de mover agg_net_tx para dentro do rtp-strip closure.
+        let agg_net_tx_rtp = agg_net_tx.clone();
         handles.push(
             std::thread::Builder::new()
                 .name("rtp-strip".into())
@@ -236,11 +239,38 @@ fn main() -> eframe::Result<()> {
                                     AggregatorNetEvent::RtpOutOfOrder
                                 }
                             };
-                            let _ = agg_net_tx.try_send(agg_evt);
+                            let _ = agg_net_tx_rtp.try_send(agg_evt);
                         }
                     }
                 })
                 .expect("falha ao criar thread rtp-strip"),
+        );
+    }
+
+    // Thread: net-events — converte NetEvent → AggregatorNetEvent e repassa ao MetricsAggregator.
+    //
+    // O canal `ch.net_events_rx` recebe eventos do UdpReceiver (Started, Timeout, Stopped).
+    // Este bridge drena o canal para evitar backpressure; quando NetEvent::UdpBufferOverflow
+    // for implementado no crate `net`, adicioná-lo aqui como `AggregatorNetEvent::UdpBufferOverflow`.
+    {
+        let net_events_rx = ch.net_events_rx;
+        let _agg_net_tx_bridge = agg_net_tx.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name("net-events".into())
+                .spawn(move || {
+                    for evt in net_events_rx.iter() {
+                        match evt {
+                            // TODO: quando net::NetEvent::UdpBufferOverflow for adicionado:
+                            // net::NetEvent::UdpBufferOverflow { .. } =>
+                            //     let _ = _agg_net_tx_bridge.try_send(AggregatorNetEvent::UdpBufferOverflow),
+                            net::NetEvent::Started
+                            | net::NetEvent::Timeout
+                            | net::NetEvent::Stopped => {}
+                        }
+                    }
+                })
+                .expect("falha ao criar thread net-events"),
         );
     }
 
@@ -327,25 +357,117 @@ fn main() -> eframe::Result<()> {
             .expect("falha ao criar thread table-disp"),
     );
 
-    // Thread: pes-drain — etapa temporária até o wiring de decode/render da UI.
+    // Thread: av-decode — SPEC-AV-002b
+    // Recebe PesPackets, decodifica via FFmpeg e roteia VideoFrame/AudioFrame.
     {
         let pes_packets_rx = ch.pes_packets_rx;
+        let video_frames_tx = ch.video_frames_tx;
+        let audio_frames_tx = ch.audio_frames_tx;
         handles.push(
             std::thread::Builder::new()
-                .name("pes-drain".into())
+                .name("av-decode".into())
                 .spawn(move || {
-                    tracing::info!(
-                        "av-decode/render ainda nao conectado; PesPackets serao drenados"
-                    );
+                    let mut decoder = match av::FfmpegDecoder::new() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::error!(
+                                %e,
+                                "av-decode: falha ao inicializar FfmpegDecoder; thread encerrando"
+                            );
+                            // Drena o canal para não bloquear o pipeline a montante.
+                            for _ in pes_packets_rx.iter() {}
+                            return;
+                        }
+                    };
+
+                    tracing::info!("av-decode: iniciado");
+
                     for packet in pes_packets_rx.iter() {
-                        tracing::trace!(
-                            pid = packet.pid,
-                            bytes = packet.payload.len(),
-                            "PES packet drenado"
-                        );
+                        match decoder.decode(&packet) {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    match frame {
+                                        av::DecodedFrame::Video(vf) => {
+                                            video_frames_tx.try_send(vf);
+                                        }
+                                        av::DecodedFrame::Audio(af) => {
+                                            audio_frames_tx.try_send(af);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, pid = packet.pid, "av-decode: erro ao decodificar PES");
+                            }
+                        }
                     }
+
+                    tracing::info!("av-decode: encerrado normalmente");
                 })
-                .expect("falha ao criar thread pes-drain"),
+                .expect("falha ao criar thread av-decode"),
+        );
+    }
+
+    // Thread: video-drain removida (Task 2) — VideoRenderer integrado na UI.
+    // `video_frames_rx` é entregue diretamente a `IronPlayerApp`.
+    let video_frames_rx = ch.video_frames_rx;
+
+    // Thread: audio-out — SPEC-AV-004
+    // Recebe AudioFrames do decoder e os entrega ao AudioOutput (WASAPI via cpal).
+    // Inicialização lazy: AudioOutput é criado na primeira frame recebida, pois
+    // sample_rate e channels só são conhecidos após decodificação.
+    {
+        let audio_frames_rx = ch.audio_frames_rx;
+        let jitter_buffer_ms = cfg.player.jitter_buffer_ms as u32;
+        let initial_volume = cfg.player.volume;
+        handles.push(
+            std::thread::Builder::new()
+                .name("audio-out".into())
+                .spawn(move || {
+                    let mut audio_out: Option<av::AudioOutput> = None;
+
+                    for frame in audio_frames_rx.iter() {
+                        // Lazy-init: cria AudioOutput na primeira frame (ou quando
+                        // sample_rate/channels mudam, reiniciando o stream).
+                        let needs_reinit = audio_out.as_ref().is_none_or(|out| {
+                            out.sample_rate != frame.sample_rate || out.channels != frame.channels
+                        });
+
+                        if needs_reinit {
+                            match av::AudioOutput::new(
+                                frame.sample_rate,
+                                frame.channels,
+                                jitter_buffer_ms,
+                            ) {
+                                Ok(out) => {
+                                    out.set_volume(initial_volume);
+                                    tracing::info!(
+                                        sample_rate = frame.sample_rate,
+                                        channels = frame.channels,
+                                        "audio-out: AudioOutput inicializado"
+                                    );
+                                    audio_out = Some(out);
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        %e,
+                                        sample_rate = frame.sample_rate,
+                                        channels = frame.channels,
+                                        "audio-out: falha ao criar AudioOutput; frame descartado"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if let Some(ref out) = audio_out {
+                            out.push_samples(&frame);
+                        }
+                    }
+
+                    tracing::info!("audio-out: encerrado normalmente");
+                })
+                .expect("falha ao criar thread audio-out"),
         );
     }
 
@@ -478,6 +600,7 @@ fn main() -> eframe::Result<()> {
                     Some(snapshot_rx),
                     Some(conn_state),
                     Some(table_events_rx.clone()),
+                    Some(video_frames_rx),
                 ),
                 guard,
             }))

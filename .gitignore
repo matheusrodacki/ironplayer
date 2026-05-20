@@ -26,3 +26,5 @@
 *.swp
 PRD.md
 progress.txt
+
+/ffmpeg/

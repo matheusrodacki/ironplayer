@@ -73,6 +73,17 @@
 
 ---
 
+### v1.x — Funcionalidades Futuras
+
+| Item                                      | Descrição                                                                                                                                                                                                                                                             |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Legendas DVB (SPEC-SUB-001)               | Parser de subtitling_descriptor na PMT; decodificação de DVB Subtitles (EN 300 743); renderização sobreposta no `VideoPanel` via `egui::Painter`. Requer `AppCommand::SelectSubtitlePid`, novo canal `subtitle_frames` e integração com o menu de contexto do player. |
+| Seleção de faixa de áudio (SPEC-AV-005)   | Suporte a múltiplas faixas de áudio por serviço; `AppCommand::SelectAudioPid`; troca dinâmica sem interrupção do vídeo.                                                                                                                                               |
+| Exportação de métricas (SPEC-METRICS-004) | Exportar histórico de bitrate e jitter PCR para CSV/JSON.                                                                                                                                                                                                             |
+| Gravação de stream (SPEC-NET-004)         | Dump do TS bruto para arquivo `.ts` com buffer circular configurável.                                                                                                                                                                                                 |
+
+---
+
 ## Dependências entre Features
 
 ```

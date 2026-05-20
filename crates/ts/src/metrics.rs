@@ -163,7 +163,7 @@ pub struct PcrDiscontinuityRecord {
 /// Mudanças posteriores no `ErrorTracker` não afetam instâncias existentes.
 ///
 /// SPEC-METRICS-002a
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ErrorSnapshot {
     /// Contagem de CC errors por PID.
     pub cc_errors: HashMap<Pid, u64>,
@@ -223,6 +223,19 @@ pub struct MetricsSnapshot {
     pub tdt_offset_secs: Option<i64>,
     /// Instante de criação deste snapshot.
     pub timestamp: Instant,
+}
+
+impl Default for MetricsSnapshot {
+    fn default() -> Self {
+        Self {
+            pid_table: Vec::new(),
+            total_bitrate_kbps: 0.0,
+            null_ratio: 0.0,
+            errors: ErrorSnapshot::default(),
+            tdt_offset_secs: None,
+            timestamp: Instant::now(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

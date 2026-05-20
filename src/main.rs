@@ -19,6 +19,7 @@ use ts::{
     },
     CompleteSection, SectionAssembler, SectionData, TsDemuxer,
 };
+use ui::IronPlayerApp;
 
 // ── SenderGuard ───────────────────────────────────────────────────────────────
 
@@ -39,15 +40,13 @@ struct SenderGuard {
     ts_events_tx: BoundedSender<ts::TsEvent>,
 }
 
-// ── IronPlayerApp ─────────────────────────────────────────────────────────────
+// ── PipelineGuard ─────────────────────────────────────────────────────────────
 
-/// App eframe que orquestra o pipeline IronPlayer e implementa shutdown limpo.
+/// Encapsula handles e recursos do pipeline para shutdown limpo.
 ///
-/// `on_exit` e invocado pelo eframe ao fechar a janela e executa:
-/// 1. Sinaliza `NetStopHandle::stop()` e `MetricsStopHandle::stop()`
-/// 2. Dropa o `SenderGuard` → encerramento em cascata dos canais
-/// 3. Faz join de todas as threads com budget total de 2 s
-struct IronPlayerApp {
+/// Injetado em `IronPlayerApp` via `eframe::CreationContext` e recuperado
+/// em `on_exit` para encerramento em cascata.
+struct PipelineGuard {
     pipeline_handles: Vec<Option<std::thread::JoinHandle<()>>>,
     metrics_handle: Option<std::thread::JoinHandle<()>>,
     net_stop_handle: Option<NetStopHandle>,
@@ -55,39 +54,8 @@ struct IronPlayerApp {
     _sender_guard: Option<SenderGuard>,
 }
 
-impl IronPlayerApp {
-    fn new(
-        pipeline_handles: Vec<std::thread::JoinHandle<()>>,
-        metrics_handle: std::thread::JoinHandle<()>,
-        net_stop_handle: NetStopHandle,
-        metrics_stop_handle: MetricsStopHandle,
-        sender_guard: SenderGuard,
-    ) -> Self {
-        Self {
-            pipeline_handles: pipeline_handles.into_iter().map(Some).collect(),
-            metrics_handle: Some(metrics_handle),
-            net_stop_handle: Some(net_stop_handle),
-            metrics_stop_handle: Some(metrics_stop_handle),
-            _sender_guard: Some(sender_guard),
-        }
-    }
-}
-
-impl eframe::App for IronPlayerApp {
-    fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
-        eframe::egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("IronPlayer");
-            ui.label("Pipeline de backend ativo.");
-        });
-    }
-
-    /// Aciona o shutdown limpo ao fechar a janela (SPEC-WIRING-SHUTDOWN).
-    ///
-    /// Sequencia:
-    /// 1. Sinaliza parada dos workers ativos (`net-recv`, `metrics`)
-    /// 2. Dropa `SenderGuard` → cascata de fechamento de canais
-    /// 3. Join de todas as threads com budget total de 2 s
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+impl PipelineGuard {
+    fn shutdown(&mut self) {
         tracing::info!("shutdown iniciado pelo eframe::App::on_exit");
 
         // 1. Sinaliza parada dos workers com stop handles
@@ -114,6 +82,24 @@ impl eframe::App for IronPlayerApp {
         }
 
         tracing::info!("shutdown limpo concluido");
+    }
+}
+
+// ── IronPlayerAppExt ──────────────────────────────────────────────────────────
+
+/// Wrapper que adiciona shutdown do pipeline ao `IronPlayerApp` do crate `ui`.
+struct IronPlayerAppWithPipeline {
+    inner: IronPlayerApp,
+    guard: PipelineGuard,
+}
+
+impl eframe::App for IronPlayerAppWithPipeline {
+    fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+        self.inner.update(ctx, frame);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.guard.shutdown();
     }
 }
 
@@ -195,7 +181,7 @@ fn main() -> eframe::Result<()> {
         MetricsStopToken::new();
 
     // 8. Instancia MetricsAggregator
-    let (metrics_agg, _snapshot_rx) =
+    let (metrics_agg, snapshot_rx) =
         MetricsAggregator::new(ch.ts_events_rx, ch.pcr_events_rx, agg_net_rx);
 
     // 9. Instancia TsDemuxer
@@ -332,19 +318,34 @@ fn main() -> eframe::Result<()> {
 
     tracing::info!(threads = handles.len() + 1, "pipeline de backend iniciado");
 
-    // 14. Loop de UI via eframe
-    let app = IronPlayerApp::new(
-        handles,
-        metrics_handle,
-        net_stop_handle,
-        metrics_stop_handle,
-        sender_guard,
-    );
+    // 14. Canal de comandos UI → pipeline
+    let (cmd_tx, _cmd_rx) =
+        crossbeam_channel::bounded::<ui::AppCommand>(channels::CAP_APP_COMMANDS);
 
-    let native_options = eframe::NativeOptions::default();
+    // 15. Loop de UI via eframe
+    let guard = PipelineGuard {
+        pipeline_handles: handles.into_iter().map(Some).collect(),
+        metrics_handle: Some(metrics_handle),
+        net_stop_handle: Some(net_stop_handle),
+        metrics_stop_handle: Some(metrics_stop_handle),
+        _sender_guard: Some(sender_guard),
+    };
+
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title("IronPlayer")
+            .with_inner_size([1280.0, 720.0]),
+        ..Default::default()
+    };
+
     eframe::run_native(
         "IronPlayer",
         native_options,
-        Box::new(|_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            Ok(Box::new(IronPlayerAppWithPipeline {
+                inner: IronPlayerApp::new(cc, cmd_tx, Some(snapshot_rx)),
+                guard,
+            }))
+        }),
     )
 }

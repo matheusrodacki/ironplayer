@@ -48,6 +48,8 @@ pub struct SectionData {
 pub struct PesData {
     /// PID do pacote.
     pub pid: Pid,
+    /// Payload Unit Start Indicator — `true` se este é o início de um novo PES packet.
+    pub pusi: bool,
     /// Bytes de payload.
     pub data: Bytes,
 }
@@ -215,7 +217,11 @@ impl TsDemuxer {
             // PID de A/V → canal PES.
             if self
                 .pes_tx
-                .try_send(PesData { pid, data: payload })
+                .try_send(PesData {
+                    pid,
+                    pusi: pkt.pusi,
+                    data: payload,
+                })
                 .is_err()
             {
                 warn!("pes_tx cheio; PesData(pid=0x{:04X}) descartado", pid);

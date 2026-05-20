@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ts", "crates/net", "crates/ui"]
+members = ["crates/ts", "crates/net", "crates/ui", "crates/av"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -14,6 +14,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow            = "1"
 thiserror         = "2"
 libloading        = "0.8"
+cpal              = "0.15"
 
 [package]
 name    = "ironplayer"

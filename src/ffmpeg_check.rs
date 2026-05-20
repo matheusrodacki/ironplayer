@@ -3,22 +3,22 @@
 //! Verificação de compatibilidade das DLLs FFmpeg no startup.
 //!
 //! Tenta carregar `avcodec` dinamicamente e chamar `avcodec_version()` para
-//! confirmar que as DLLs corretas (FFmpeg 7.x → avcodec major 61) estão
+//! confirmar que as DLLs corretas (FFmpeg 8.x → avcodec major 62) estão
 //! presentes antes de qualquer instanciação de `FfmpegDecoder`.
 //!
 //! Critério de busca: primeiro `{exe_dir}/ffmpeg/`, depois `{exe_dir}/`.
 //! Em caso de falha, retorna mensagem de erro detalhada para saída limpa.
 
-/// Major version do avcodec que corresponde ao FFmpeg 7.x.
-const AVCODEC_EXPECTED_MAJOR: u32 = 61;
+/// Major version do avcodec que corresponde ao FFmpeg 8.x.
+const AVCODEC_EXPECTED_MAJOR: u32 = 62;
 
 /// Nome da DLL avcodec para a versão esperada (Windows).
 #[cfg(windows)]
-const AVCODEC_DLL: &str = "avcodec-61.dll";
+const AVCODEC_DLL: &str = "avcodec-62.dll";
 
 /// Nome da biblioteca avcodec para a versão esperada (Linux/macOS – fallback).
 #[cfg(not(windows))]
-const AVCODEC_DLL: &str = "libavcodec.so.61";
+const AVCODEC_DLL: &str = "libavcodec.so.62";
 
 /// Verifica se as DLLs FFmpeg são compatíveis com a versão esperada.
 ///
@@ -36,6 +36,15 @@ pub fn check_ffmpeg_compatibility() -> Result<(), String> {
     // Tenta cada caminho de busca em ordem
     for candidate in &search_paths {
         tracing::debug!(path = %candidate.display(), "tentando carregar {}", AVCODEC_DLL);
+
+        // No Windows, avcodec-62.dll importa avutil-60.dll etc. O Windows só
+        // encontra essas dependências se o diretório delas estiver no DLL
+        // search path. SetDllDirectory adiciona o diretório da DLL
+        // temporariamente para que as dependências sejam resolvidas.
+        #[cfg(windows)]
+        if let Some(dir) = candidate.parent() {
+            set_dll_search_dir(Some(dir));
+        }
 
         // SAFETY: libloading carrega a biblioteca do sistema operacional.
         // O código é unsafe por natureza da FFI, mas confinado aqui.
@@ -74,8 +83,8 @@ pub fn check_ffmpeg_compatibility() -> Result<(), String> {
         if major != AVCODEC_EXPECTED_MAJOR {
             return Err(format!(
                 "FFmpeg incompatível: avcodec versão detectada = {major}.{minor}.{patch}, \
-                 esperada = {AVCODEC_EXPECTED_MAJOR}.x.x (FFmpeg 7.x).\n\
-                 Atualize as DLLs FFmpeg na pasta 'ffmpeg/' para a versão 7.x.\n\
+                 esperada = {AVCODEC_EXPECTED_MAJOR}.x.x (FFmpeg 8.x).\n\
+                 Atualize as DLLs FFmpeg na pasta 'ffmpeg/' para a versão 8.x.\n\
                  DLL carregada: {}",
                 candidate.display()
             ));
@@ -91,8 +100,16 @@ pub fn check_ffmpeg_compatibility() -> Result<(), String> {
         // A carga real fica por conta de `FfmpegDecoder` via ffmpeg-next.
         std::mem::drop(lib);
 
+        // Restaura o diretório de busca de DLLs.
+        #[cfg(windows)]
+        set_dll_search_dir(None);
+
         return Ok(());
     }
+
+    // Restaura o diretório de busca de DLLs caso nenhum candidato tenha carregado.
+    #[cfg(windows)]
+    set_dll_search_dir(None);
 
     // Nenhum caminho funcionou
     let paths_str = search_paths
@@ -105,8 +122,8 @@ pub fn check_ffmpeg_compatibility() -> Result<(), String> {
         "FFmpeg não encontrado. DLL esperada: '{AVCODEC_DLL}'.\n\
          Caminhos pesquisados:\n{paths_str}\n\n\
          Solução:\n\
-         1. Baixe FFmpeg 7.x para Windows em https://ffmpeg.org/download.html\n\
-         2. Copie as DLLs ({AVCODEC_DLL}, avformat-61.dll, avutil-59.dll, swresample-5.dll, swscale-8.dll)\n\
+         1. Baixe FFmpeg 8.x para Windows em https://ffmpeg.org/download.html\n\
+         2. Copie as DLLs ({AVCODEC_DLL}, avformat-62.dll, avutil-60.dll, swresample-6.dll, swscale-9.dll)\n\
             para a pasta 'ffmpeg/' ao lado do executável ironplayer.exe"
     ))
 }
@@ -136,6 +153,36 @@ fn ffmpeg_search_paths() -> Vec<std::path::PathBuf> {
     paths.push(std::path::PathBuf::from(AVCODEC_DLL));
 
     paths
+}
+
+/// Define (ou limpa) o diretório adicional de busca de DLLs no Windows.
+///
+/// Chama `SetDllDirectoryW(path)` para que dependências transitivas de
+/// `avcodec-62.dll` (ex.: `avutil-60.dll`) sejam encontradas na mesma pasta.
+/// Passar `None` restaura o comportamento padrão (`SetDllDirectoryW(NULL)`).
+///
+/// SAFETY: kernel32 está sempre disponível no Windows; a assinatura corresponde
+/// à declaração oficial de `SetDllDirectoryW`.
+#[cfg(windows)]
+fn set_dll_search_dir(dir: Option<&std::path::Path>) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetDllDirectoryW(lpPathName: *const u16) -> i32;
+    }
+
+    match dir {
+        Some(p) => {
+            let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: wide é nul-terminado e kernel32 está sempre disponível.
+            unsafe { SetDllDirectoryW(wide.as_ptr()) };
+        }
+        None => {
+            // SAFETY: NULL restaura o comportamento padrão.
+            unsafe { SetDllDirectoryW(std::ptr::null()) };
+        }
+    }
 }
 
 #[cfg(test)]

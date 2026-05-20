@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use tokio::sync::watch;
 
 use crate::error::{PcrEvent, TsEvent};
 use crate::metrics::{
@@ -61,6 +60,53 @@ impl StopHandle {
     /// Sinaliza a parada do loop.
     pub fn stop(&self) {
         self.0.store(true, Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SnapshotSender / SnapshotReceiver — publicação lock-free do MetricsSnapshot
+// ---------------------------------------------------------------------------
+
+/// Publica o `MetricsSnapshot` mais recente para os leitores.
+pub struct SnapshotSender(std::sync::Arc<std::sync::RwLock<crate::metrics::MetricsSnapshot>>);
+
+/// Permite ler o `MetricsSnapshot` mais recente publicado pelo aggregator.
+///
+/// Obtido via `MetricsAggregator::new`. Use `borrow()` para clonar o snapshot
+/// atual; a leitura nunca bloqueia o pipeline.
+#[derive(Clone)]
+pub struct SnapshotReceiver(std::sync::Arc<std::sync::RwLock<crate::metrics::MetricsSnapshot>>);
+
+impl SnapshotSender {
+    fn send(&self, snapshot: crate::metrics::MetricsSnapshot) {
+        if let Ok(mut guard) = self.0.write() {
+            *guard = snapshot;
+        }
+    }
+}
+
+impl SnapshotReceiver {
+    /// Retorna uma cópia do snapshot mais recente.
+    pub fn borrow(&self) -> crate::metrics::MetricsSnapshot {
+        self.0
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| crate::metrics::MetricsSnapshot {
+                pid_table: vec![],
+                total_bitrate_kbps: 0.0,
+                null_ratio: 0.0,
+                errors: crate::metrics::ErrorSnapshot {
+                    cc_errors: std::collections::HashMap::new(),
+                    pcr_jitter_events: vec![],
+                    pcr_discontinuities: vec![],
+                    crc_errors: std::collections::HashMap::new(),
+                    sync_losses: 0,
+                    rtp_out_of_order: 0,
+                    udp_overflows: 0,
+                },
+                tdt_offset_secs: None,
+                timestamp: std::time::Instant::now(),
+            })
     }
 }
 
@@ -119,7 +165,7 @@ pub struct MetricsAggregator {
     ts_rx: Receiver<TsEvent>,
     pcr_rx: Receiver<PcrEvent>,
     net_rx: Receiver<AggregatorNetEvent>,
-    snapshot_tx: watch::Sender<MetricsSnapshot>,
+    snapshot_tx: SnapshotSender,
     bitrate: BitrateMonitor,
     errors: ErrorTracker,
     pid_info: HashMap<Pid, PidInfo>,
@@ -135,7 +181,7 @@ impl MetricsAggregator {
         ts_rx: Receiver<TsEvent>,
         pcr_rx: Receiver<PcrEvent>,
         net_rx: Receiver<AggregatorNetEvent>,
-    ) -> (Self, watch::Receiver<MetricsSnapshot>) {
+    ) -> (Self, SnapshotReceiver) {
         let initial = MetricsSnapshot {
             pid_table: vec![],
             total_bitrate_kbps: 0.0,
@@ -152,7 +198,9 @@ impl MetricsAggregator {
             tdt_offset_secs: None,
             timestamp: Instant::now(),
         };
-        let (snapshot_tx, snapshot_rx) = watch::channel(initial);
+        let shared = std::sync::Arc::new(std::sync::RwLock::new(initial));
+        let snapshot_tx = SnapshotSender(std::sync::Arc::clone(&shared));
+        let snapshot_rx = SnapshotReceiver(shared);
         let agg = Self {
             ts_rx,
             pcr_rx,
@@ -205,8 +253,7 @@ impl MetricsAggregator {
             // --- Publicar snapshot a cada 1 s ---
             if last_publish.elapsed() >= PUBLISH_INTERVAL {
                 let snapshot = self.build_snapshot();
-                // send() falha apenas se não há receivers — pode ser ignorado
-                let _ = self.snapshot_tx.send(snapshot);
+                self.snapshot_tx.send(snapshot);
                 last_publish = Instant::now();
             }
 

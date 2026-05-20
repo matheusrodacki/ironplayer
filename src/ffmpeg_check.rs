@@ -214,14 +214,14 @@ mod tests {
     /// SPEC-AV-CHECK-001: caminhos de busca devem conter o nome correto da DLL.
     #[test]
     fn spec_av_check_001_dll_name_matches_expected_version() {
-        // FFmpeg 7.x → avcodec major 61
+        // FFmpeg 8.x → avcodec major 62
         assert!(
-            AVCODEC_DLL.contains("61"),
-            "nome da DLL deve conter a major version 61 para FFmpeg 7.x"
+            AVCODEC_DLL.contains("62"),
+            "nome da DLL deve conter a major version 62 para FFmpeg 8.x"
         );
         assert_eq!(
-            AVCODEC_EXPECTED_MAJOR, 61,
-            "major version esperada deve ser 61 para FFmpeg 7.x"
+            AVCODEC_EXPECTED_MAJOR, 62,
+            "major version esperada deve ser 62 para FFmpeg 8.x"
         );
     }
 
@@ -242,26 +242,26 @@ mod tests {
 
         let err_msg = format!(
             "FFmpeg incompatível: avcodec versão detectada = {major}.{minor}.{patch}, \
-             esperada = {AVCODEC_EXPECTED_MAJOR}.x.x (FFmpeg 7.x)."
+             esperada = {AVCODEC_EXPECTED_MAJOR}.x.x (FFmpeg 8.x)."
         );
         assert!(
             err_msg.contains("60.3.100"),
             "mensagem deve citar versão detectada"
         );
         assert!(
-            err_msg.contains("61"),
+            err_msg.contains("62"),
             "mensagem deve citar versão esperada"
         );
     }
 
-    /// SPEC-AV-CHECK-001: versão compatível (61.x.x) deve ser aceita.
+    /// SPEC-AV-CHECK-001: versão compatível (62.x.x) deve ser aceita.
     #[test]
     fn spec_av_check_001_compatible_version_is_accepted() {
-        let raw_version: u32 = (61u32 << 16) | (3 << 8) | 100;
+        let raw_version: u32 = (62u32 << 16) | (3 << 8) | 100;
         let major = raw_version >> 16;
         assert_eq!(
             major, AVCODEC_EXPECTED_MAJOR,
-            "FFmpeg 7.x (major=61) deve ser aceito"
+            "FFmpeg 8.x (major=62) deve ser aceito"
         );
     }
 

@@ -166,8 +166,14 @@ mod tests {
     fn spec_av_002a_audio_codec_from_stream_type() {
         assert_eq!(AudioCodec::from_stream_type(0x03), Some(AudioCodec::Mp2));
         assert_eq!(AudioCodec::from_stream_type(0x04), Some(AudioCodec::Mp2));
-        assert_eq!(AudioCodec::from_stream_type(0x0F), Some(AudioCodec::AacAdts));
-        assert_eq!(AudioCodec::from_stream_type(0x11), Some(AudioCodec::AacLatm));
+        assert_eq!(
+            AudioCodec::from_stream_type(0x0F),
+            Some(AudioCodec::AacAdts)
+        );
+        assert_eq!(
+            AudioCodec::from_stream_type(0x11),
+            Some(AudioCodec::AacLatm)
+        );
         assert_eq!(AudioCodec::from_stream_type(0x81), Some(AudioCodec::Ac3));
         assert_eq!(AudioCodec::from_stream_type(0x87), Some(AudioCodec::Eac3));
     }

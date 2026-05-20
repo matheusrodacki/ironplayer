@@ -176,7 +176,8 @@ impl SectionAssembler {
         let total = 3 + buf.section_length as usize;
         let section_bytes = &buf.data[..total];
 
-        if !verify_crc32_mpeg2(section_bytes) {
+        let has_crc = buf.table_id != 0x70;
+        if has_crc && !verify_crc32_mpeg2(section_bytes) {
             // CRC inválido — descartar e notificar via evento.
             if self
                 .event_tx
@@ -195,7 +196,9 @@ impl SectionAssembler {
         }
 
         // CRC válido — emitir seção sem os 4 bytes de CRC finais.
-        let data_without_crc = Bytes::copy_from_slice(&section_bytes[..total - 4]);
+        // TDT (table_id 0x70) não possui CRC; nesse caso a seção segue inteira.
+        let data_end = if has_crc { total - 4 } else { total };
+        let data_without_crc = Bytes::copy_from_slice(&section_bytes[..data_end]);
         let complete = CompleteSection {
             pid,
             table_id: buf.table_id,

@@ -10,8 +10,9 @@ use net::{
     ReceiverConfig, RtpStripper, StopHandle as NetStopHandle, StopToken as NetStopToken, StreamUrl,
     UdpReceiver,
 };
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use table_dispatcher::TableDispatcher;
+use table_dispatcher::{DemuxCommand, TableDispatcher};
 use ts::{
     aggregator::{
         AggregatorNetEvent, MetricsAggregator, StopHandle as MetricsStopHandle,
@@ -49,7 +50,8 @@ struct SenderGuard {
 struct PipelineGuard {
     pipeline_handles: Vec<Option<std::thread::JoinHandle<()>>>,
     metrics_handle: Option<std::thread::JoinHandle<()>>,
-    net_stop_handle: Option<NetStopHandle>,
+    /// Handle da conexão de rede atual; compartilhado com o cmd-handler.
+    current_net_stop: Arc<Mutex<Option<NetStopHandle>>>,
     metrics_stop_handle: Option<MetricsStopHandle>,
     _sender_guard: Option<SenderGuard>,
 }
@@ -58,8 +60,8 @@ impl PipelineGuard {
     fn shutdown(&mut self) {
         tracing::info!("shutdown iniciado pelo eframe::App::on_exit");
 
-        // 1. Sinaliza parada dos workers com stop handles
-        if let Some(h) = self.net_stop_handle.take() {
+        // 1. Para a conexão de rede ativa (se houver)
+        if let Some(h) = self.current_net_stop.lock().unwrap().take() {
             h.stop();
         }
         if let Some(h) = self.metrics_stop_handle.take() {
@@ -157,48 +159,43 @@ fn main() -> eframe::Result<()> {
     // 4. Cria todos os canais bounded do pipeline
     let ch = channels::AppChannels::create();
 
-    // 5. URL de stream (primeiro argumento CLI, opcional)
-    let stream_url: Option<StreamUrl> = std::env::args().nth(1).and_then(|url| {
-        match StreamUrl::parse(&url) {
-            Ok(u) => {
-                tracing::info!(url, "URL de stream configurada");
-                Some(u)
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "URL de stream invalida; pipeline de rede desativado");
-                None
-            }
-        }
-    });
-
-    // 6. Canais auxiliares para eventos RTP → MetricsAggregator
+    // 5. Canais auxiliares para eventos RTP → MetricsAggregator
     let (rtp_events_tx, rtp_events_rx) = crossbeam_channel::bounded::<net::RtpEvent>(64);
     let (agg_net_tx, agg_net_rx) = crossbeam_channel::bounded::<AggregatorNetEvent>(64);
+    let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded::<DemuxCommand>(64);
 
-    // 7. Tokens e handles de parada
-    let (net_stop_token, net_stop_handle) = NetStopToken::new();
+    // 6. Token de parada do MetricsAggregator
     let (metrics_stop_token, metrics_stop_handle): (MetricsStopToken, MetricsStopHandle) =
         MetricsStopToken::new();
 
-    // 8. Instancia MetricsAggregator
+    // Estado de conexão compartilhado entre cmd-handler e IronPlayerApp
+    let conn_state: Arc<std::sync::RwLock<ui::ConnectionState>> =
+        Arc::new(std::sync::RwLock::new(ui::ConnectionState::Idle));
+
+    // Handle da conexão de rede atual; compartilhado entre cmd-handler e PipelineGuard
+    let current_net_stop: Arc<Mutex<Option<NetStopHandle>>> = Arc::new(Mutex::new(None));
+
+    // 7. Instancia MetricsAggregator
     let (metrics_agg, snapshot_rx) =
         MetricsAggregator::new(ch.ts_events_rx, ch.pcr_events_rx, agg_net_rx);
 
-    // 9. Instancia TsDemuxer
+    // 8. Instancia TsDemuxer
     let ts_demuxer = TsDemuxer::new(
         ch.section_data_tx.sender(),
         ch.pes_data_tx.sender(),
         ch.ts_events_tx.sender(),
     );
 
-    // 10. Instancia SectionAssembler
+    // 9. Instancia SectionAssembler
     let section_asm =
         SectionAssembler::new(ch.complete_sections_tx.sender(), ch.ts_events_tx.sender());
 
-    // 11. Instancia TableDispatcher
-    let table_disp = TableDispatcher::new(ch.complete_sections_rx, ch.table_events_tx);
+    // 10. Instancia TableDispatcher
+    let table_disp =
+        TableDispatcher::new(ch.complete_sections_rx, ch.table_events_tx, demux_cmd_tx);
+    let table_events_rx = ch.table_events_rx;
 
-    // 12. SenderGuard -- mantem senders vivos ate o shutdown
+    // 11. SenderGuard -- mantem senders vivos ate o shutdown
     let sender_guard = SenderGuard {
         net_raw_tx: ch.net_raw_tx,
         section_data_tx: ch.section_data_tx,
@@ -206,30 +203,8 @@ fn main() -> eframe::Result<()> {
         ts_events_tx: ch.ts_events_tx,
     };
 
-    // 13. Spawn das threads de backend
+    // 12. Spawn das threads de backend (sem net-recv — iniciado pelo cmd-handler)
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
-
-    // Thread: net-recv (apenas se URL fornecida)
-    if let Some(url) = stream_url {
-        let receiver_cfg = ReceiverConfig {
-            buf_size: cfg.network.udp_buffer_bytes,
-            timeout_ms: cfg.network.timeout_ms,
-        };
-        let net_raw_tx = sender_guard.net_raw_tx.sender();
-        let net_events_tx = ch.net_events_tx.sender();
-        let stop = net_stop_token.clone();
-        let receiver = UdpReceiver::new(url, net_raw_tx, net_events_tx, receiver_cfg);
-        handles.push(
-            std::thread::Builder::new()
-                .name("net-recv".into())
-                .spawn(move || {
-                    if let Err(e) = receiver.run(stop) {
-                        tracing::error!(error = %e, "net-recv encerrou com erro");
-                    }
-                })
-                .expect("falha ao criar thread net-recv"),
-        );
-    }
 
     // Thread: rtp-strip
     {
@@ -273,6 +248,16 @@ fn main() -> eframe::Result<()> {
                 .spawn(move || {
                     let mut demuxer = ts_demuxer;
                     for bytes in ts_raw_rx.iter() {
+                        while let Ok(command) = demux_cmd_rx.try_recv() {
+                            match command {
+                                DemuxCommand::RegisterPmtPid(pid) => {
+                                    demuxer.register_pmt_pid(pid);
+                                }
+                                DemuxCommand::RegisterAvPid(pid) => {
+                                    demuxer.register_av_pid(pid);
+                                }
+                            }
+                        }
                         demuxer.process_chunk(&bytes);
                     }
                 })
@@ -318,15 +303,103 @@ fn main() -> eframe::Result<()> {
 
     tracing::info!(threads = handles.len() + 1, "pipeline de backend iniciado");
 
-    // 14. Canal de comandos UI → pipeline
-    let (cmd_tx, _cmd_rx) =
-        crossbeam_channel::bounded::<ui::AppCommand>(channels::CAP_APP_COMMANDS);
+    // 13. Canal de comandos UI → pipeline
+    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<ui::AppCommand>(channels::CAP_APP_COMMANDS);
+
+    // 14. Thread: cmd-handler — processa Connect/Disconnect da UI dinamicamente
+    {
+        let conn_state = conn_state.clone();
+        let current_net_stop = current_net_stop.clone();
+        let net_raw_tx = sender_guard.net_raw_tx.sender();
+        let net_events_tx = ch.net_events_tx.sender();
+        let receiver_cfg = ReceiverConfig {
+            buf_size: cfg.network.udp_buffer_bytes,
+            timeout_ms: cfg.network.timeout_ms,
+        };
+
+        std::thread::Builder::new()
+            .name("cmd-handler".into())
+            .spawn(move || {
+                for cmd in cmd_rx.iter() {
+                    match cmd {
+                        ui::AppCommand::Connect { url, iface: _ } => {
+                            // Para conexão anterior, se existir
+                            if let Some(h) = current_net_stop.lock().unwrap().take() {
+                                h.stop();
+                            }
+
+                            match StreamUrl::parse(&url) {
+                                Err(e) => {
+                                    tracing::error!(error = %e, url, "URL de stream inválida");
+                                    *conn_state.write().unwrap() = ui::ConnectionState::Error {
+                                        url,
+                                        reason: e.to_string(),
+                                    };
+                                }
+                                Ok(parsed_url) => {
+                                    *conn_state.write().unwrap() =
+                                        ui::ConnectionState::Connecting { url: url.clone() };
+                                    tracing::info!(url, "conectando...");
+
+                                    let (stop_token, stop_handle) = NetStopToken::new();
+                                    *current_net_stop.lock().unwrap() = Some(stop_handle);
+
+                                    let receiver = UdpReceiver::new(
+                                        parsed_url,
+                                        net_raw_tx.clone(),
+                                        net_events_tx.clone(),
+                                        receiver_cfg.clone(),
+                                    );
+                                    let conn_state_t = conn_state.clone();
+                                    let url_t = url.clone();
+
+                                    std::thread::Builder::new()
+                                        .name("net-recv".into())
+                                        .spawn(move || {
+                                            *conn_state_t.write().unwrap() =
+                                                ui::ConnectionState::Connected {
+                                                    url: url_t.clone(),
+                                                    since: Instant::now(),
+                                                };
+                                            match receiver.run(stop_token) {
+                                                Ok(()) => {
+                                                    *conn_state_t.write().unwrap() =
+                                                        ui::ConnectionState::Idle;
+                                                    tracing::info!("net-recv encerrado normalmente");
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(error = %e, "net-recv encerrou com erro");
+                                                    *conn_state_t.write().unwrap() =
+                                                        ui::ConnectionState::Error {
+                                                            url: url_t,
+                                                            reason: e.to_string(),
+                                                        };
+                                                }
+                                            }
+                                        })
+                                        .expect("falha ao criar thread net-recv");
+                                }
+                            }
+                        }
+                        ui::AppCommand::Disconnect => {
+                            if let Some(h) = current_net_stop.lock().unwrap().take() {
+                                h.stop();
+                            }
+                            *conn_state.write().unwrap() = ui::ConnectionState::Idle;
+                            tracing::info!("desconectado pelo usuário");
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .expect("falha ao criar thread cmd-handler");
+    }
 
     // 15. Loop de UI via eframe
     let guard = PipelineGuard {
         pipeline_handles: handles.into_iter().map(Some).collect(),
         metrics_handle: Some(metrics_handle),
-        net_stop_handle: Some(net_stop_handle),
+        current_net_stop,
         metrics_stop_handle: Some(metrics_stop_handle),
         _sender_guard: Some(sender_guard),
     };
@@ -343,7 +416,13 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(IronPlayerAppWithPipeline {
-                inner: IronPlayerApp::new(cc, cmd_tx, Some(snapshot_rx)),
+                inner: IronPlayerApp::new(
+                    cc,
+                    cmd_tx,
+                    Some(snapshot_rx),
+                    Some(conn_state),
+                    Some(table_events_rx.clone()),
+                ),
                 guard,
             }))
         }),

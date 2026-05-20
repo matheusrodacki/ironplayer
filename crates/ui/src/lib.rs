@@ -6,11 +6,12 @@ pub mod panels;
 pub mod state;
 pub mod status_bar;
 
-pub use state::{AppCommand, AppState, ConnectionState, TablesSnapshot};
+pub use state::{AppCommand, AppState, ConnectionState, TableEvent, TablesSnapshot};
 
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 
 use crate::panels::metrics::MetricsPanel;
@@ -47,6 +48,10 @@ pub struct IronPlayerApp {
     ///
     /// SPEC-UI-008
     snapshot_rx: Option<ts::aggregator::SnapshotReceiver>,
+    /// Estado de conexão compartilhado com o command handler do pipeline.
+    connection_rx: Option<Arc<RwLock<ConnectionState>>>,
+    /// Eventos incrementais de tabelas PSI/SI vindos do `TableDispatcher`.
+    table_events_rx: Option<Receiver<TableEvent>>,
 }
 
 impl IronPlayerApp {
@@ -60,6 +65,8 @@ impl IronPlayerApp {
         _cc: &eframe::CreationContext<'_>,
         cmd_tx: Sender<AppCommand>,
         snapshot_rx: Option<ts::aggregator::SnapshotReceiver>,
+        connection_rx: Option<Arc<RwLock<ConnectionState>>>,
+        table_events_rx: Option<Receiver<TableEvent>>,
     ) -> Self {
         Self {
             state: AppState::default(),
@@ -68,6 +75,8 @@ impl IronPlayerApp {
             tables_panel: TablesPanel::new(),
             metrics_panel: MetricsPanel::new(),
             snapshot_rx,
+            connection_rx,
+            table_events_rx,
         }
     }
 
@@ -116,6 +125,26 @@ impl IronPlayerApp {
 
         // Atualiza o snapshot de métricas.
         self.state.metrics = snapshot;
+
+        // Atualiza o estado de conexão a partir do command handler.
+        if let Some(conn_rx) = &self.connection_rx {
+            if let Ok(state) = conn_rx.read() {
+                self.state.connection = state.clone();
+            }
+        }
+    }
+
+    /// Drena eventos de tabela sem bloquear o frame da UI.
+    ///
+    /// SPEC-UI-008
+    fn poll_table_events(&mut self) {
+        let Some(rx) = self.table_events_rx.as_ref().cloned() else {
+            return;
+        };
+
+        for event in rx.try_iter().take(512) {
+            self.state.apply_table_event(event);
+        }
     }
 }
 
@@ -126,6 +155,7 @@ impl eframe::App for IronPlayerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── Poll de métricas do pipeline ──────────────────────────────────
         self.poll_snapshot();
+        self.poll_table_events();
 
         // ── Header: URL + botões Conectar / Desconectar ──────────────────────
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
@@ -216,6 +246,6 @@ pub fn run(title: &str) -> eframe::Result {
     eframe::run_native(
         title,
         native_options,
-        Box::new(move |cc| Ok(Box::new(IronPlayerApp::new(cc, cmd_tx, None)))),
+        Box::new(move |cc| Ok(Box::new(IronPlayerApp::new(cc, cmd_tx, None, None, None)))),
     )
 }

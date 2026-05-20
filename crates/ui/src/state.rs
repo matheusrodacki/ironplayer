@@ -11,6 +11,35 @@ use ts::tables::{Bat, EitEvent, Nit, Pat, Pmt, Sdt, Tdt};
 use ts::Pid;
 
 // ---------------------------------------------------------------------------
+// TableEvent
+// ---------------------------------------------------------------------------
+
+/// Evento incremental de tabela PSI/SI recebido do pipeline.
+///
+/// SPEC-UI-002
+#[derive(Debug, Clone)]
+pub enum TableEvent {
+    /// Snapshot mais recente da PAT.
+    Pat(Pat),
+    /// Snapshot mais recente de uma PMT.
+    Pmt(Pmt),
+    /// Snapshot mais recente da NIT.
+    Nit(Nit),
+    /// Snapshot mais recente da SDT.
+    Sdt(Sdt),
+    /// Present/following extraído de EIT p/f.
+    EitPf {
+        service_id: u16,
+        current: Option<EitEvent>,
+        next: Option<EitEvent>,
+    },
+    /// Snapshot mais recente da TDT.
+    Tdt(Tdt),
+    /// Snapshot mais recente da BAT.
+    Bat(Bat),
+}
+
+// ---------------------------------------------------------------------------
 // ConnectionState
 // ---------------------------------------------------------------------------
 
@@ -69,6 +98,31 @@ pub struct AppState {
     pub bitrate_history: VecDeque<(Instant, f64)>,
     /// Histórico de jitter de PCR por PID.
     pub pcr_history: HashMap<Pid, VecDeque<PcrJitterRecord>>,
+}
+
+impl AppState {
+    /// Aplica um evento incremental de tabela ao snapshot imutável da UI.
+    ///
+    /// SPEC-UI-002
+    pub(crate) fn apply_table_event(&mut self, event: TableEvent) {
+        match event {
+            TableEvent::Pat(pat) => self.tables.pat = Some(pat),
+            TableEvent::Pmt(pmt) => {
+                self.tables.pmts.insert(pmt.program_number, pmt);
+            }
+            TableEvent::Nit(nit) => self.tables.nit = Some(nit),
+            TableEvent::Sdt(sdt) => self.tables.sdt = Some(sdt),
+            TableEvent::EitPf {
+                service_id,
+                current,
+                next,
+            } => {
+                self.tables.eit_pf.insert(service_id, (current, next));
+            }
+            TableEvent::Tdt(tdt) => self.tables.tdt = Some(tdt),
+            TableEvent::Bat(bat) => self.tables.bat = Some(bat),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,5 +185,20 @@ mod tests {
     fn spec_ui_002_connection_state_default_is_idle() {
         let cs = ConnectionState::default();
         assert!(matches!(cs, ConnectionState::Idle));
+    }
+
+    #[test]
+    fn spec_ui_002_apply_table_event_updates_pat_snapshot() {
+        let mut state = AppState::default();
+        let pat = Pat {
+            transport_stream_id: 1,
+            version: 3,
+            current_next: true,
+            programs: Vec::new(),
+        };
+
+        state.apply_table_event(TableEvent::Pat(pat.clone()));
+
+        assert_eq!(state.tables.pat, Some(pat));
     }
 }

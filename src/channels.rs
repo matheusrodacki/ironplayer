@@ -10,6 +10,7 @@ use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use net::NetEvent;
 use ts::{CompleteSection, PcrEvent, PesData, SectionData, TsEvent};
+use ui::TableEvent;
 
 // ─── Capacidades (SPEC-CHAN-001) ──────────────────────────────────────────────
 
@@ -46,11 +47,6 @@ pub const CAP_APP_COMMANDS: usize = 32;
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct PesPacket(pub Bytes);
-
-/// Evento de tabela PSI/SI despachado pelo `TableDispatcher`.
-/// Placeholder até o dispatcher ser implementado no crate `ts`.
-#[derive(Debug)]
-pub struct TableEvent;
 
 /// Frame de vídeo decodificado pelo FFmpeg. Placeholder até o crate `av`.
 #[derive(Debug)]

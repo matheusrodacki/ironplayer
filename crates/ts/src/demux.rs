@@ -3,6 +3,7 @@
 //! SPEC-TS-002
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use crossbeam_channel::Sender;
@@ -70,6 +71,8 @@ pub struct TsDemuxer {
     pmt_pids: HashSet<Pid>,
     /// PIDs de A/V registrados dinamicamente ao parsear a PMT.
     av_pids: HashSet<Pid>,
+    /// Último WARN de canal cheio para eventos Packet, que são de alta frequência.
+    last_packet_event_full_warn: Option<Instant>,
 }
 
 impl TsDemuxer {
@@ -88,6 +91,7 @@ impl TsDemuxer {
             cc_state: HashMap::new(),
             pmt_pids: HashSet::new(),
             av_pids: HashSet::new(),
+            last_packet_event_full_warn: None,
         }
     }
 
@@ -170,6 +174,7 @@ impl TsDemuxer {
             .event_tx
             .try_send(TsEvent::Packet { pid, bytes: 188 })
             .is_err()
+            && self.should_warn_packet_event_full()
         {
             warn!("event_tx cheio; Packet(pid=0x{:04X}) descartado", pid);
         }
@@ -267,6 +272,21 @@ impl TsDemuxer {
     fn is_section_pid(&self, pid: Pid) -> bool {
         matches!(pid, PID_PAT | PID_NIT | PID_SDT | PID_EIT | PID_TDT)
             || self.pmt_pids.contains(&pid)
+    }
+
+    fn should_warn_packet_event_full(&mut self) -> bool {
+        const WARN_INTERVAL: Duration = Duration::from_secs(1);
+        let now = Instant::now();
+        let should_warn = match self.last_packet_event_full_warn {
+            Some(last) => now.duration_since(last) >= WARN_INTERVAL,
+            None => true,
+        };
+        if should_warn {
+            self.last_packet_event_full_warn = Some(now);
+            true
+        } else {
+            false
+        }
     }
 }
 

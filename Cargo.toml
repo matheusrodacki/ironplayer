@@ -38,6 +38,7 @@ eframe            = "0.29"
 ts                = { path = "crates/ts" }
 net               = { path = "crates/net" }
 ui                = { path = "crates/ui" }
+av                = { path = "crates/av" }
 
 [dev-dependencies]
 tempfile = "3"

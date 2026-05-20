@@ -1,3 +1,4 @@
+use av::{AudioFrame, PesPacket, VideoFrame};
 /// SPEC-CHAN-001
 /// Helper de canais bounded com monitoramento de backpressure.
 ///
@@ -42,19 +43,6 @@ pub const CAP_NET_EVENTS: usize = 64;
 pub const CAP_APP_COMMANDS: usize = 32;
 
 // ─── Tipos placeholder ────────────────────────────────────────────────────────
-
-/// Pacote PES montado. Placeholder até o crate `av` ser implementado.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct PesPacket(pub Bytes);
-
-/// Frame de vídeo decodificado pelo FFmpeg. Placeholder até o crate `av`.
-#[derive(Debug)]
-pub struct VideoFrame;
-
-/// Frame de áudio decodificado pelo FFmpeg. Placeholder até o crate `av`.
-#[derive(Debug)]
-pub struct AudioFrame;
 
 /// Comando enviado pela UI ao pipeline. Placeholder até o crate `ui`.
 #[derive(Debug)]

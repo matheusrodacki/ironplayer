@@ -4,6 +4,7 @@
 /// emite [`TableEvent`] para o `AppState`.
 use std::collections::HashMap;
 
+use av::MediaCodec;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 use tracing::{trace, warn};
@@ -23,6 +24,14 @@ pub enum DemuxCommand {
     RegisterAvPid(Pid),
 }
 
+/// SPEC-TABLE
+/// Comando de controle enviado ao `PesAssembler` após parse de PMT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PesCommand {
+    /// Registra o codec de um elementary stream suportado.
+    RegisterPid { pid: Pid, codec: MediaCodec },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SectionKey {
     pid: Pid,
@@ -37,6 +46,7 @@ pub struct TableDispatcher {
     rx: Receiver<CompleteSection>,
     tx: BoundedSender<TableEvent>,
     demux_tx: Sender<DemuxCommand>,
+    pes_tx: Sender<PesCommand>,
     last_sections: HashMap<SectionKey, Bytes>,
 }
 
@@ -46,11 +56,13 @@ impl TableDispatcher {
         rx: Receiver<CompleteSection>,
         tx: BoundedSender<TableEvent>,
         demux_tx: Sender<DemuxCommand>,
+        pes_tx: Sender<PesCommand>,
     ) -> Self {
         Self {
             rx,
             tx,
             demux_tx,
+            pes_tx,
             last_sections: HashMap::new(),
         }
     }
@@ -120,7 +132,13 @@ impl TableDispatcher {
         match Pmt::from_section_body(body) {
             Ok(pmt) => {
                 for stream in &pmt.streams {
-                    self.send_demux_command(DemuxCommand::RegisterAvPid(stream.elementary_pid));
+                    if let Some(codec) = MediaCodec::from_stream_type(stream.stream_type) {
+                        self.send_demux_command(DemuxCommand::RegisterAvPid(stream.elementary_pid));
+                        self.send_pes_command(PesCommand::RegisterPid {
+                            pid: stream.elementary_pid,
+                            codec,
+                        });
+                    }
                 }
                 self.tx.try_send(TableEvent::Pmt(pmt));
             }
@@ -195,6 +213,12 @@ impl TableDispatcher {
     fn send_demux_command(&self, command: DemuxCommand) {
         if self.demux_tx.try_send(command).is_err() {
             warn!(?command, "canal demux-control cheio — comando descartado");
+        }
+    }
+
+    fn send_pes_command(&self, command: PesCommand) {
+        if self.pes_tx.try_send(command).is_err() {
+            warn!(?command, "canal pes-control cheio — comando descartado");
         }
     }
 

@@ -12,7 +12,7 @@ use net::{
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use table_dispatcher::{DemuxCommand, TableDispatcher};
+use table_dispatcher::{DemuxCommand, PesCommand, TableDispatcher};
 use ts::{
     aggregator::{
         AggregatorNetEvent, MetricsAggregator, StopHandle as MetricsStopHandle,
@@ -163,6 +163,7 @@ fn main() -> eframe::Result<()> {
     let (rtp_events_tx, rtp_events_rx) = crossbeam_channel::bounded::<net::RtpEvent>(64);
     let (agg_net_tx, agg_net_rx) = crossbeam_channel::bounded::<AggregatorNetEvent>(64);
     let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded::<DemuxCommand>(64);
+    let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded::<PesCommand>(64);
 
     // 6. Token de parada do MetricsAggregator
     let (metrics_stop_token, metrics_stop_handle): (MetricsStopToken, MetricsStopHandle) =
@@ -191,8 +192,12 @@ fn main() -> eframe::Result<()> {
         SectionAssembler::new(ch.complete_sections_tx.sender(), ch.ts_events_tx.sender());
 
     // 10. Instancia TableDispatcher
-    let table_disp =
-        TableDispatcher::new(ch.complete_sections_rx, ch.table_events_tx, demux_cmd_tx);
+    let table_disp = TableDispatcher::new(
+        ch.complete_sections_rx,
+        ch.table_events_tx,
+        demux_cmd_tx,
+        pes_cmd_tx,
+    );
     let table_events_rx = ch.table_events_rx;
 
     // 11. SenderGuard -- mantem senders vivos ate o shutdown
@@ -265,6 +270,35 @@ fn main() -> eframe::Result<()> {
         );
     }
 
+    // Thread: pes-asm
+    {
+        let pes_data_rx = ch.pes_data_rx;
+        let pes_packets_tx = ch.pes_packets_tx.sender();
+        handles.push(
+            std::thread::Builder::new()
+                .name("pes-asm".into())
+                .spawn(move || {
+                    let mut asm = av::PesAssembler::new(pes_packets_tx);
+                    loop {
+                        while let Ok(command) = pes_cmd_rx.try_recv() {
+                            match command {
+                                PesCommand::RegisterPid { pid, codec } => {
+                                    asm.register_pid(pid, codec);
+                                }
+                            }
+                        }
+
+                        match pes_data_rx.recv_timeout(Duration::from_millis(10)) {
+                            Ok(data) => asm.push(data.pid, data.pusi, data.data),
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                })
+                .expect("falha ao criar thread pes-asm"),
+        );
+    }
+
     // Thread: sec-asm
     {
         let section_data_rx = ch.section_data_rx;
@@ -292,6 +326,28 @@ fn main() -> eframe::Result<()> {
             })
             .expect("falha ao criar thread table-disp"),
     );
+
+    // Thread: pes-drain — etapa temporária até o wiring de decode/render da UI.
+    {
+        let pes_packets_rx = ch.pes_packets_rx;
+        handles.push(
+            std::thread::Builder::new()
+                .name("pes-drain".into())
+                .spawn(move || {
+                    tracing::info!(
+                        "av-decode/render ainda nao conectado; PesPackets serao drenados"
+                    );
+                    for packet in pes_packets_rx.iter() {
+                        tracing::trace!(
+                            pid = packet.pid,
+                            bytes = packet.payload.len(),
+                            "PES packet drenado"
+                        );
+                    }
+                })
+                .expect("falha ao criar thread pes-drain"),
+        );
+    }
 
     // Thread: metrics
     let metrics_handle = std::thread::Builder::new()

@@ -64,6 +64,7 @@ fn rgb24_to_rgba8_into(rgb: &[u8], rgba: &mut Vec<u8>) {
     }
 }
 
+#[cfg(test)]
 fn rgb24_to_rgba8(rgb: &[u8]) -> Vec<u8> {
     let mut rgba = Vec::new();
     rgb24_to_rgba8_into(rgb, &mut rgba);

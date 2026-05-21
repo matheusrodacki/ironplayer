@@ -91,6 +91,22 @@ pub struct SwsContext {
     _opaque: [u8; 0],
 }
 
+/// Layout público de `AVChannelLayout` em FFmpeg 8.x.
+#[repr(C)]
+pub struct AvChannelLayout {
+    pub order: c_int,
+    pub nb_channels: c_int,
+    pub channels: AvChannelLayoutChannels,
+    pub opaque: *mut c_void,
+}
+
+/// União pública de `AVChannelLayout`.
+#[repr(C)]
+pub union AvChannelLayoutChannels {
+    pub mask: u64,
+    pub custom_channel: *mut c_void,
+}
+
 // ─── AVPacket (layout estável desde FFmpeg 4.x, offsets x86-64) ──────────────
 //
 // Campo             Offset  Tamanho
@@ -150,10 +166,8 @@ pub struct AvPacket {
 // 192     top_field_first (int) [deprecated]
 // 196     palette_has_changed (int) [deprecated]
 // 200     reordered_opaque (int64_t) [deprecated, presente em FFmpeg 8]
-// 208     sample_rate (int)
-// 212     _pad (int)
-// 216     ch_layout.order (enum, int = 4 bytes)
-// 220     ch_layout.nb_channels (int)
+// Campos de metadata de áudio como `sample_rate` e `ch_layout` não são mais
+// lidos por offset; usamos AVOptions públicas do FFmpeg no codec context.
 
 /// Lê `data[i]` de um `AVFrame*` opaco.
 ///
@@ -217,22 +231,6 @@ pub(crate) unsafe fn frame_pts(frame: *mut c_void) -> i64 {
     *((frame as *const u8).add(136) as *const i64)
 }
 
-/// Lê `sample_rate` de um `AVFrame*` opaco (offset 208).
-///
-/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` do FFmpeg 8.x.
-#[inline]
-pub(crate) unsafe fn frame_sample_rate(frame: *mut c_void) -> c_int {
-    *((frame as *const u8).add(208) as *const c_int)
-}
-
-/// Lê `ch_layout.nb_channels` de um `AVFrame*` opaco (offset 220).
-///
-/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` do FFmpeg 8.x.
-#[inline]
-pub(crate) unsafe fn frame_nb_channels(frame: *mut c_void) -> c_int {
-    *((frame as *const u8).add(220) as *const c_int)
-}
-
 // ─── Tipos de ponteiro de função ──────────────────────────────────────────────
 
 type FnAvcodecFindDecoder = unsafe extern "C" fn(id: u32) -> *mut AvCodec;
@@ -254,6 +252,15 @@ type FnAvNewPacket = unsafe extern "C" fn(pkt: *mut AvPacket, size: c_int) -> c_
 type FnAvFrameAlloc = unsafe extern "C" fn() -> *mut c_void;
 type FnAvFrameFree = unsafe extern "C" fn(frame: *mut *mut c_void);
 type FnAvFrameUnref = unsafe extern "C" fn(frame: *mut c_void);
+type FnAvOptGetInt =
+    unsafe extern "C" fn(obj: *mut c_void, name: *const i8, search_flags: c_int, out_val: *mut i64) -> c_int;
+type FnAvOptGetChlayout = unsafe extern "C" fn(
+    obj: *mut c_void,
+    name: *const i8,
+    search_flags: c_int,
+    layout: *mut AvChannelLayout,
+) -> c_int;
+type FnAvChannelLayoutUninit = unsafe extern "C" fn(channel_layout: *mut AvChannelLayout);
 type FnAvStrerror =
     unsafe extern "C" fn(errnum: c_int, errbuf: *mut i8, errbuf_size: usize) -> c_int;
 
@@ -313,6 +320,9 @@ pub struct FfmpegLib {
     pub(crate) av_frame_alloc: FnAvFrameAlloc,
     pub(crate) av_frame_free: FnAvFrameFree,
     pub(crate) av_frame_unref: FnAvFrameUnref,
+    pub(crate) av_opt_get_int: FnAvOptGetInt,
+    pub(crate) av_opt_get_chlayout: FnAvOptGetChlayout,
+    pub(crate) av_channel_layout_uninit: FnAvChannelLayoutUninit,
     pub(crate) av_strerror: FnAvStrerror,
 
     // Funções swscale
@@ -399,6 +409,11 @@ impl FfmpegLib {
         let av_frame_alloc = sym!(avutil, b"av_frame_alloc\0", FnAvFrameAlloc);
         let av_frame_free = sym!(avutil, b"av_frame_free\0", FnAvFrameFree);
         let av_frame_unref = sym!(avutil, b"av_frame_unref\0", FnAvFrameUnref);
+        let av_opt_get_int = sym!(avutil, b"av_opt_get_int\0", FnAvOptGetInt);
+        let av_opt_get_chlayout =
+            sym!(avutil, b"av_opt_get_chlayout\0", FnAvOptGetChlayout);
+        let av_channel_layout_uninit =
+            sym!(avutil, b"av_channel_layout_uninit\0", FnAvChannelLayoutUninit);
         let av_strerror = sym!(avutil, b"av_strerror\0", FnAvStrerror);
 
         let sws_get_context = sym!(swscale, b"sws_getContext\0", FnSwsGetContext);
@@ -421,6 +436,9 @@ impl FfmpegLib {
             av_frame_alloc,
             av_frame_free,
             av_frame_unref,
+            av_opt_get_int,
+            av_opt_get_chlayout,
+            av_channel_layout_uninit,
             av_strerror,
             sws_get_context,
             sws_scale,
@@ -526,6 +544,67 @@ impl FfmpegCodecContext {
         } else {
             Err(AvError::FfmpegError { code: ret })
         }
+    }
+
+    /// Lê `sample_rate` e número de canais do `AVCodecContext` via AVOptions.
+    ///
+    /// Evita depender de offsets frágeis do `AVFrame` para metadata de áudio.
+    pub(crate) fn audio_params(&self) -> Result<(u32, u16), AvError> {
+        let mut sample_rate = 0i64;
+        let sample_rate_ret = unsafe {
+            (self.lib.av_opt_get_int)(
+                self.ctx.cast(),
+                c"sample_rate".as_ptr(),
+                0,
+                &mut sample_rate,
+            )
+        };
+        if sample_rate_ret < 0 {
+            return Err(AvError::FfmpegError {
+                code: sample_rate_ret,
+            });
+        }
+
+        let channels = match self.audio_channels_from_context() {
+            Ok(channels) => channels,
+            Err(ch_layout_ret) => {
+                let mut channels = 0i64;
+                let channels_ret = unsafe {
+                    (self.lib.av_opt_get_int)(
+                        self.ctx.cast(),
+                        c"channels".as_ptr(),
+                        0,
+                        &mut channels,
+                    )
+                };
+                if channels_ret < 0 {
+                    return Err(AvError::FfmpegError { code: ch_layout_ret });
+                }
+                channels
+            }
+        };
+
+        normalize_audio_params(sample_rate, channels)
+    }
+
+    fn audio_channels_from_context(&self) -> Result<i64, i32> {
+        let mut layout = AvChannelLayout {
+            order: 0,
+            nb_channels: 0,
+            channels: AvChannelLayoutChannels { mask: 0 },
+            opaque: std::ptr::null_mut(),
+        };
+
+        let ret = unsafe {
+            (self.lib.av_opt_get_chlayout)(self.ctx.cast(), c"ch_layout".as_ptr(), 0, &mut layout)
+        };
+        if ret < 0 {
+            return Err(ret);
+        }
+
+        let channels = layout.nb_channels as i64;
+        unsafe { (self.lib.av_channel_layout_uninit)(&mut layout) };
+        Ok(channels)
     }
 }
 
@@ -746,35 +825,30 @@ impl FfmpegFrame {
     /// (int16 planar). Outros formatos retornam `AvError::FfmpegError`.
     ///
     /// SPEC-AV-002b
-    pub(crate) fn to_pcm_f32(&self) -> Result<(u32, u16, i64, Vec<f32>), AvError> {
-        // SAFETY: offsets validados contra FFmpeg 8.x headers.
-        let (nb_samples, fmt, sample_rate, nb_channels, pts) = unsafe {
+    pub(crate) fn to_pcm_f32(&self, sample_rate: u32, channels: u16) -> Result<(i64, Vec<f32>), AvError> {
+        // SAFETY: offsets usados aqui se limitam a `nb_samples`, `format` e `pts`.
+        let (nb_samples, fmt, pts) = unsafe {
             (
                 frame_nb_samples(self.frame),
                 frame_format(self.frame),
-                frame_sample_rate(self.frame),
-                frame_nb_channels(self.frame),
                 frame_pts(self.frame),
             )
         };
 
-        if nb_samples <= 0 || nb_channels <= 0 || sample_rate <= 0 {
-            // Provavelmente os offsets do AVFrame nao batem com a ABI da
-            // libavutil carregada. Logamos os valores brutos lidos para
-            // diagnosticar qual campo esta em offset errado.
+        if nb_samples <= 0 || channels == 0 || sample_rate == 0 {
             tracing::error!(
                 nb_samples,
                 fmt,
                 sample_rate,
-                nb_channels,
+                channels,
                 pts,
-                "to_pcm_f32: valores invalidos lidos do AVFrame (offsets podem estar errados para esta versao de libavutil)"
+                "to_pcm_f32: metadata de áudio inválida ao converter frame"
             );
             return Err(AvError::FfmpegError { code: -22 });
         }
 
         let s = nb_samples as usize;
-        let c = nb_channels as usize;
+        let c = channels as usize;
         let mut out = vec![0f32; s * c];
 
         match fmt {
@@ -811,8 +885,16 @@ impl FfmpegFrame {
             }
         }
 
-        Ok((sample_rate as u32, nb_channels as u16, pts, out))
+        Ok((pts, out))
     }
+}
+
+fn normalize_audio_params(sample_rate: i64, channels: i64) -> Result<(u32, u16), AvError> {
+    if sample_rate <= 0 || sample_rate > u32::MAX as i64 || channels <= 0 || channels > u16::MAX as i64 {
+        return Err(AvError::FfmpegError { code: -22 });
+    }
+
+    Ok((sample_rate as u32, channels as u16))
 }
 
 impl Drop for FfmpegFrame {
@@ -893,6 +975,19 @@ pub fn set_dll_search_dir(_dir: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spec_av_002b_normalize_audio_params_validates_values() {
+        assert_eq!(normalize_audio_params(48_000, 2).unwrap(), (48_000, 2));
+        assert!(matches!(
+            normalize_audio_params(0, 2),
+            Err(AvError::FfmpegError { code: -22 })
+        ));
+        assert!(matches!(
+            normalize_audio_params(48_000, 0),
+            Err(AvError::FfmpegError { code: -22 })
+        ));
+    }
 
     /// SPEC-AV-002b: constantes de codec ID devem corresponder aos valores
     /// documentados na ISO 13818 / FFmpeg enum `AVCodecID`.

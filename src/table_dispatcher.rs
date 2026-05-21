@@ -20,6 +20,8 @@ use crate::channels::BoundedSender;
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemuxCommand {
+    /// Limpa estado dinâmico de PIDs ao trocar/reiniciar a fonte.
+    Reset,
     /// Registra um PID de PMT descoberto na PAT.
     RegisterPmtPid(Pid),
     /// Registra um PID A/V descoberto na PMT.
@@ -32,6 +34,8 @@ pub enum DemuxCommand {
 /// Comando de controle enviado ao `PesAssembler` após parse de PMT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PesCommand {
+    /// Limpa registros de PID e buffers parciais ao trocar/reiniciar a fonte.
+    Reset,
     /// Registra o codec de um elementary stream suportado.
     RegisterPid { pid: Pid, codec: MediaCodec },
     /// Remove o registro de um PID (ao trocar de serviço).
@@ -204,16 +208,17 @@ impl TableDispatcher {
 
         match Pat::from_section_body(body) {
             Ok(pat) => {
-                // SPEC-TABLE-001d: quando a versão da PAT muda, invalida o cache
-                // de deduplicação para todos os PIDs de PMT conhecidos, forçando
-                // o re-parse das PMTs quando chegarem novamente.
-                let version_changed = self.pat_version != Some(pat.version);
-                if version_changed {
+                // SPEC-TABLE-001d: quando a PAT muda, invalida o cache para
+                // todos os PIDs de PMT conhecidos, forçando o re-parse das PMTs.
+                let new_pmt_pids: HashSet<Pid> = pat.pmt_pids().collect();
+                let pat_changed = self.pat_version != Some(pat.version)
+                    || self.pat_pmt_pids != new_pmt_pids;
+                if pat_changed {
                     if self.pat_version.is_some() {
                         tracing::info!(
                             old_version = self.pat_version,
                             new_version = pat.version,
-                            "PAT version mudou — invalidando cache de PMTs"
+                            "PAT mudou — invalidando cache de PMTs"
                         );
                     }
                     // Remove entradas de dedup para todos os PIDs de PMT antigos.
@@ -225,7 +230,7 @@ impl TableDispatcher {
                         self.pmt_versions.remove(pid);
                     }
                     self.pat_version = Some(pat.version);
-                    self.pat_pmt_pids = pat.pmt_pids().collect();
+                    self.pat_pmt_pids = new_pmt_pids;
                 }
                 for pid in pat.pmt_pids() {
                     self.send_demux_command(DemuxCommand::RegisterPmtPid(pid));
@@ -248,14 +253,15 @@ impl TableDispatcher {
         match Pmt::from_section_body(body) {
             Ok(pmt) => {
                 let pmt_pid = section.pid;
-                let version_changed = self.pmt_versions.get(&pmt_pid).copied() != Some(pmt.version);
-                if version_changed {
+                let pmt_changed = self.pmt_versions.get(&pmt_pid).copied() != Some(pmt.version)
+                    || self.pmt_cache.get(&pmt.program_number) != Some(&pmt);
+                if pmt_changed {
                     if self.pmt_versions.contains_key(&pmt_pid) {
                         tracing::info!(
                             pid = pmt_pid,
                             program = pmt.program_number,
                             new_version = pmt.version,
-                            "PMT version mudou — re-registrando streams A/V"
+                            "PMT mudou — re-registrando streams A/V"
                         );
                     }
                     self.pmt_versions.insert(pmt_pid, pmt.version);
@@ -342,6 +348,10 @@ impl TableDispatcher {
             new_service = ?new_service,
             "serviço alterado — re-roteando PIDs A/V"
         );
+
+        if new_service.is_none() {
+            self.auto_play_triggered = false;
+        }
 
         // Desregistra todos os PIDs ativos.
         let pids: Vec<Pid> = self.active_av_pids.drain().collect();
@@ -823,6 +833,61 @@ mod tests {
     }
 
     #[test]
+    fn spec_table_reused_pmt_pid_same_version_new_program_reregisters_streams() {
+        let (mut dispatcher, _tx, _events_rx, demux_rx, pes_rx, _decode_rx, _audio_status) =
+            make_dispatcher();
+
+        dispatcher.process_section(make_pat_section(0x0001, 1, &[(1, 0x0101)]));
+        while demux_rx.try_recv().is_ok() {}
+
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x0101,
+            1,
+            0,
+            0x0101,
+            &[(0x1B, 0x0101, &[])],
+        ));
+        while demux_rx.try_recv().is_ok() {}
+        while pes_rx.try_recv().is_ok() {}
+
+        dispatcher.process_section(make_pat_section(0x0010, 1, &[(16, 0x0101)]));
+        while demux_rx.try_recv().is_ok() {}
+
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x0101,
+            16,
+            0,
+            0x0111,
+            &[(0x1B, 0x0111, &[]), (0x11, 0x0112, &[])],
+        ));
+
+        let demux_cmds: Vec<DemuxCommand> =
+            std::iter::from_fn(|| demux_rx.try_recv().ok()).collect();
+        let pes_cmds: Vec<PesCommand> = std::iter::from_fn(|| pes_rx.try_recv().ok()).collect();
+
+        assert!(
+            demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x0111)),
+            "vídeo do novo programa deve ser registrado mesmo com PMT PID/version reutilizados"
+        );
+        assert!(
+            demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x0112)),
+            "áudio LATM do novo programa deve ser registrado"
+        );
+        assert!(
+            pes_cmds.iter().any(|command| {
+                matches!(
+                    command,
+                    PesCommand::RegisterPid {
+                        pid: 0x0112,
+                        codec: MediaCodec::Audio(av::AudioCodec::AacLatm),
+                    }
+                )
+            }),
+            "PesAssembler deve receber AAC LATM do novo programa"
+        );
+    }
+
+    #[test]
     fn spec_table_private_audio_descriptor_registers_audio_pid() {
         let (mut dispatcher, _tx, _events_rx, demux_rx, pes_rx, _decode_rx, _audio_status) =
             make_dispatcher();
@@ -1176,6 +1241,59 @@ mod tests {
         );
         while demux_cmd_rx.try_recv().is_ok() {}
         while pes_cmd_rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn spec_integration_auto_play_rearms_when_selection_is_cleared() {
+        let (_sections_tx, sections_rx) = crossbeam_channel::bounded(64);
+        let (table_events_tx, _table_events_rx) = crossbeam_channel::bounded(64);
+        let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded(64);
+        let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded(64);
+        let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded(64);
+        let bounded_tx = BoundedSender::new(table_events_tx, "test_auto_play_rearm");
+        let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
+        let selected_service_ctrl = Arc::clone(&selected_service);
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
+
+        let mut dispatcher = TableDispatcher::new_with_auto_play(
+            sections_rx,
+            bounded_tx,
+            demux_cmd_tx,
+            pes_cmd_tx,
+            decode_cmd_tx,
+            selected_service,
+            audio_status,
+            true,
+        );
+
+        dispatcher.process_section(make_pmt_section(0x0100, 1, 0, 0x0101));
+        assert_eq!(*selected_service_ctrl.read().unwrap(), Some(1));
+        dispatcher.last_selected_service = Some(1);
+        while demux_cmd_rx.try_recv().is_ok() {}
+        while pes_cmd_rx.try_recv().is_ok() {}
+
+        *selected_service_ctrl.write().unwrap() = None;
+        dispatcher.on_service_changed(None);
+        dispatcher.last_selected_service = None;
+        assert!(
+            !dispatcher.auto_play_triggered,
+            "limpar seleção deve rearmar auto-play para a próxima fonte"
+        );
+        let _ = decode_cmd_rx.try_recv();
+
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x0101,
+            16,
+            0,
+            0x0111,
+            &[(0x1B, 0x0111, &[]), (0x11, 0x0112, &[])],
+        ));
+
+        assert_eq!(
+            *selected_service_ctrl.read().unwrap(),
+            Some(16),
+            "auto-play deve selecionar o serviço da nova fonte"
+        );
     }
 
     /// Integration: run() em thread separada + troca de serviço via Arc<RwLock>

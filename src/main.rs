@@ -151,6 +151,26 @@ fn refresh_audio_status_from_output(
     }
 }
 
+fn reset_stream_routing(
+    selected_service: &Arc<std::sync::RwLock<Option<u16>>>,
+    demux_cmd_tx: &crossbeam_channel::Sender<DemuxCommand>,
+    pes_cmd_tx: &crossbeam_channel::Sender<PesCommand>,
+    decode_cmd_tx: &crossbeam_channel::Sender<DecodeCommand>,
+) {
+    if let Ok(mut service) = selected_service.write() {
+        *service = None;
+    }
+    if demux_cmd_tx.try_send(DemuxCommand::Reset).is_err() {
+        tracing::warn!("canal demux-control cheio — Reset descartado");
+    }
+    if pes_cmd_tx.try_send(PesCommand::Reset).is_err() {
+        tracing::warn!("canal pes-control cheio — Reset descartado");
+    }
+    if decode_cmd_tx.try_send(DecodeCommand::Reset).is_err() {
+        tracing::warn!("canal decode-control cheio — Reset descartado");
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> eframe::Result<()> {
@@ -234,9 +254,9 @@ fn main() -> eframe::Result<()> {
     let table_disp = TableDispatcher::new_with_auto_play(
         ch.complete_sections_rx,
         ch.table_events_tx,
-        demux_cmd_tx,
-        pes_cmd_tx,
-        decode_cmd_tx,
+        demux_cmd_tx.clone(),
+        pes_cmd_tx.clone(),
+        decode_cmd_tx.clone(),
         selected_service.clone(),
         audio_status.clone(),
         true,
@@ -327,6 +347,9 @@ fn main() -> eframe::Result<()> {
                     for bytes in ts_raw_rx.iter() {
                         while let Ok(command) = demux_cmd_rx.try_recv() {
                             match command {
+                                DemuxCommand::Reset => {
+                                    demuxer.reset_dynamic_state();
+                                }
                                 DemuxCommand::RegisterPmtPid(pid) => {
                                     demuxer.register_pmt_pid(pid);
                                 }
@@ -357,6 +380,9 @@ fn main() -> eframe::Result<()> {
                     loop {
                         while let Ok(command) = pes_cmd_rx.try_recv() {
                             match command {
+                                PesCommand::Reset => {
+                                    asm.reset();
+                                }
                                 PesCommand::RegisterPid { pid, codec } => {
                                     asm.register_pid(pid, codec);
                                 }
@@ -642,6 +668,9 @@ fn main() -> eframe::Result<()> {
         let audio_status = audio_status.clone();
         let current_net_stop = current_net_stop.clone();
         let selected_service = selected_service.clone();
+        let demux_cmd_tx = demux_cmd_tx.clone();
+        let pes_cmd_tx = pes_cmd_tx.clone();
+        let decode_cmd_tx = decode_cmd_tx.clone();
         let net_raw_tx = sender_guard.net_raw_tx.sender();
         let net_events_tx = ch.net_events_tx.sender();
         let receiver_cfg = ReceiverConfig {
@@ -659,6 +688,12 @@ fn main() -> eframe::Result<()> {
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
                                 h.stop();
                             }
+                            reset_stream_routing(
+                                &selected_service,
+                                &demux_cmd_tx,
+                                &pes_cmd_tx,
+                                &decode_cmd_tx,
+                            );
 
                             match StreamUrl::parse(&url) {
                                 Err(e) => {
@@ -733,6 +768,12 @@ fn main() -> eframe::Result<()> {
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
                                 h.stop();
                             }
+                            reset_stream_routing(
+                                &selected_service,
+                                &demux_cmd_tx,
+                                &pes_cmd_tx,
+                                &decode_cmd_tx,
+                            );
                             if let Ok(mut status) = audio_status.write() {
                                 status.reset_stream_runtime(ui::AudioOperationalState::Idle);
                             }

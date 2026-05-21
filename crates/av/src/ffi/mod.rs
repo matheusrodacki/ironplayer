@@ -58,7 +58,8 @@ pub const AV_CODEC_ID_HEVC: u32 = 173;
 pub const AV_CODEC_ID_MP2: u32 = 0x15000;
 pub const AV_CODEC_ID_AAC: u32 = 0x15002;
 pub const AV_CODEC_ID_AC3: u32 = 0x15003;
-pub const AV_CODEC_ID_EAC3: u32 = 0x1502a;
+pub const AV_CODEC_ID_EAC3: u32 = 0x15028;
+pub const AV_CODEC_ID_AAC_LATM: u32 = 0x15031;
 
 /// Formatos de pixel.
 pub const AV_PIX_FMT_RGB24: c_int = 2;
@@ -172,13 +173,12 @@ pub struct AvPacket {
 // 168     quality (int)
 // 172     _pad (int)
 // 176     opaque (*void)
-// 184     repeat_pict (int)
-// 188     interlaced_frame (int) [deprecated]
-// 192     top_field_first (int) [deprecated]
-// 196     palette_has_changed (int) [deprecated]
-// 200     reordered_opaque (int64_t) [deprecated, presente em FFmpeg 8]
-// Campos de metadata de áudio como `sample_rate` e `ch_layout` não são mais
-// lidos por offset; usamos AVOptions públicas do FFmpeg no codec context.
+// 168     opaque (*void)
+// 176     repeat_pict (int)
+// 180     sample_rate (int)
+// 184     buf[8] (*AVBufferRef)
+// 384     ch_layout (AVChannelLayout)
+// 388     ch_layout.nb_channels (int)
 
 /// Lê `data[i]` de um `AVFrame*` opaco.
 ///
@@ -242,6 +242,22 @@ pub(crate) unsafe fn frame_pts(frame: *mut c_void) -> i64 {
     *((frame as *const u8).add(136) as *const i64)
 }
 
+/// Lê `sample_rate` de um `AVFrame*` opaco (offset 180).
+///
+/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn frame_sample_rate(frame: *mut c_void) -> c_int {
+    *((frame as *const u8).add(180) as *const c_int)
+}
+
+/// Lê `ch_layout.nb_channels` de um `AVFrame*` opaco (offset 388).
+///
+/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn frame_channel_count(frame: *mut c_void) -> c_int {
+    *((frame as *const u8).add(388) as *const c_int)
+}
+
 // ─── Tipos de ponteiro de função ──────────────────────────────────────────────
 
 type FnAvcodecFindDecoder = unsafe extern "C" fn(id: u32) -> *mut AvCodec;
@@ -263,15 +279,8 @@ type FnAvNewPacket = unsafe extern "C" fn(pkt: *mut AvPacket, size: c_int) -> c_
 type FnAvFrameAlloc = unsafe extern "C" fn() -> *mut c_void;
 type FnAvFrameFree = unsafe extern "C" fn(frame: *mut *mut c_void);
 type FnAvFrameUnref = unsafe extern "C" fn(frame: *mut c_void);
-type FnAvOptGetInt =
-    unsafe extern "C" fn(obj: *mut c_void, name: *const i8, search_flags: c_int, out_val: *mut i64) -> c_int;
-type FnAvOptGetChlayout = unsafe extern "C" fn(
-    obj: *mut c_void,
-    name: *const i8,
-    search_flags: c_int,
-    layout: *mut AvChannelLayout,
-) -> c_int;
-type FnAvChannelLayoutDefault = unsafe extern "C" fn(layout: *mut AvChannelLayout, nb_channels: c_int);
+type FnAvChannelLayoutDefault =
+    unsafe extern "C" fn(layout: *mut AvChannelLayout, nb_channels: c_int);
 type FnAvChannelLayoutUninit = unsafe extern "C" fn(channel_layout: *mut AvChannelLayout);
 type FnAvStrerror =
     unsafe extern "C" fn(errnum: c_int, errbuf: *mut i8, errbuf_size: usize) -> c_int;
@@ -288,7 +297,8 @@ type FnSwrAllocSetOpts2 = unsafe extern "C" fn(
     log_ctx: *mut c_void,
 ) -> c_int;
 type FnSwrInit = unsafe extern "C" fn(swr_ctx: *mut SwrContext) -> c_int;
-type FnSwrGetOutSamples = unsafe extern "C" fn(swr_ctx: *mut SwrContext, in_samples: c_int) -> c_int;
+type FnSwrGetOutSamples =
+    unsafe extern "C" fn(swr_ctx: *mut SwrContext, in_samples: c_int) -> c_int;
 type FnSwrConvert = unsafe extern "C" fn(
     swr_ctx: *mut SwrContext,
     out: *mut *mut u8,
@@ -355,8 +365,6 @@ pub struct FfmpegLib {
     pub(crate) av_frame_alloc: FnAvFrameAlloc,
     pub(crate) av_frame_free: FnAvFrameFree,
     pub(crate) av_frame_unref: FnAvFrameUnref,
-    pub(crate) av_opt_get_int: FnAvOptGetInt,
-    pub(crate) av_opt_get_chlayout: FnAvOptGetChlayout,
     pub(crate) av_channel_layout_default: FnAvChannelLayoutDefault,
     pub(crate) av_channel_layout_uninit: FnAvChannelLayoutUninit,
     pub(crate) av_strerror: FnAvStrerror,
@@ -459,20 +467,21 @@ impl FfmpegLib {
         let av_frame_alloc = sym!(avutil, b"av_frame_alloc\0", FnAvFrameAlloc);
         let av_frame_free = sym!(avutil, b"av_frame_free\0", FnAvFrameFree);
         let av_frame_unref = sym!(avutil, b"av_frame_unref\0", FnAvFrameUnref);
-        let av_opt_get_int = sym!(avutil, b"av_opt_get_int\0", FnAvOptGetInt);
-        let av_opt_get_chlayout =
-            sym!(avutil, b"av_opt_get_chlayout\0", FnAvOptGetChlayout);
-        let av_channel_layout_default =
-            sym!(avutil, b"av_channel_layout_default\0", FnAvChannelLayoutDefault);
-        let av_channel_layout_uninit =
-            sym!(avutil, b"av_channel_layout_uninit\0", FnAvChannelLayoutUninit);
+        let av_channel_layout_default = sym!(
+            avutil,
+            b"av_channel_layout_default\0",
+            FnAvChannelLayoutDefault
+        );
+        let av_channel_layout_uninit = sym!(
+            avutil,
+            b"av_channel_layout_uninit\0",
+            FnAvChannelLayoutUninit
+        );
         let av_strerror = sym!(avutil, b"av_strerror\0", FnAvStrerror);
 
-        let swr_alloc_set_opts2 =
-            sym!(swresample, b"swr_alloc_set_opts2\0", FnSwrAllocSetOpts2);
+        let swr_alloc_set_opts2 = sym!(swresample, b"swr_alloc_set_opts2\0", FnSwrAllocSetOpts2);
         let swr_init = sym!(swresample, b"swr_init\0", FnSwrInit);
-        let swr_get_out_samples =
-            sym!(swresample, b"swr_get_out_samples\0", FnSwrGetOutSamples);
+        let swr_get_out_samples = sym!(swresample, b"swr_get_out_samples\0", FnSwrGetOutSamples);
         let swr_convert = sym!(swresample, b"swr_convert\0", FnSwrConvert);
         let swr_free = sym!(swresample, b"swr_free\0", FnSwrFree);
 
@@ -497,8 +506,6 @@ impl FfmpegLib {
             av_frame_alloc,
             av_frame_free,
             av_frame_unref,
-            av_opt_get_int,
-            av_opt_get_chlayout,
             av_channel_layout_default,
             av_channel_layout_uninit,
             av_strerror,
@@ -611,67 +618,6 @@ impl FfmpegCodecContext {
         } else {
             Err(AvError::FfmpegError { code: ret })
         }
-    }
-
-    /// Lê `sample_rate` e número de canais do `AVCodecContext` via AVOptions.
-    ///
-    /// Evita depender de offsets frágeis do `AVFrame` para metadata de áudio.
-    pub(crate) fn audio_params(&self) -> Result<(u32, u16), AvError> {
-        let mut sample_rate = 0i64;
-        let sample_rate_ret = unsafe {
-            (self.lib.av_opt_get_int)(
-                self.ctx.cast(),
-                c"sample_rate".as_ptr(),
-                0,
-                &mut sample_rate,
-            )
-        };
-        if sample_rate_ret < 0 {
-            return Err(AvError::FfmpegError {
-                code: sample_rate_ret,
-            });
-        }
-
-        let channels = match self.audio_channels_from_context() {
-            Ok(channels) => channels,
-            Err(ch_layout_ret) => {
-                let mut channels = 0i64;
-                let channels_ret = unsafe {
-                    (self.lib.av_opt_get_int)(
-                        self.ctx.cast(),
-                        c"channels".as_ptr(),
-                        0,
-                        &mut channels,
-                    )
-                };
-                if channels_ret < 0 {
-                    return Err(AvError::FfmpegError { code: ch_layout_ret });
-                }
-                channels
-            }
-        };
-
-        normalize_audio_params(sample_rate, channels)
-    }
-
-    fn audio_channels_from_context(&self) -> Result<i64, i32> {
-        let mut layout = AvChannelLayout {
-            order: 0,
-            nb_channels: 0,
-            channels: AvChannelLayoutChannels { mask: 0 },
-            opaque: std::ptr::null_mut(),
-        };
-
-        let ret = unsafe {
-            (self.lib.av_opt_get_chlayout)(self.ctx.cast(), c"ch_layout".as_ptr(), 0, &mut layout)
-        };
-        if ret < 0 {
-            return Err(ret);
-        }
-
-        let channels = layout.nb_channels as i64;
-        unsafe { (self.lib.av_channel_layout_uninit)(&mut layout) };
-        Ok(channels)
     }
 }
 
@@ -970,9 +916,20 @@ impl FfmpegFrame {
             });
         }
 
-        let out_frames = (out_samples_capacity as usize).max(nb_samples as usize).max(1);
+        let out_frames = (out_samples_capacity as usize)
+            .max(nb_samples as usize)
+            .max(1);
         let mut out = vec![0f32; out_frames * out_channels as usize];
-        let mut out_planes = [out.as_mut_ptr() as *mut u8, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()];
+        let mut out_planes = [
+            out.as_mut_ptr() as *mut u8,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ];
         let in_planes = unsafe {
             [
                 frame_data_ptr(self.frame, 0) as *const u8,
@@ -1010,8 +967,26 @@ impl FfmpegFrame {
     }
 }
 
+impl FfmpegFrame {
+    /// Lê `sample_rate` e canais do AVFrame decodificado.
+    pub(crate) fn audio_params(&self) -> Result<(u32, u16), AvError> {
+        let (sample_rate, channels) = unsafe {
+            (
+                frame_sample_rate(self.frame) as i64,
+                frame_channel_count(self.frame) as i64,
+            )
+        };
+
+        normalize_audio_params(sample_rate, channels)
+    }
+}
+
 fn normalize_audio_params(sample_rate: i64, channels: i64) -> Result<(u32, u16), AvError> {
-    if sample_rate <= 0 || sample_rate > u32::MAX as i64 || channels <= 0 || channels > u16::MAX as i64 {
+    if sample_rate <= 0
+        || sample_rate > u32::MAX as i64
+        || channels <= 0
+        || channels > u16::MAX as i64
+    {
         return Err(AvError::FfmpegError { code: -22 });
     }
 
@@ -1054,14 +1029,6 @@ fn free_swr_context(lib: &FfmpegLib, swr: &mut *mut SwrContext) {
 
 impl FfmpegFrame {
     fn audio_channel_layout(&self, channels: u16) -> Result<AvChannelLayout, AvError> {
-        let mut layout = empty_channel_layout();
-        let ret = unsafe {
-            (self.lib.av_opt_get_chlayout)(self.frame.cast(), c"ch_layout".as_ptr(), 0, &mut layout)
-        };
-        if ret >= 0 && layout.nb_channels > 0 {
-            return Ok(layout);
-        }
-
         default_channel_layout(&self.lib, channels)
     }
 }
@@ -1166,6 +1133,20 @@ mod tests {
         assert_eq!(output_channels_for_input(8), 2);
     }
 
+    #[test]
+    fn spec_av_002b_audio_frame_metadata_offsets_match_ffmpeg_8_layout() {
+        let mut frame = vec![0u8; 416];
+        frame[180..184].copy_from_slice(&48_000i32.to_ne_bytes());
+        frame[388..392].copy_from_slice(&2i32.to_ne_bytes());
+
+        let frame_ptr = frame.as_mut_ptr().cast::<c_void>();
+        let (sample_rate, channels) =
+            unsafe { (frame_sample_rate(frame_ptr), frame_channel_count(frame_ptr)) };
+
+        assert_eq!(sample_rate, 48_000);
+        assert_eq!(channels, 2);
+    }
+
     /// SPEC-AV-002b: constantes de codec ID devem corresponder aos valores
     /// documentados na ISO 13818 / FFmpeg enum `AVCodecID`.
     #[test]
@@ -1173,10 +1154,11 @@ mod tests {
         assert_eq!(AV_CODEC_ID_MPEG2VIDEO, 2);
         assert_eq!(AV_CODEC_ID_H264, 27);
         assert_eq!(AV_CODEC_ID_HEVC, 173);
-        // AAC/AC3/EAC3 são audio codecs (offset 0x15000 na enum)
-        assert!(AV_CODEC_ID_AAC > AV_CODEC_ID_H264);
-        assert!(AV_CODEC_ID_AC3 > AV_CODEC_ID_H264);
-        assert!(AV_CODEC_ID_EAC3 > AV_CODEC_ID_AC3);
+        assert_eq!(AV_CODEC_ID_MP2, 0x15000);
+        assert_eq!(AV_CODEC_ID_AAC, 0x15002);
+        assert_eq!(AV_CODEC_ID_AC3, 0x15003);
+        assert_eq!(AV_CODEC_ID_EAC3, 0x15028);
+        assert_eq!(AV_CODEC_ID_AAC_LATM, 0x15031);
     }
 
     /// SPEC-AV-002b: AVERROR_EOF deve ser o valor canônico.

@@ -149,6 +149,14 @@ impl PesAssembler {
         self.buffers.remove(&pid);
     }
 
+    /// Limpa registros de PID e buffers parciais ao trocar/reiniciar a fonte.
+    ///
+    /// SPEC-AV-001
+    pub fn reset(&mut self) {
+        self.pid_codecs.clear();
+        self.buffers.clear();
+    }
+
     /// Processa o payload de um pacote TS.
     ///
     /// - `pusi = true`: início de novo PES unit. O buffer anterior (se houver)
@@ -668,6 +676,24 @@ mod tests {
         asm.push(0x0400, true, Bytes::from(pes));
 
         assert!(rx.try_recv().is_err(), "PID desconhecido deve ser ignorado");
+    }
+
+    /// Reset remove codecs registrados e buffers parciais de fonte anterior.
+    #[test]
+    fn spec_av_001_reset_clears_registered_pids() {
+        let (tx, rx) = bounded::<PesPacket>(16);
+        let mut asm = PesAssembler::new(tx);
+        let pid: Pid = 0x0101;
+        asm.register_pid(pid, MediaCodec::Video(VideoCodec::H264));
+        asm.reset();
+
+        let pes = build_pes_packet(1000, &[0x11, 0x22, 0x33]);
+        asm.push(pid, true, Bytes::from(pes));
+
+        assert!(
+            rx.try_recv().is_err(),
+            "PID removido por reset deve ser ignorado"
+        );
     }
 
     /// PES com PTS e DTS tem ambos os timestamps decodificados.

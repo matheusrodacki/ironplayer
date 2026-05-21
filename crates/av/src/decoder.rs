@@ -15,8 +15,8 @@ use crate::codec::MediaCodec;
 use crate::error::AvError;
 use crate::ffi::{
     find_ffmpeg_dll_dir, FfmpegCodecContext, FfmpegFrame, FfmpegLib, FfmpegPacket, AV_CODEC_ID_AAC,
-    AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2,
-    AV_CODEC_ID_MPEG2VIDEO,
+    AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC,
+    AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
 };
 use crate::pes::PesPacket;
 use crate::renderer::VideoFrame;
@@ -70,9 +70,8 @@ fn codec_to_avid(codec: MediaCodec) -> Result<u32, AvError> {
         MediaCodec::Video(VideoCodec::H264) => Ok(AV_CODEC_ID_H264),
         MediaCodec::Video(VideoCodec::Hevc) => Ok(AV_CODEC_ID_HEVC),
         MediaCodec::Video(VideoCodec::Mpeg2) => Ok(AV_CODEC_ID_MPEG2VIDEO),
-        MediaCodec::Audio(AudioCodec::AacAdts) | MediaCodec::Audio(AudioCodec::AacLatm) => {
-            Ok(AV_CODEC_ID_AAC)
-        }
+        MediaCodec::Audio(AudioCodec::AacAdts) => Ok(AV_CODEC_ID_AAC),
+        MediaCodec::Audio(AudioCodec::AacLatm) => Ok(AV_CODEC_ID_AAC_LATM),
         MediaCodec::Audio(AudioCodec::Ac3) => Ok(AV_CODEC_ID_AC3),
         MediaCodec::Audio(AudioCodec::Eac3) => Ok(AV_CODEC_ID_EAC3),
         MediaCodec::Audio(AudioCodec::Mp2) => Ok(AV_CODEC_ID_MP2),
@@ -211,8 +210,8 @@ impl FfmpegDecoder {
                         let pts = pts_raw_to_option(pts_raw);
                         DecodedFrame::Video(VideoFrame::new(w, h, pts, Bytes::from(rgb)))
                     } else {
-                        let (sr, ch) = state.codec_ctx.audio_params().map_err(|e| {
-                            tracing::warn!(%e, pid = pid_raw, "falha ao ler metadata de áudio do codec context");
+                        let (sr, ch) = av_frame.audio_params().map_err(|e| {
+                            tracing::warn!(%e, pid = pid_raw, "falha ao ler metadata de áudio do frame");
                             e
                         })?;
                         let (pts_raw, out_sr, out_ch, samples) = av_frame.to_pcm_f32(sr, ch)?;
@@ -318,7 +317,7 @@ mod tests {
         );
         assert_eq!(
             codec_to_avid(MediaCodec::Audio(AudioCodec::AacLatm)).unwrap(),
-            AV_CODEC_ID_AAC
+            AV_CODEC_ID_AAC_LATM
         );
         assert_eq!(
             codec_to_avid(MediaCodec::Audio(AudioCodec::Ac3)).unwrap(),

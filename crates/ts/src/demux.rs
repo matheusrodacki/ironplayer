@@ -139,6 +139,15 @@ impl TsDemuxer {
         self.cc_state.remove(&pid);
     }
 
+    /// Limpa registros dinâmicos ao trocar/reiniciar a fonte.
+    ///
+    /// SPEC-TS-002a
+    pub fn reset_dynamic_state(&mut self) {
+        self.cc_state.clear();
+        self.pmt_pids.clear();
+        self.av_pids.clear();
+    }
+
     /// Processa um chunk de bytes (múltiplos de 188 bytes).
     ///
     /// Itera o buffer em janelas de 188 bytes. Se o byte na posição atual não
@@ -257,21 +266,9 @@ impl TsDemuxer {
             return;
         };
 
-        if self.av_pids.contains(&pid) {
-            // PID de A/V → canal PES.
-            if self
-                .pes_tx
-                .try_send(PesData {
-                    pid,
-                    pusi: pkt.pusi,
-                    data: payload,
-                })
-                .is_err()
-            {
-                warn!("pes_tx cheio; PesData(pid=0x{:04X}) descartado", pid);
-            }
-        } else if self.is_section_pid(pid) {
+        if self.is_section_pid(pid) {
             // PID de seção conhecida ou PMT → canal de seções.
+            // PMT tem precedência sobre A/V para conter estado obsoleto entre reconexões.
             if self
                 .section_tx
                 .try_send(SectionData {
@@ -285,6 +282,19 @@ impl TsDemuxer {
                     "section_tx cheio; SectionData(pid=0x{:04X}) descartado",
                     pid
                 );
+            }
+        } else if self.av_pids.contains(&pid) {
+            // PID de A/V → canal PES.
+            if self
+                .pes_tx
+                .try_send(PesData {
+                    pid,
+                    pusi: pkt.pusi,
+                    data: payload,
+                })
+                .is_err()
+            {
+                warn!("pes_tx cheio; PesData(pid=0x{:04X}) descartado", pid);
             }
         } else {
             // PID desconhecido → rotear como seção (tentativa).
@@ -646,6 +656,31 @@ mod tests {
         assert_eq!(sections[0].pid, pmt_pid);
     }
 
+    /// PID de PMT deve continuar sendo seção mesmo se um registro A/V obsoleto
+    /// para o mesmo PID ainda existir após reconexão.
+    #[test]
+    fn spec_ts_002_routing_pmt_pid_takes_precedence_over_stale_av_pid() {
+        let (sec_tx, sec_rx) = bounded(64);
+        let (pes_tx, pes_rx) = bounded(64);
+        let (evt_tx, _evt_rx) = bounded(64);
+
+        let mut demuxer = TsDemuxer::new(sec_tx, pes_tx, evt_tx);
+        let reused_pid: Pid = 0x0101;
+        demuxer.register_av_pid(reused_pid);
+        demuxer.register_pmt_pid(reused_pid);
+
+        demuxer.process_chunk(&build_payload_packet(reused_pid, 0));
+
+        let sections: Vec<SectionData> = sec_rx.try_iter().collect();
+        let pes_pkts: Vec<PesData> = pes_rx.try_iter().collect();
+        assert_eq!(sections.len(), 1, "PID de PMT deve ir para section_tx");
+        assert_eq!(sections[0].pid, reused_pid);
+        assert!(
+            pes_pkts.is_empty(),
+            "registro A/V obsoleto não deve mandar PMT para pes_tx"
+        );
+    }
+
     /// PID registrado via `register_av_pid` é roteado para `pes_tx`.
     ///
     /// SPEC-TS-002a
@@ -664,6 +699,24 @@ mod tests {
         let pes_pkts: Vec<PesData> = pes_rx.try_iter().collect();
         assert_eq!(pes_pkts.len(), 1, "PID de A/V deve ser roteado para pes_tx");
         assert_eq!(pes_pkts[0].pid, av_pid);
+    }
+
+    /// Reset dinâmico remove registros A/V obsoletos entre fontes.
+    #[test]
+    fn spec_ts_002_reset_dynamic_state_clears_registered_av_pids() {
+        let (sec_tx, sec_rx) = bounded(64);
+        let (pes_tx, pes_rx) = bounded(64);
+        let (evt_tx, _evt_rx) = bounded(64);
+
+        let mut demuxer = TsDemuxer::new(sec_tx, pes_tx, evt_tx);
+        let pid: Pid = 0x0101;
+        demuxer.register_av_pid(pid);
+        demuxer.reset_dynamic_state();
+
+        demuxer.process_chunk(&build_payload_packet(pid, 0));
+
+        assert!(pes_rx.try_iter().next().is_none());
+        assert_eq!(sec_rx.try_iter().count(), 1);
     }
 
     /// Null packets (PID=0x1FFF) não são roteados para nenhum canal de dados.

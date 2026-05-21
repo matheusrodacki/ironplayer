@@ -235,6 +235,14 @@ impl eframe::App for IronPlayerApp {
         self.poll_table_events();
         self.poll_video_frames();
 
+        // eframe e' reactive por padrao -- so' repinta com interacao do
+        // usuario. Para vídeo em tempo real precisamos de redraw contínuo:
+        // pedimos repaint a ~60 Hz enquanto houver fluxo de video. Sem isso o
+        // canal `video_frames` lota e o decoder fica gerando frames descartados.
+        if self.video_frames_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+
         // ── Header: URL + botões Conectar / Desconectar ──────────────────────
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {

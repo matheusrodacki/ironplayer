@@ -12,7 +12,7 @@ use net::{
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use table_dispatcher::{DemuxCommand, PesCommand, TableDispatcher};
+use table_dispatcher::{DecodeCommand, DemuxCommand, PesCommand, TableDispatcher};
 use ts::{
     aggregator::{
         AggregatorNetEvent, MetricsAggregator, StopHandle as MetricsStopHandle,
@@ -137,10 +137,19 @@ fn join_with_deadline(handle: std::thread::JoinHandle<()>, deadline: Instant) {
 
 fn main() -> eframe::Result<()> {
     // 1. Init tracing
+    //
+    // O filtro default silencia bibliotecas de UI/GPU notoriamente barulhentas
+    // (`wgpu`, `naga`, `winit`, `glutin`, `eframe`) em nível INFO; sem isso a
+    // `Device::maintain: waiting for submission index N` é emitida a cada
+    // submit GPU e satura o terminal, derrubando o FPS efetivo do player.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(
+                    "info,wgpu=warn,wgpu_core=warn,wgpu_hal=error,naga=warn,\
+                     winit=warn,glutin=warn,eframe=warn,egui_wgpu=warn",
+                )
+            }),
         )
         .init();
 
@@ -164,6 +173,7 @@ fn main() -> eframe::Result<()> {
     let (agg_net_tx, agg_net_rx) = crossbeam_channel::bounded::<AggregatorNetEvent>(64);
     let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded::<DemuxCommand>(64);
     let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded::<PesCommand>(64);
+    let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded::<DecodeCommand>(16);
 
     // 6. Token de parada do MetricsAggregator
     let (metrics_stop_token, metrics_stop_handle): (MetricsStopToken, MetricsStopHandle) =
@@ -175,6 +185,10 @@ fn main() -> eframe::Result<()> {
 
     // Handle da conexão de rede atual; compartilhado entre cmd-handler e PipelineGuard
     let current_net_stop: Arc<Mutex<Option<NetStopHandle>>> = Arc::new(Mutex::new(None));
+
+    // Serviço selecionado, compartilhado entre cmd-handler, TableDispatcher e UI.
+    let selected_service: Arc<std::sync::RwLock<Option<u16>>> =
+        Arc::new(std::sync::RwLock::new(None));
 
     // 7. Instancia MetricsAggregator
     let (metrics_agg, snapshot_rx) =
@@ -192,12 +206,16 @@ fn main() -> eframe::Result<()> {
     let section_asm =
         SectionAssembler::new(ch.complete_sections_tx.sender(), ch.ts_events_tx.sender());
 
-    // 10. Instancia TableDispatcher
-    let table_disp = TableDispatcher::new(
+    // 10. Instancia TableDispatcher (auto_play: seleciona o primeiro serviço
+    // com A/V automaticamente; o usuário pode trocar via menu do VideoPanel).
+    let table_disp = TableDispatcher::new_with_auto_play(
         ch.complete_sections_rx,
         ch.table_events_tx,
         demux_cmd_tx,
         pes_cmd_tx,
+        decode_cmd_tx,
+        selected_service.clone(),
+        true,
     );
     let table_events_rx = ch.table_events_rx;
 
@@ -291,6 +309,9 @@ fn main() -> eframe::Result<()> {
                                 DemuxCommand::RegisterAvPid(pid) => {
                                     demuxer.register_av_pid(pid);
                                 }
+                                DemuxCommand::DeregisterAvPid(pid) => {
+                                    demuxer.deregister_av_pid(pid);
+                                }
                             }
                         }
                         demuxer.process_chunk(&bytes);
@@ -314,6 +335,9 @@ fn main() -> eframe::Result<()> {
                             match command {
                                 PesCommand::RegisterPid { pid, codec } => {
                                     asm.register_pid(pid, codec);
+                                }
+                                PesCommand::DeregisterPid { pid } => {
+                                    asm.deregister_pid(pid);
                                 }
                             }
                         }
@@ -362,6 +386,7 @@ fn main() -> eframe::Result<()> {
     {
         let pes_packets_rx = ch.pes_packets_rx;
         let video_frames_tx = ch.video_frames_tx;
+        let video_frames_rx_for_drop = ch.video_frames_rx.clone();
         let audio_frames_tx = ch.audio_frames_tx;
         handles.push(
             std::thread::Builder::new()
@@ -382,23 +407,58 @@ fn main() -> eframe::Result<()> {
 
                     tracing::info!("av-decode: iniciado");
 
-                    for packet in pes_packets_rx.iter() {
-                        match decoder.decode(&packet) {
-                            Ok(frames) => {
-                                for frame in frames {
-                                    match frame {
-                                        av::DecodedFrame::Video(vf) => {
-                                            video_frames_tx.try_send(vf);
-                                        }
-                                        av::DecodedFrame::Audio(af) => {
-                                            audio_frames_tx.try_send(af);
+                    // Contador de erros de decode por PID para evitar log spam
+                    // (canais de áudio com offset errado podem falhar 30x/s).
+                    let mut decode_err_count: std::collections::HashMap<u16, u64> =
+                        std::collections::HashMap::new();
+
+                    loop {
+                        // Drena comandos de controle (ex.: Reset ao trocar serviço).
+                        while let Ok(command) = decode_cmd_rx.try_recv() {
+                            match command {
+                                DecodeCommand::Reset => {
+                                    decoder.reset();
+                                    tracing::info!(
+                                        "av-decode: contextos resetados (troca de serviço)"
+                                    );
+                                }
+                            }
+                        }
+
+                        match pes_packets_rx.recv_timeout(Duration::from_millis(20)) {
+                            Ok(packet) => match decoder.decode(&packet) {
+                                Ok(frames) => {
+                                    for frame in frames {
+                                        match frame {
+                                            av::DecodedFrame::Video(vf) => {
+                                                video_frames_tx.try_send_latest(
+                                                    &video_frames_rx_for_drop,
+                                                    vf,
+                                                );
+                                            }
+                                            av::DecodedFrame::Audio(af) => {
+                                                audio_frames_tx.try_send(af);
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::warn!(%e, pid = packet.pid, "av-decode: erro ao decodificar PES");
-                            }
+                                Err(e) => {
+                                    let n = decode_err_count.entry(packet.pid).or_insert(0);
+                                    *n += 1;
+                                    // Loga o primeiro erro e depois a cada 200 ocorrencias
+                                    // do mesmo PID, evitando saturar o terminal.
+                                    if *n == 1 || *n % 200 == 0 {
+                                        tracing::warn!(
+                                            %e,
+                                            pid = packet.pid,
+                                            count = *n,
+                                            "av-decode: erro ao decodificar PES"
+                                        );
+                                    }
+                                }
+                            },
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         }
                     }
 
@@ -488,6 +548,7 @@ fn main() -> eframe::Result<()> {
     {
         let conn_state = conn_state.clone();
         let current_net_stop = current_net_stop.clone();
+        let selected_service = selected_service.clone();
         let net_raw_tx = sender_guard.net_raw_tx.sender();
         let net_events_tx = ch.net_events_tx.sender();
         let receiver_cfg = ReceiverConfig {
@@ -566,6 +627,10 @@ fn main() -> eframe::Result<()> {
                             *conn_state.write().unwrap() = ui::ConnectionState::Idle;
                             tracing::info!("desconectado pelo usuário");
                         }
+                        ui::AppCommand::SelectService { service_id } => {
+                            *selected_service.write().unwrap() = Some(service_id);
+                            tracing::info!(service_id, "serviço selecionado pelo usuário");
+                        }
                         _ => {}
                     }
                 }
@@ -599,6 +664,7 @@ fn main() -> eframe::Result<()> {
                     cmd_tx,
                     Some(snapshot_rx),
                     Some(conn_state),
+                    Some(selected_service),
                     Some(table_events_rx.clone()),
                     Some(video_frames_rx),
                 ),

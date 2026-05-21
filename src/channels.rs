@@ -117,6 +117,48 @@ impl<T> BoundedSender<T> {
             }
         }
     }
+
+    /// SPEC-CHAN-001
+    /// Tenta enviar mantendo o item mais recente quando o canal esta cheio.
+    ///
+    /// Ao contrario de [`try_send`], esta politica descarta um item antigo do
+    /// receptor e tenta publicar o novo item. Use apenas em fluxos ao vivo nos
+    /// quais baixa latencia importa mais do que preservar todos os itens, como
+    /// `video_frames`.
+    pub fn try_send_latest(&self, rx: &Receiver<T>, msg: T) -> bool {
+        match self.inner.try_send(msg) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Full(msg)) => {
+                match rx.try_recv() {
+                    Ok(_stale) => {}
+                    Err(crossbeam_channel::TryRecvError::Empty) => {}
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        tracing::warn!("canal {} desconectado — item descartado", self.name);
+                        return false;
+                    }
+                }
+
+                match self.inner.try_send(msg) {
+                    Ok(()) => true,
+                    Err(crossbeam_channel::TrySendError::Full(_)) => {
+                        tracing::debug!(
+                            "canal {} cheio — frame antigo descartado, novo nao coube",
+                            self.name
+                        );
+                        false
+                    }
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        tracing::warn!("canal {} desconectado — item descartado", self.name);
+                        false
+                    }
+                }
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                tracing::warn!("canal {} desconectado — item descartado", self.name);
+                false
+            }
+        }
+    }
 }
 
 impl<T> Clone for BoundedSender<T> {
@@ -288,6 +330,24 @@ mod tests {
             !sender.try_send(10),
             "envio com canal cheio deve retornar false"
         );
+    }
+
+    /// SPEC-CHAN-001
+    /// `try_send_latest` descarta o item mais antigo e preserva o mais recente.
+    #[test]
+    fn spec_chan_001_try_send_latest_drops_oldest_on_full() {
+        let (tx, rx) = bounded::<u32>(2);
+        let sender = BoundedSender::new(tx, "video_frames");
+
+        assert!(sender.try_send(1), "primeiro envio deve ter sucesso");
+        assert!(sender.try_send(2), "segundo envio deve ter sucesso");
+        assert!(
+            sender.try_send_latest(&rx, 3),
+            "envio latest deve descartar antigo e manter novo"
+        );
+
+        let collected: Vec<u32> = rx.try_iter().collect();
+        assert_eq!(collected, vec![2, 3]);
     }
 
     /// SPEC-CHAN-001

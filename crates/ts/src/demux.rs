@@ -127,6 +127,18 @@ impl TsDemuxer {
         self.av_pids.insert(pid);
     }
 
+    /// Remove o registro de um PID A/V (chamado ao trocar de serviço).
+    ///
+    /// Após esta chamada, os pacotes deste PID não serão mais roteados ao
+    /// `PesAssembler`. Também limpa o estado de Continuity Counter para que
+    /// uma futura re-registração não dispare descontinuidades espúrias.
+    ///
+    /// SPEC-TS-002a
+    pub fn deregister_av_pid(&mut self, pid: Pid) {
+        self.av_pids.remove(&pid);
+        self.cc_state.remove(&pid);
+    }
+
     /// Processa um chunk de bytes (múltiplos de 188 bytes).
     ///
     /// Itera o buffer em janelas de 188 bytes. Se o byte na posição atual não

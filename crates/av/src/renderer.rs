@@ -56,11 +56,17 @@ impl VideoFrame {
 /// Converte RGB24 → RGBA8 (alpha fixo = 255).
 ///
 /// Necessário porque wgpu/egui usam RGBA8, enquanto `VideoFrame` usa RGB24.
-fn rgb24_to_rgba8(rgb: &[u8]) -> Vec<u8> {
-    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-    for chunk in rgb.chunks_exact(3) {
-        rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+fn rgb24_to_rgba8_into(rgb: &[u8], rgba: &mut Vec<u8>) {
+    rgba.clear();
+    rgba.reserve(rgb.len() / 3 * 4);
+    for pixel in rgb.chunks_exact(3) {
+        rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
     }
+}
+
+fn rgb24_to_rgba8(rgb: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::new();
+    rgb24_to_rgba8_into(rgb, &mut rgba);
     rgba
 }
 
@@ -73,6 +79,7 @@ struct GpuRenderer {
     texture: Option<wgpu::Texture>,
     texture_id: Option<TextureId>,
     dims: Option<(u32, u32)>,
+    rgba_scratch: Vec<u8>,
 }
 
 impl GpuRenderer {
@@ -119,7 +126,7 @@ impl GpuRenderer {
 
         // Faz upload dos pixels RGB24 → RGBA8 para a textura wgpu.
         if let Some(texture) = &self.texture {
-            let rgba = rgb24_to_rgba8(frame.data.as_ref());
+            rgb24_to_rgba8_into(frame.data.as_ref(), &mut self.rgba_scratch);
             self.queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture,
@@ -127,7 +134,7 @@ impl GpuRenderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &rgba,
+                &self.rgba_scratch,
                 wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(4 * frame.width),
@@ -228,6 +235,7 @@ impl VideoRenderer {
                 texture: None,
                 texture_id: None,
                 dims: None,
+                rgba_scratch: Vec::new(),
             }),
         }
     }

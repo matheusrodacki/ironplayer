@@ -393,9 +393,9 @@ impl FfmpegLib {
         let avcodec_receive_frame =
             sym!(avcodec, b"avcodec_receive_frame\0", FnAvcodecReceiveFrame);
 
-        let av_packet_alloc = sym!(avutil, b"av_packet_alloc\0", FnAvPacketAlloc);
-        let av_packet_free = sym!(avutil, b"av_packet_free\0", FnAvPacketFree);
-        let av_new_packet = sym!(avutil, b"av_new_packet\0", FnAvNewPacket);
+        let av_packet_alloc = sym!(avcodec, b"av_packet_alloc\0", FnAvPacketAlloc);
+        let av_packet_free = sym!(avcodec, b"av_packet_free\0", FnAvPacketFree);
+        let av_new_packet = sym!(avcodec, b"av_new_packet\0", FnAvNewPacket);
         let av_frame_alloc = sym!(avutil, b"av_frame_alloc\0", FnAvFrameAlloc);
         let av_frame_free = sym!(avutil, b"av_frame_free\0", FnAvFrameFree);
         let av_frame_unref = sym!(avutil, b"av_frame_unref\0", FnAvFrameUnref);
@@ -759,6 +759,17 @@ impl FfmpegFrame {
         };
 
         if nb_samples <= 0 || nb_channels <= 0 || sample_rate <= 0 {
+            // Provavelmente os offsets do AVFrame nao batem com a ABI da
+            // libavutil carregada. Logamos os valores brutos lidos para
+            // diagnosticar qual campo esta em offset errado.
+            tracing::error!(
+                nb_samples,
+                fmt,
+                sample_rate,
+                nb_channels,
+                pts,
+                "to_pcm_f32: valores invalidos lidos do AVFrame (offsets podem estar errados para esta versao de libavutil)"
+            );
             return Err(AvError::FfmpegError { code: -22 });
         }
 

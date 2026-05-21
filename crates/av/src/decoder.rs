@@ -166,6 +166,15 @@ impl FfmpegDecoder {
     pub fn decode(&mut self, pes: &PesPacket) -> Result<Vec<DecodedFrame>, AvError> {
         let pid_raw: u16 = pes.pid;
 
+        // TODO(av-audio-offsets): áudio temporariamente desabilitado. Os offsets
+        // de `sample_rate` (208) e `ch_layout.nb_channels` (220) do AVFrame
+        // usados em ffi/mod.rs nao batem com a ABI da libavutil-60 GA: leem 0
+        // e disparam erro -22 a 30x/s, sem produzir frame valido. Enquanto isso
+        // ignoramos PES de audio para nao saturar logs nem desperdicar CPU.
+        if matches!(pes.codec, MediaCodec::Audio(_)) {
+            return Ok(Vec::new());
+        }
+
         // Obtém ou cria o codec state para este PID.
         if !self.states.contains_key(&pid_raw) {
             let avid = codec_to_avid(pes.codec)?;
@@ -212,11 +221,9 @@ impl FfmpegDecoder {
                         DecodedFrame::Video(VideoFrame::new(w, h, pts, Bytes::from(rgb)))
                     } else {
                         let (sr, ch, pts_raw, samples) = av_frame.to_pcm_f32().map_err(|e| {
-                            tracing::warn!(
-                                %e,
-                                pid = pid_raw,
-                                "falha ao converter frame de áudio"
-                            );
+                            // Log barulhento ja' e' emitido por to_pcm_f32 no
+                            // primeiro erro com os valores brutos. Aqui nao
+                            // duplicamos para evitar spam.
                             e
                         })?;
                         let pts = pts_raw_to_option(pts_raw);

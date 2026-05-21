@@ -242,6 +242,19 @@ pub(crate) unsafe fn frame_pts(frame: *mut c_void) -> i64 {
     *((frame as *const u8).add(136) as *const i64)
 }
 
+/// Lê `sample_aspect_ratio` de um `AVFrame*` opaco (offset 128).
+///
+/// Retorna `(num, den)`.  Quando `den == 0` ou `num <= 0`, o SAR não está
+/// definido; o chamador deve tratar como pixels quadrados (1:1).
+///
+/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn frame_sar(frame: *mut c_void) -> (i32, i32) {
+    let num = *((frame as *const u8).add(128) as *const i32);
+    let den = *((frame as *const u8).add(132) as *const i32);
+    (num, den)
+}
+
 /// Lê `sample_rate` de um `AVFrame*` opaco (offset 180).
 ///
 /// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
@@ -728,18 +741,30 @@ impl FfmpegFrame {
 
     /// Converte o frame de vídeo para RGB24 via swscale.
     ///
-    /// Retorna `(width, height, pts, rgb_bytes)`.
+    /// Retorna `(width, height, pts, rgb_bytes, (sar_num, sar_den))`.
+    /// `sar_num/sar_den` é o Sample Aspect Ratio do frame; use-o para calcular
+    /// o Display Aspect Ratio: `DAR = (sar_num * width) / (sar_den * height)`.
+    /// Quando `sar_num == sar_den` (incluindo ambos == 1), pixels são quadrados.
     ///
     /// SPEC-AV-002b
-    pub(crate) fn to_rgb24(&self) -> Result<(u32, u32, i64, Vec<u8>), AvError> {
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn to_rgb24(&self) -> Result<(u32, u32, i64, Vec<u8>, (u32, u32)), AvError> {
         // SAFETY: offsets validados contra FFmpeg 8.x headers (ver comentário de layout).
-        let (width, height, pts, src_fmt) = unsafe {
+        let (width, height, pts, src_fmt, raw_sar) = unsafe {
             (
                 frame_width(self.frame),
                 frame_height(self.frame),
                 frame_pts(self.frame),
                 frame_format(self.frame),
+                frame_sar(self.frame),
             )
+        };
+
+        // Normaliza SAR: (0,*), (*,0) ou valores negativos → 1:1 (pixels quadrados).
+        let sar = if raw_sar.0 > 0 && raw_sar.1 > 0 {
+            (raw_sar.0 as u32, raw_sar.1 as u32)
+        } else {
+            (1u32, 1u32)
         };
 
         if width <= 0 || height <= 0 {
@@ -829,7 +854,7 @@ impl FfmpegFrame {
             return Err(AvError::FfmpegError { code: -22 });
         }
 
-        Ok((width as u32, height as u32, pts, rgb_data))
+        Ok((width as u32, height as u32, pts, rgb_data, sar))
     }
 
     /// Converte o frame de áudio para PCM f32 interleaved.

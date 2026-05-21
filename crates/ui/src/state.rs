@@ -11,6 +11,41 @@ use ts::tables::{Bat, EitEvent, Nit, Pat, Pmt, Sdt, Tdt};
 use ts::Pid;
 
 // ---------------------------------------------------------------------------
+// AspectRatioMode
+// ---------------------------------------------------------------------------
+
+/// Modo de exibição do aspect-ratio do vídeo.
+///
+/// Controla como o `VideoPanel` calcula o retângulo de exibição.
+/// Preferência puramente visual; não afeta o pipeline de decodificação.
+///
+/// SPEC-UI-001
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AspectRatioMode {
+    /// Usa o DAR derivado do SAR sinalizado no stream (comportamento padrão).
+    #[default]
+    Dar,
+    /// Força proporção 16:9 independente do que o stream reporta.
+    Force16x9,
+    /// Força proporção 4:3 independente do que o stream reporta.
+    Force4x3,
+}
+
+impl AspectRatioMode {
+    /// Retorna o aspect-ratio efetivo para exibição.
+    ///
+    /// `stream_aspect` é o aspect-ratio calculado a partir das dimensões de
+    /// exibição SAR-corrigidas (`display_w / display_h`).
+    pub fn effective_aspect(self, stream_aspect: f32) -> f32 {
+        match self {
+            Self::Dar => stream_aspect,
+            Self::Force16x9 => 16.0 / 9.0,
+            Self::Force4x3 => 4.0 / 3.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AudioStatusSnapshot
 // ---------------------------------------------------------------------------
 

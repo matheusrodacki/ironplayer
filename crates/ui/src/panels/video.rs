@@ -6,7 +6,7 @@ use crossbeam_channel::Sender;
 use eframe::egui;
 use ts::tables::PmtStream;
 
-use crate::state::{AppCommand, ConnectionState};
+use crate::state::{AppCommand, AspectRatioMode, ConnectionState};
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +67,9 @@ impl VideoPanel {
     /// Quando `None` e conectado sem serviço selecionado, exibe fundo preto.
     /// Caso contrário, mostra o placeholder `"[ sem stream ]"`.
     ///
+    /// `aspect_ratio`: modo de proporção selecionado pelo usuário; mutado
+    /// pelo submenu de contexto.
+    ///
     /// `cmd_tx`: canal para envio de comandos ao backend; utilizado pelo menu
     /// de contexto (botão direito) para despachar `SelectService`.
     ///
@@ -76,6 +79,7 @@ impl VideoPanel {
         state: &AppState,
         video_texture: Option<(egui::TextureId, (u32, u32))>,
         cmd_tx: &Sender<AppCommand>,
+        aspect_ratio: &mut AspectRatioMode,
     ) {
         let has_stream = matches!(state.connection, ConnectionState::Connected { .. })
             && state.selected_service.is_some();
@@ -87,7 +91,10 @@ impl VideoPanel {
 
         if let Some((tex_id, (w, h))) = video_texture {
             // Exibe o frame decodificado escalado com aspect-ratio correto.
-            let aspect = w as f32 / h.max(1) as f32;
+            // `video_dims` já carrega as dimensões SAR-corrigidas (DAR);
+            // o mode pode sobrescrever com um valor fixo.
+            let stream_aspect = w as f32 / h.max(1) as f32;
+            let aspect = aspect_ratio.effective_aspect(stream_aspect);
             let (draw_w, draw_h) = if available.x / available.y > aspect {
                 (available.y * aspect, available.y)
             } else {
@@ -126,7 +133,7 @@ impl VideoPanel {
         let connected = matches!(state.connection, ConnectionState::Connected { .. });
 
         response.context_menu(|ui| {
-            Self::show_context_menu(ui, state, cmd_tx, connected);
+            Self::show_context_menu(ui, state, cmd_tx, connected, aspect_ratio);
         });
     }
 
@@ -140,6 +147,7 @@ impl VideoPanel {
         state: &AppState,
         cmd_tx: &Sender<AppCommand>,
         connected: bool,
+        aspect_ratio: &mut AspectRatioMode,
     ) {
         // ── Submenu: Serviço ──────────────────────────────────────────────
         ui.menu_button("Serviço", |ui| {
@@ -248,6 +256,29 @@ impl VideoPanel {
             } else {
                 for pid in subtitle_streams {
                     ui.add_enabled(false, egui::Button::new(format!("0x{pid:04X}  Legenda")));
+                }
+            }
+        });
+
+        ui.separator();
+
+        // ── Submenu: Proporção ────────────────────────────────────────────
+        ui.menu_button("Proporção", |ui| {
+            let options = [
+                (AspectRatioMode::Dar, "DAR (padrão)"),
+                (AspectRatioMode::Force16x9, "16:9 (forçado)"),
+                (AspectRatioMode::Force4x3, "4:3 (forçado)"),
+            ];
+            for (mode, label) in options {
+                let active = *aspect_ratio == mode;
+                let display = if active {
+                    format!("✓  {label}")
+                } else {
+                    format!("    {label}")
+                };
+                if ui.button(display).clicked() {
+                    *aspect_ratio = mode;
+                    ui.close_menu();
                 }
             }
         });

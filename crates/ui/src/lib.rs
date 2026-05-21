@@ -7,8 +7,8 @@ pub mod state;
 pub mod status_bar;
 
 pub use state::{
-    AppCommand, AppState, AudioErrorSnapshot, AudioOperationalState, AudioStatusSnapshot,
-    AudioTrackInfo, ConnectionState, TableEvent, TablesSnapshot,
+    AppCommand, AppState, AspectRatioMode, AudioErrorSnapshot, AudioOperationalState,
+    AudioStatusSnapshot, AudioTrackInfo, ConnectionState, TableEvent, TablesSnapshot,
 };
 
 use std::sync::{Arc, RwLock};
@@ -68,8 +68,12 @@ pub struct IronPlayerApp {
     ///
     /// SPEC-AV-003
     video_renderer: Option<VideoRenderer>,
-    /// Dimensões do último frame renderizado `(width, height)`.
+    /// Dimensões do último frame renderizado `(width, height)` corrigidas por SAR.
     video_dims: Option<(u32, u32)>,
+    /// Modo de aspect-ratio selecionado pelo usuário.
+    ///
+    /// Preferência puramente visual; padrão `Dar` usa o SAR sinalizado pelo stream.
+    aspect_ratio_mode: AspectRatioMode,
     /// Timestamp do último snapshot usado para alimentar históricos de gráficos.
     last_metrics_snapshot_timestamp: Option<Instant>,
     /// Número de eventos de jitter PCR já incorporados ao histórico da UI.
@@ -126,6 +130,7 @@ impl IronPlayerApp {
             video_frames_rx,
             video_renderer,
             video_dims: None,
+            aspect_ratio_mode: AspectRatioMode::default(),
             last_metrics_snapshot_timestamp: None,
             seen_pcr_jitter_records: 0,
         }
@@ -232,7 +237,17 @@ impl IronPlayerApp {
             if let Some(renderer) = &mut self.video_renderer {
                 match renderer.upload(&frame) {
                     Ok(()) => {
-                        self.video_dims = Some((frame.width, frame.height));
+                        // Aplica o SAR para calcular as dimensões de exibição corretas.
+                        // DAR = SAR * (w/h); mantemos w fixo e ajustamos h:
+                        //   display_h = pixel_h * sar_den / sar_num
+                        // Para 1920×540 com SAR 1:2 → display_h = 540*2/1 = 1080 → 16:9
+                        let display_h = if frame.sar_num > 1 || frame.sar_den > 1 {
+                            let h64 = frame.height as u64 * frame.sar_den as u64;
+                            (h64 / frame.sar_num.max(1) as u64) as u32
+                        } else {
+                            frame.height
+                        };
+                        self.video_dims = Some((frame.width, display_h.max(1)));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "poll_video_frames: falha no upload do frame");
@@ -365,7 +380,13 @@ impl eframe::App for IronPlayerApp {
             .resizable(true)
             .default_width(400.0)
             .show(ctx, |ui| {
-                VideoPanel::show(ui, &self.state, video_texture, &self.cmd_tx);
+                VideoPanel::show(
+                    ui,
+                    &self.state,
+                    video_texture,
+                    &self.cmd_tx,
+                    &mut self.aspect_ratio_mode,
+                );
             });
 
         // ── Painel direito: MetricsPanel (≈25%) ──────────────────────────────

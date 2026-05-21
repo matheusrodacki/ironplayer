@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::audio::AudioFrame;
-use crate::codec::MediaCodec;
+use crate::codec::{AudioCodec, MediaCodec};
 use crate::error::AvError;
 use crate::ffi::{
     find_ffmpeg_dll_dir, FfmpegCodecContext, FfmpegFrame, FfmpegLib, FfmpegPacket, AV_CODEC_ID_AAC,
@@ -157,9 +157,11 @@ impl FfmpegDecoder {
     ///
     /// Internamente:
     /// 1. Obtém (ou cria) o `AVCodecContext` para o PID do pacote.
-    /// 2. Cria um `AVPacket` com o payload do PES.
-    /// 3. Chama `avcodec_send_packet` + loop de `avcodec_receive_frame`.
-    /// 4. Converte cada frame para `DecodedFrame` (RGB24 ou PCM f32).
+    /// 2. Para AAC LATM, divide o payload em frames LOAS individuais antes de
+    ///    enviar ao decoder (um `AVPacket` por frame LOAS).
+    /// 3. Para outros codecs, cria um `AVPacket` com o payload completo.
+    /// 4. Chama `avcodec_send_packet` + loop de `avcodec_receive_frame`.
+    /// 5. Converte cada frame para `DecodedFrame` (RGB24 ou PCM f32).
     ///
     /// SPEC-AV-002b
     pub fn decode(&mut self, pes: &PesPacket) -> Result<Vec<DecodedFrame>, AvError> {
@@ -188,27 +190,105 @@ impl FfmpegDecoder {
             ))
         })?;
 
+        let mut frames = Vec::new();
+        let mut av_frame = FfmpegFrame::alloc(Arc::clone(&self.lib))?;
+
+        // AAC LATM: um PES pode conter múltiplos frames LOAS concatenados.
+        // O decoder aac_latm do FFmpeg aceita apenas um frame LOAS por AVPacket;
+        // enviar o PES inteiro causa "frame length mismatch" e AVERROR_INVALIDDATA.
+        // Solução: dividir o payload em frames LOAS individuais via sync word.
+        if matches!(pes.codec, MediaCodec::Audio(AudioCodec::AacLatm)) {
+            let loas_slices = split_loas_frames(&pes.payload);
+
+            // Conjunto de slices a decodificar: frames LOAS individuais, ou o
+            // payload completo como fallback quando nenhum sync word é encontrado.
+            enum LoasSource<'a> {
+                Slices(Vec<&'a [u8]>),
+                Full(&'a [u8]),
+            }
+            let source = if loas_slices.is_empty() {
+                LoasSource::Full(&pes.payload)
+            } else {
+                LoasSource::Slices(loas_slices)
+            };
+            let iter: Vec<&[u8]> = match &source {
+                LoasSource::Full(d) => vec![d],
+                LoasSource::Slices(v) => v.to_vec(),
+            };
+
+            for loas_data in iter {
+                let pkt = FfmpegPacket::from_bytes(Arc::clone(&self.lib), loas_data, pes.pts)?;
+                if let Err(e) = state.codec_ctx.send_packet(&pkt) {
+                    tracing::warn!(%e, pid = pid_raw, "aac_latm: falha ao enviar frame LOAS");
+                    continue;
+                }
+                loop {
+                    match state.codec_ctx.receive_frame(&mut av_frame) {
+                        Ok(true) => {
+                            let (sr, ch) = av_frame.audio_params().map_err(|e| {
+                                tracing::warn!(
+                                    %e,
+                                    pid = pid_raw,
+                                    "aac_latm: falha ao ler metadata de áudio"
+                                );
+                                e
+                            })?;
+                            let (pts_raw, out_sr, out_ch, samples) = av_frame.to_pcm_f32(sr, ch)?;
+                            frames.push(DecodedFrame::Audio(AudioFrame::new(
+                                out_sr,
+                                out_ch,
+                                pts_raw_to_option(pts_raw),
+                                samples,
+                            )));
+                            av_frame.unref();
+                        }
+                        Ok(false) => break,
+                        Err(e) => {
+                            tracing::warn!(%e, pid = pid_raw, "aac_latm: receive_frame erro");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return Ok(frames);
+        }
+
+        // Caminho padrão para vídeo e demais codecs de áudio.
+        //
+        // Erros de send_packet são tratados como recuperáveis: ao entrar no stream
+        // no meio de um GOP (ex.: HEVC sem IDR), o decodificador pode rejeitar
+        // pacotes com AVERROR_INVALIDDATA até receber um IDR frame.  Retornar Err
+        // aqui seria correto para erros fatais, mas para o caso mid-stream o
+        // decoder se recupera sozinho no próximo IDR — portanto loga e continua.
+
         // Cria o AVPacket com o payload PES.
         let pkt = FfmpegPacket::from_bytes(Arc::clone(&self.lib), &pes.payload, pes.pts)?;
 
         // Envia o pacote ao decodificador.
-        state.codec_ctx.send_packet(&pkt)?;
-
-        // Coleta todos os frames disponíveis.
-        let mut frames = Vec::new();
-        let mut av_frame = FfmpegFrame::alloc(Arc::clone(&self.lib))?;
+        if let Err(e) = state.codec_ctx.send_packet(&pkt) {
+            tracing::debug!(%e, pid = pid_raw, "send_packet: erro transitório (aguardando IDR?)");
+            return Ok(frames);
+        }
 
         loop {
             match state.codec_ctx.receive_frame(&mut av_frame) {
                 Ok(true) => {
                     // Frame pronto — converte para tipo Rust.
                     let decoded = if state.is_video {
-                        let (w, h, pts_raw, rgb) = av_frame.to_rgb24().map_err(|e| {
+                        let (w, h, pts_raw, rgb, sar) = av_frame.to_rgb24().map_err(|e| {
                             tracing::warn!(%e, pid = pid_raw, "falha ao converter frame de vídeo");
                             e
                         })?;
                         let pts = pts_raw_to_option(pts_raw);
-                        DecodedFrame::Video(VideoFrame::new(w, h, pts, Bytes::from(rgb)))
+                        DecodedFrame::Video(VideoFrame::new(
+                            w,
+                            h,
+                            pts,
+                            Bytes::from(rgb),
+                            sar.0,
+                            sar.1,
+                        ))
                     } else {
                         let (sr, ch) = av_frame.audio_params().map_err(|e| {
                             tracing::warn!(%e, pid = pid_raw, "falha ao ler metadata de áudio do frame");
@@ -227,14 +307,61 @@ impl FfmpegDecoder {
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!(%e, pid = pid_raw, "avcodec_receive_frame retornou erro");
-                    return Err(e);
+                    // Erro de receive_frame: pode ocorrer em bitstreams corrompidos
+                    // ou durante sincronização inicial.  Loga e interrompe o loop
+                    // sem propagar o erro — o decodificador continuará no próximo PES.
+                    tracing::debug!(%e, pid = pid_raw, "receive_frame: erro transitório");
+                    break;
                 }
             }
         }
 
         Ok(frames)
     }
+}
+
+// ─── Parsing de LOAS frames ───────────────────────────────────────────────────
+
+/// Divide um payload PES de AAC LATM em frames LOAS individuais.
+///
+/// O stream LOAS (Low Overhead Audio Stream) usa o sync word de 11 bits `0x2B7`
+/// nos MSBs de dois bytes consecutivos (`byte[0] == 0x56`, `byte[1] >> 5 == 7`).
+/// Os 13 bits seguintes carregam `audio_mux_length_bytes`; o frame total mede
+/// `3 + audio_mux_length_bytes` bytes.
+///
+/// Um PES de AAC LATM pode conter vários desses frames concatenados.  O decoder
+/// `aac_latm` do FFmpeg espera exatamente um frame por `AVPacket`; enviar o PES
+/// inteiro resulta em `frame length mismatch`.
+///
+/// Retorna slice vazio se nenhum sync word for encontrado (fallback: enviar
+/// o payload completo).
+///
+/// SPEC-AV-002b
+fn split_loas_frames(data: &[u8]) -> Vec<&[u8]> {
+    let mut frames: Vec<&[u8]> = Vec::new();
+    let mut pos = 0usize;
+
+    while pos + 3 <= data.len() {
+        // LOAS sync: AV_RB16(data) >> 5 == 0x2B7
+        //   byte[0] == 0x56 e (byte[1] >> 5) == 7  (top-3-bits = 0b111)
+        if data[pos] == 0x56 && (data[pos + 1] >> 5) == 7 {
+            let audio_mux_length =
+                (((data[pos + 1] & 0x1F) as usize) << 8) | data[pos + 2] as usize;
+            let frame_end = pos + 3 + audio_mux_length;
+            if frame_end <= data.len() {
+                frames.push(&data[pos..frame_end]);
+                pos = frame_end;
+            } else {
+                // Frame truncado — interrompe a varredura.
+                break;
+            }
+        } else {
+            // Byte não é parte de um sync word — avança um byte.
+            pos += 1;
+        }
+    }
+
+    frames
 }
 
 /// Converte `pts_raw` do FFmpeg para `Option<u64>`.
@@ -474,5 +601,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ─── Testes de split_loas_frames ─────────────────────────────────────────
+
+    /// SPEC-AV-002b: payload vazio retorna slice vazio.
+    #[test]
+    fn spec_av_002b_split_loas_empty_input() {
+        let frames = split_loas_frames(&[]);
+        assert!(frames.is_empty());
+    }
+
+    /// SPEC-AV-002b: payload sem sync word retorna slice vazio (fallback path).
+    #[test]
+    fn spec_av_002b_split_loas_no_sync_word() {
+        let data = [0x00u8; 64];
+        let frames = split_loas_frames(&data);
+        assert!(frames.is_empty());
+    }
+
+    /// SPEC-AV-002b: um único frame LOAS é identificado corretamente.
+    ///
+    /// Frame: [0x56, 0xE0 | 0x04, 0x00] = length = 0x0400 = 1024 → total = 1027 bytes.
+    #[test]
+    fn spec_av_002b_split_loas_single_frame() {
+        // Sync: 0x56 0xE4 → audio_mux_length = (0x04 << 8) | 0x00 = 0x400 = 1024
+        // frame_end = 3 + 1024 = 1027
+        let mut data = vec![0x00u8; 1027];
+        data[0] = 0x56;
+        data[1] = 0xE4; // top-3-bits = 111, low-5-bits = 0x04
+        data[2] = 0x00; // low 8 bits of length
+
+        let frames = split_loas_frames(&data);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), 1027);
+        assert_eq!(frames[0][0], 0x56);
+    }
+
+    /// SPEC-AV-002b: dois frames LOAS concatenados são divididos corretamente.
+    ///
+    /// Reproduz o caso real: PES com ~2 frames de ~8 KB cada.
+    #[test]
+    fn spec_av_002b_split_loas_two_frames() {
+        // Frame A: audio_mux_length = (0x1F << 8) | 0xAD = 0x1FAD = 8109 → total = 8112
+        // Frame B: audio_mux_length = (0x1F << 8) | 0xFC = 0x1FFC = 8188 → total = 8191
+        let len_a = 8112usize;
+        let len_b = 8191usize;
+        let mut data = vec![0x00u8; len_a + len_b];
+
+        // Frame A header
+        data[0] = 0x56;
+        data[1] = 0xE0 | ((((len_a - 3) >> 8) & 0x1F) as u8);
+        data[2] = ((len_a - 3) & 0xFF) as u8;
+
+        // Frame B header (immediately after frame A)
+        data[len_a] = 0x56;
+        data[len_a + 1] = 0xE0 | ((((len_b - 3) >> 8) & 0x1F) as u8);
+        data[len_a + 2] = ((len_b - 3) & 0xFF) as u8;
+
+        let frames = split_loas_frames(&data);
+        assert_eq!(frames.len(), 2, "esperava 2 frames LOAS");
+        assert_eq!(frames[0].len(), len_a, "frame A tamanho incorreto");
+        assert_eq!(frames[1].len(), len_b, "frame B tamanho incorreto");
+    }
+
+    /// SPEC-AV-002b: frame truncado (tamanho declarado > dados disponíveis) é ignorado.
+    #[test]
+    fn spec_av_002b_split_loas_truncated_frame() {
+        // Declara length = 500, mas só há 100 bytes após o header.
+        let length: usize = 500;
+        let mut data = vec![0x00u8; 3 + 100]; // truncado: 3-byte header + 100 bytes
+        data[0] = 0x56;
+        data[1] = 0xE0 | (((length >> 8) & 0x1F) as u8);
+        data[2] = (length & 0xFF) as u8;
+
+        let frames = split_loas_frames(&data);
+        // Frame truncado não deve ser incluído.
+        assert!(frames.is_empty(), "frame truncado não deve ser emitido");
+    }
+
+    /// SPEC-AV-002b: bytes de padding antes do sync word são ignorados.
+    #[test]
+    fn spec_av_002b_split_loas_leading_padding() {
+        let frame_len = 100usize;
+        let total = 5 + 3 + frame_len; // 5 bytes de padding + header + payload
+        let mut data = vec![0xFFu8; total];
+        // Frame começa no byte 5
+        data[5] = 0x56;
+        data[6] = 0xE0 | (((frame_len >> 8) & 0x1F) as u8);
+        data[7] = (frame_len & 0xFF) as u8;
+
+        let frames = split_loas_frames(&data);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), 3 + frame_len);
     }
 }

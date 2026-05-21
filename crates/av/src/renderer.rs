@@ -28,18 +28,40 @@ pub struct VideoFrame {
     pub pts: Option<u64>,
     /// Dados RGB24: `width * height * 3` bytes, linha a linha, top-down.
     pub data: Bytes,
+    /// Sample Aspect Ratio numerador. Combinado com `sar_den`, define o DAR:
+    /// `DAR = (sar_num * width) / (sar_den * height)`.
+    /// Valor `1` com `sar_den == 1` indica pixels quadrados (1:1).
+    ///
+    /// SPEC-AV-003
+    pub sar_num: u32,
+    /// Sample Aspect Ratio denominador. Ver `sar_num`.
+    ///
+    /// SPEC-AV-003
+    pub sar_den: u32,
 }
 
 impl VideoFrame {
     /// Cria um `VideoFrame` a partir de dados RGB24 brutos.
     ///
+    /// `sar_num` e `sar_den` definem o Sample Aspect Ratio.
+    /// Passe `(1, 1)` para pixels quadrados.
+    ///
     /// SPEC-AV-003
-    pub fn new(width: u32, height: u32, pts: Option<u64>, data: Bytes) -> Self {
+    pub fn new(
+        width: u32,
+        height: u32,
+        pts: Option<u64>,
+        data: Bytes,
+        sar_num: u32,
+        sar_den: u32,
+    ) -> Self {
         Self {
             width,
             height,
             pts,
             data,
+            sar_num: sar_num.max(1),
+            sar_den: sar_den.max(1),
         }
     }
 
@@ -312,7 +334,7 @@ mod tests {
         for _ in 0..count {
             data.extend_from_slice(&[r, g, b]);
         }
-        VideoFrame::new(width, height, None, Bytes::from(data))
+        VideoFrame::new(width, height, None, Bytes::from(data), 1, 1)
     }
 
     // ── SPEC-AV-003c: fallback CPU ──────────────────────────────────────────
@@ -407,7 +429,7 @@ mod tests {
     /// `is_valid_size()` deve retornar `false` para frame com tamanho incorreto.
     #[test]
     fn spec_av_003_video_frame_invalid_size_detected() {
-        let frame = VideoFrame::new(16, 9, None, Bytes::from(vec![0u8; 10]));
+        let frame = VideoFrame::new(16, 9, None, Bytes::from(vec![0u8; 10]), 1, 1);
         assert!(
             !frame.is_valid_size(),
             "Frame com 10 bytes deve ser inválido para 16×9"
@@ -419,7 +441,7 @@ mod tests {
     fn spec_av_003_upload_rejects_invalid_frame() {
         let ctx = egui::Context::default();
         let mut renderer = VideoRenderer::new_cpu(ctx);
-        let bad_frame = VideoFrame::new(4, 4, None, Bytes::from(vec![0u8; 5]));
+        let bad_frame = VideoFrame::new(4, 4, None, Bytes::from(vec![0u8; 5]), 1, 1);
         assert!(
             renderer.upload(&bad_frame).is_err(),
             "upload() deve retornar Err para frame com tamanho inválido"
@@ -429,7 +451,7 @@ mod tests {
     /// Frame 0×0 tem tamanho zero, que é consistente com `0*0*3 = 0` bytes.
     #[test]
     fn spec_av_003_zero_dimension_frame_is_valid_size() {
-        let frame = VideoFrame::new(0, 0, None, Bytes::new());
+        let frame = VideoFrame::new(0, 0, None, Bytes::new(), 1, 1);
         assert!(frame.is_valid_size());
     }
 
@@ -438,7 +460,7 @@ mod tests {
     fn spec_av_003_cpu_zero_dim_upload() {
         let ctx = egui::Context::default();
         let mut renderer = VideoRenderer::new_cpu(ctx);
-        let frame = VideoFrame::new(0, 0, None, Bytes::new());
+        let frame = VideoFrame::new(0, 0, None, Bytes::new(), 1, 1);
         renderer
             .upload(&frame)
             .expect("upload de frame 0×0 não deve falhar");

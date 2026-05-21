@@ -139,6 +139,16 @@ impl PesAssembler {
         self.pid_codecs.insert(pid, codec);
     }
 
+    /// Remove o registro de um PID (chamado ao trocar de serviço).
+    ///
+    /// Descarta também o buffer parcial acumulado para este PID.
+    ///
+    /// SPEC-AV-001
+    pub fn deregister_pid(&mut self, pid: Pid) {
+        self.pid_codecs.remove(&pid);
+        self.buffers.remove(&pid);
+    }
+
     /// Processa o payload de um pacote TS.
     ///
     /// - `pusi = true`: início de novo PES unit. O buffer anterior (se houver)

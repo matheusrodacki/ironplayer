@@ -40,6 +40,9 @@ pub struct PlayerConfig {
     pub volume: f32,
     /// Fallback para renderização por CPU quando GPU indisponível. Padrão: false.
     pub fallback_cpu_render: bool,
+    /// Seleciona automaticamente o primeiro serviço com streams A/V válidos ao
+    /// receber a primeira PMT, sem sobrescrever uma seleção manual. Padrão: true.
+    pub auto_play_first_service: bool,
 }
 
 impl Default for PlayerConfig {
@@ -48,6 +51,7 @@ impl Default for PlayerConfig {
             jitter_buffer_ms: 100,
             volume: 1.0,
             fallback_cpu_render: false,
+            auto_play_first_service: true,
         }
     }
 }

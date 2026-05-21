@@ -144,6 +144,16 @@ impl FfmpegDecoder {
         }
     }
 
+    /// Reinicia todos os contextos de decodificação, descartando estados de codec.
+    ///
+    /// Chamado ao trocar de serviço para evitar decodificação com contexto obsoleto.
+    /// O próximo pacote para cada PID criará um novo `AVCodecContext` do zero.
+    ///
+    /// SPEC-AV-002b
+    pub fn reset(&mut self) {
+        self.states.clear();
+    }
+
     /// Decodifica um `PesPacket` completo, retornando todos os frames prontos.
     ///
     /// Internamente:

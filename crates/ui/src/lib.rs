@@ -51,6 +51,8 @@ pub struct IronPlayerApp {
     snapshot_rx: Option<ts::aggregator::SnapshotReceiver>,
     /// Estado de conexão compartilhado com o command handler do pipeline.
     connection_rx: Option<Arc<RwLock<ConnectionState>>>,
+    /// Serviço selecionado compartilhado com o command handler do pipeline.
+    selected_service_rx: Option<Arc<RwLock<Option<u16>>>>,
     /// Eventos incrementais de tabelas PSI/SI vindos do `TableDispatcher`.
     table_events_rx: Option<Receiver<TableEvent>>,
     /// Receptor de frames de vídeo decodificados (FfmpegDecoder → UI).
@@ -81,6 +83,7 @@ impl IronPlayerApp {
         cmd_tx: Sender<AppCommand>,
         snapshot_rx: Option<ts::aggregator::SnapshotReceiver>,
         connection_rx: Option<Arc<RwLock<ConnectionState>>>,
+        selected_service_rx: Option<Arc<RwLock<Option<u16>>>>,
         table_events_rx: Option<Receiver<TableEvent>>,
         video_frames_rx: Option<Receiver<VideoFrame>>,
     ) -> Self {
@@ -106,6 +109,7 @@ impl IronPlayerApp {
             metrics_panel: MetricsPanel::new(),
             snapshot_rx,
             connection_rx,
+            selected_service_rx,
             table_events_rx,
             video_frames_rx,
             video_renderer,
@@ -163,6 +167,13 @@ impl IronPlayerApp {
         if let Some(conn_rx) = &self.connection_rx {
             if let Ok(state) = conn_rx.read() {
                 self.state.connection = state.clone();
+            }
+        }
+
+        // Atualiza o serviço selecionado a partir do command handler.
+        if let Some(svc_rx) = &self.selected_service_rx {
+            if let Ok(svc) = svc_rx.read() {
+                self.state.selected_service = *svc;
             }
         }
     }
@@ -277,7 +288,7 @@ impl eframe::App for IronPlayerApp {
             .resizable(true)
             .default_width(400.0)
             .show(ctx, |ui| {
-                VideoPanel::show(ui, &self.state, video_texture);
+                VideoPanel::show(ui, &self.state, video_texture, &self.cmd_tx);
             });
 
         // ── Painel direito: MetricsPanel (≈25%) ──────────────────────────────
@@ -320,7 +331,7 @@ pub fn run(title: &str) -> eframe::Result {
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(IronPlayerApp::new(
-                cc, cmd_tx, None, None, None, None,
+                cc, cmd_tx, None, None, None, None, None,
             )))
         }),
     )

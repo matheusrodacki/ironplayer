@@ -3,8 +3,8 @@
 //! SPEC-AV-004 · SPEC-AV-004a · SPEC-AV-004b · SPEC-AV-004c
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -67,6 +67,12 @@ pub struct AudioRingBuffer {
     capacity: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PopReport {
+    copied_samples: usize,
+    missing_samples: usize,
+}
+
 impl AudioRingBuffer {
     /// Cria o buffer com `capacity_samples` amostras de capacidade nominal.
     ///
@@ -78,22 +84,35 @@ impl AudioRingBuffer {
         }
     }
 
+    fn hard_limit(&self) -> usize {
+        self.capacity.saturating_mul(2)
+    }
+
+    fn push_with_drop_oldest(&mut self, samples: &[f32]) -> usize {
+        self.samples.extend(samples.iter().copied());
+
+        let hard_limit = self.hard_limit();
+        if self.samples.len() <= hard_limit {
+            return 0;
+        }
+
+        // Mantem a latencia proxima ao jitter buffer configurado descartando
+        // audio antigo quando a fila ultrapassa 2x a capacidade nominal.
+        let target_len = self.capacity;
+        let to_drop = self.samples.len().saturating_sub(target_len);
+        for _ in 0..to_drop {
+            let _ = self.samples.pop_front();
+        }
+        to_drop
+    }
+
     /// Empurra `samples` no buffer.
     ///
-    /// Retorna `true` quando as amostras foram aceitas, `false` quando o
-    /// buffer estava acima de 2 × capacidade e os dados foram descartados.
+    /// Retorna `true` quando nao foi necessario descartar amostras antigas.
     ///
     /// SPEC-AV-004a
     pub fn push(&mut self, samples: &[f32]) -> bool {
-        if self.samples.len() > self.capacity.saturating_mul(2) {
-            tracing::warn!(
-                dropped = samples.len(),
-                "AudioRingBuffer: overflow — frame descartado"
-            );
-            return false;
-        }
-        self.samples.extend(samples.iter().copied());
-        true
+        self.push_with_drop_oldest(samples) == 0
     }
 
     /// Drena até `output.len()` amostras.  Posições sem dado são preenchidas
@@ -101,8 +120,23 @@ impl AudioRingBuffer {
     ///
     /// SPEC-AV-004
     pub fn pop(&mut self, output: &mut [f32]) {
+        let _ = self.pop_report(output);
+    }
+
+    fn pop_report(&mut self, output: &mut [f32]) -> PopReport {
+        let mut copied_samples = 0;
         for slot in output.iter_mut() {
-            *slot = self.samples.pop_front().unwrap_or(0.0);
+            if let Some(sample) = self.samples.pop_front() {
+                *slot = sample;
+                copied_samples += 1;
+            } else {
+                *slot = 0.0;
+            }
+        }
+
+        PopReport {
+            copied_samples,
+            missing_samples: output.len().saturating_sub(copied_samples),
         }
     }
 
@@ -146,6 +180,107 @@ fn apply_volume(samples: &mut [f32], volume: f32) {
     }
 }
 
+fn sanitize_buffer_ms(buffer_ms: u32) -> u32 {
+    match buffer_ms {
+        50 | 100 | 200 | 500 => buffer_ms,
+        other => {
+            tracing::warn!(
+                requested_buffer_ms = other,
+                "AudioOutput: jitter buffer invalido; usando 100 ms"
+            );
+            100
+        }
+    }
+}
+
+fn buffer_capacity_samples(sample_rate: u32, channels: u16, buffer_ms: u32) -> usize {
+    let samples = sample_rate as u64 * channels as u64 * buffer_ms as u64 / 1000;
+    samples.max(channels.max(1) as u64) as usize
+}
+
+fn prime_threshold_samples(capacity_samples: usize, channels: u16) -> usize {
+    if capacity_samples == 0 {
+        return 0;
+    }
+
+    capacity_samples
+        .saturating_div(2)
+        .max(channels.max(1) as usize)
+}
+
+struct AudioPlaybackState {
+    buffer: AudioRingBuffer,
+    primed: bool,
+    prime_threshold_samples: usize,
+}
+
+impl AudioPlaybackState {
+    fn new(capacity_samples: usize, channels: u16) -> Self {
+        Self {
+            buffer: AudioRingBuffer::new(capacity_samples),
+            primed: false,
+            prime_threshold_samples: prime_threshold_samples(capacity_samples, channels),
+        }
+    }
+
+    fn push_samples(&mut self, samples: &[f32]) -> usize {
+        self.buffer.push_with_drop_oldest(samples)
+    }
+
+    fn pop_for_output(&mut self, output: &mut [f32]) -> PopReport {
+        let start_threshold = self
+            .prime_threshold_samples
+            .max(output.len().min(self.buffer.capacity()));
+
+        if !self.primed && self.buffer.len() < start_threshold {
+            output.fill(0.0);
+            return PopReport {
+                copied_samples: 0,
+                missing_samples: output.len(),
+            };
+        }
+
+        self.primed = true;
+        let report = self.buffer.pop_report(output);
+        if report.missing_samples > 0 {
+            self.primed = false;
+        }
+        report
+    }
+
+    fn buffer_level(&self) -> f32 {
+        self.buffer.level()
+    }
+}
+
+struct AudioSharedState {
+    playback: Mutex<AudioPlaybackState>,
+    volume: AtomicU32,
+    restart_requested: AtomicBool,
+    underruns: AtomicU64,
+    overruns: AtomicU64,
+}
+
+impl AudioSharedState {
+    fn new(capacity_samples: usize, channels: u16) -> Self {
+        Self {
+            playback: Mutex::new(AudioPlaybackState::new(capacity_samples, channels)),
+            volume: AtomicU32::new(1.0f32.to_bits()),
+            restart_requested: AtomicBool::new(false),
+            underruns: AtomicU64::new(0),
+            overruns: AtomicU64::new(0),
+        }
+    }
+
+    fn request_restart(&self) {
+        self.restart_requested.store(true, Ordering::Relaxed);
+    }
+
+    fn take_restart_request(&self) {
+        self.restart_requested.store(false, Ordering::Relaxed);
+    }
+}
+
 // ─── AudioOutput ─────────────────────────────────────────────────────────────
 
 /// Saída de áudio WASAPI via cpal.
@@ -157,25 +292,22 @@ fn apply_volume(samples: &mut [f32], volume: f32) {
 /// SPEC-AV-004
 pub struct AudioOutput {
     /// Stream cpal mantida viva enquanto `AudioOutput` existir.
-    _stream: cpal::Stream,
-    /// Buffer de jitter compartilhado entre producer e callback cpal.
-    buffer: Arc<Mutex<AudioRingBuffer>>,
-    /// Volume atual (bits de f32 armazenados atomicamente).
-    volume: Arc<AtomicU32>,
+    stream: Option<cpal::Stream>,
+    /// Estado compartilhado entre producer, callback e rotina de recovery.
+    shared: Arc<AudioSharedState>,
     /// Taxa de amostragem configurada (Hz).
     pub sample_rate: u32,
     /// Número de canais configurado.
     pub channels: u16,
+    buffer_ms: u32,
 }
 
 impl AudioOutput {
-    /// Abre o dispositivo de saída padrão WASAPI e inicia a reprodução.
-    ///
-    /// `buffer_ms` define o tamanho do buffer de jitter em milissegundos
-    /// (padrão recomendado: 100 ms).
-    ///
-    /// SPEC-AV-004
-    pub fn new(sample_rate: u32, channels: u16, buffer_ms: u32) -> Result<Self, AvError> {
+    fn build_stream(
+        sample_rate: u32,
+        channels: u16,
+        shared: Arc<AudioSharedState>,
+    ) -> Result<cpal::Stream, AvError> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -183,35 +315,45 @@ impl AudioOutput {
                 message: "nenhum dispositivo de saída de áudio encontrado".into(),
             })?;
 
-        // Capacidade em amostras interleaved para `buffer_ms` milissegundos.
-        let capacity = (sample_rate as u64 * channels as u64 * buffer_ms as u64 / 1000) as usize;
-
-        let buffer = Arc::new(Mutex::new(AudioRingBuffer::new(capacity)));
-        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
-
-        let buf_cb = Arc::clone(&buffer);
-        let vol_cb = Arc::clone(&volume);
-
         let config = cpal::StreamConfig {
             channels,
             sample_rate: cpal::SampleRate(sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
 
+        let callback_state = Arc::clone(&shared);
+        let error_state = Arc::clone(&shared);
         let stream = device
             .build_output_stream::<f32, _, _>(
                 &config,
                 move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                    let vol = f32::from_bits(vol_cb.load(Ordering::Relaxed));
-                    if let Ok(mut buf) = buf_cb.lock() {
-                        buf.pop(output);
-                    } else {
-                        output.fill(0.0);
+                    let volume = f32::from_bits(callback_state.volume.load(Ordering::Relaxed));
+
+                    let report = match callback_state.playback.try_lock() {
+                        Ok(mut playback) => playback.pop_for_output(output),
+                        Err(TryLockError::WouldBlock) | Err(TryLockError::Poisoned(_)) => {
+                            output.fill(0.0);
+                            PopReport {
+                                copied_samples: 0,
+                                missing_samples: output.len(),
+                            }
+                        }
+                    };
+
+                    if report.missing_samples > 0 {
+                        callback_state.underruns.fetch_add(1, Ordering::Relaxed);
                     }
-                    apply_volume(output, vol);
+
+                    apply_volume(output, volume);
                 },
-                |err| {
-                    tracing::error!(error = %err, "cpal: erro no stream de áudio");
+                move |err| {
+                    error_state.request_restart();
+                    tracing::warn!(
+                        error = %err,
+                        sample_rate,
+                        channels,
+                        "cpal: erro no stream de áudio; recriação agendada"
+                    );
                 },
                 None,
             )
@@ -223,6 +365,21 @@ impl AudioOutput {
             message: e.to_string(),
         })?;
 
+        Ok(stream)
+    }
+
+    /// Abre o dispositivo de saída padrão WASAPI e inicia a reprodução.
+    ///
+    /// `buffer_ms` define o tamanho do buffer de jitter em milissegundos
+    /// (padrão recomendado: 100 ms).
+    ///
+    /// SPEC-AV-004
+    pub fn new(sample_rate: u32, channels: u16, buffer_ms: u32) -> Result<Self, AvError> {
+        let buffer_ms = sanitize_buffer_ms(buffer_ms);
+        let capacity = buffer_capacity_samples(sample_rate, channels, buffer_ms);
+        let shared = Arc::new(AudioSharedState::new(capacity, channels));
+        let stream = Self::build_stream(sample_rate, channels, Arc::clone(&shared))?;
+
         tracing::info!(
             sample_rate,
             channels,
@@ -231,11 +388,11 @@ impl AudioOutput {
         );
 
         Ok(Self {
-            _stream: stream,
-            buffer,
-            volume,
+            stream: Some(stream),
+            shared,
             sample_rate,
             channels,
+            buffer_ms,
         })
     }
 
@@ -246,9 +403,21 @@ impl AudioOutput {
     ///
     /// SPEC-AV-004a
     pub fn push_samples(&self, frame: &AudioFrame) {
-        match self.buffer.lock() {
-            Ok(mut buf) => {
-                buf.push(&frame.samples);
+        match self.shared.playback.lock() {
+            Ok(mut playback) => {
+                let dropped_samples = playback.push_samples(&frame.samples);
+                if dropped_samples > 0 {
+                    let overruns = self.shared.overruns.fetch_add(1, Ordering::Relaxed) + 1;
+                    if overruns == 1 || overruns % 50 == 0 {
+                        tracing::warn!(
+                            dropped_samples,
+                            overruns,
+                            sample_rate = self.sample_rate,
+                            channels = self.channels,
+                            "AudioOutput: overrun no jitter buffer; audio antigo descartado"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(error = %e, "AudioOutput: mutex envenenado em push_samples");
@@ -263,7 +432,8 @@ impl AudioOutput {
     ///
     /// SPEC-AV-004b
     pub fn set_volume(&self, volume: f32) {
-        self.volume
+        self.shared
+            .volume
             .store(volume.max(0.0).to_bits(), Ordering::Relaxed);
     }
 
@@ -273,7 +443,49 @@ impl AudioOutput {
     ///
     /// SPEC-AV-004c
     pub fn buffer_level(&self) -> f32 {
-        self.buffer.lock().map(|b| b.level()).unwrap_or(0.0)
+        self.shared
+            .playback
+            .lock()
+            .map(|state| state.buffer_level())
+            .unwrap_or(0.0)
+    }
+
+    /// Retorna `true` quando o stream WASAPI sinalizou falha e precisa ser recriado.
+    ///
+    /// SPEC-AV-004
+    pub fn needs_rebuild(&self) -> bool {
+        self.shared.restart_requested.load(Ordering::Relaxed)
+    }
+
+    /// Tenta recriar o stream de saída usando o dispositivo padrão atual.
+    ///
+    /// SPEC-AV-004
+    pub fn rebuild_stream(&mut self) -> Result<(), AvError> {
+        self.stream.take();
+        let stream = Self::build_stream(self.sample_rate, self.channels, Arc::clone(&self.shared))?;
+        self.stream = Some(stream);
+        self.shared.take_restart_request();
+        tracing::info!(
+            sample_rate = self.sample_rate,
+            channels = self.channels,
+            buffer_ms = self.buffer_ms,
+            "AudioOutput: stream WASAPI recriado"
+        );
+        Ok(())
+    }
+
+    /// Retorna o número de callbacks que precisaram completar o buffer com silêncio.
+    ///
+    /// SPEC-AV-004c
+    pub fn underrun_count(&self) -> u64 {
+        self.shared.underruns.load(Ordering::Relaxed)
+    }
+
+    /// Retorna o número de vezes em que áudio antigo foi descartado para conter a latência.
+    ///
+    /// SPEC-AV-004c
+    pub fn overrun_count(&self) -> u64 {
+        self.shared.overruns.load(Ordering::Relaxed)
     }
 }
 
@@ -340,14 +552,12 @@ mod tests {
     fn spec_av_004_drop_frames_when_buffer_exceeds_2x_capacity() {
         let mut buf = AudioRingBuffer::new(4);
 
-        // Lota acima de 2 × capacidade (9 amostras > 2 × 4 = 8).
-        let _ = buf.push(&[0.0f32; 9]);
-        // Agora buf.len() > 2 * capacity → próximo push deve ser descartado.
-        let dropped = !buf.push(&[1.0f32; 4]);
-        assert!(
-            dropped,
-            "push deveria retornar false quando buffer > 2 × capacidade"
-        );
+        assert!(!buf.push(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]));
+        assert_eq!(buf.len(), 4, "buffer deve voltar para a capacidade nominal");
+
+        let mut out = [0.0f32; 4];
+        buf.pop(&mut out);
+        assert_eq!(out, [6.0, 7.0, 8.0, 9.0]);
     }
 
     /// `buffer_level()` retorna exatamente 1.0 quando len == capacity.
@@ -507,5 +717,61 @@ mod tests {
         );
         let _ = buf.push(&[0.0f32; 50]);
         assert_eq!(buf.level(), 1.0);
+    }
+
+    /// O callback so inicia a reproducao quando o jitter buffer tem prefill suficiente.
+    ///
+    /// SPEC-AV-004c
+    #[test]
+    fn spec_av_004c_playback_waits_for_prefill_before_starting() {
+        let mut state = AudioPlaybackState::new(8, 2);
+        let dropped = state.push_samples(&[0.1, 0.2, 0.3]);
+        assert_eq!(dropped, 0);
+
+        let mut out = [1.0f32; 4];
+        let report = state.pop_for_output(&mut out);
+        assert_eq!(report.copied_samples, 0);
+        assert_eq!(report.missing_samples, 4);
+        assert_eq!(out, [0.0; 4]);
+
+        let dropped = state.push_samples(&[0.4, 0.5, 0.6, 0.7, 0.8]);
+        assert_eq!(dropped, 0);
+
+        let report = state.pop_for_output(&mut out);
+        assert_eq!(report.copied_samples, 4);
+        assert_eq!(report.missing_samples, 0);
+        assert_eq!(out, [0.1, 0.2, 0.3, 0.4]);
+    }
+
+    /// Underrun depois de iniciado rebaixa o estado para re-prime e conta silencio.
+    ///
+    /// SPEC-AV-004c
+    #[test]
+    fn spec_av_004c_underrun_resets_primed_state() {
+        let mut state = AudioPlaybackState::new(8, 2);
+        let _ = state.push_samples(&[0.1, 0.2, 0.3, 0.4]);
+
+        let mut out = [0.0f32; 4];
+        let started = state.pop_for_output(&mut out);
+        assert_eq!(started.missing_samples, 0);
+        assert!(state.primed);
+
+        let mut out2 = [0.0f32; 4];
+        let underrun = state.pop_for_output(&mut out2);
+        assert_eq!(underrun.copied_samples, 0);
+        assert_eq!(underrun.missing_samples, 4);
+        assert!(!state.primed);
+    }
+
+    /// Apenas 50, 100, 200 e 500 ms sao aceitos como jitter buffer configuravel.
+    ///
+    /// SPEC-AV-004
+    #[test]
+    fn spec_av_004_supported_buffer_sizes_are_enforced() {
+        assert_eq!(sanitize_buffer_ms(50), 50);
+        assert_eq!(sanitize_buffer_ms(100), 100);
+        assert_eq!(sanitize_buffer_ms(200), 200);
+        assert_eq!(sanitize_buffer_ms(500), 500);
+        assert_eq!(sanitize_buffer_ms(75), 100);
     }
 }

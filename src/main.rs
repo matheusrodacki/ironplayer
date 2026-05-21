@@ -431,10 +431,8 @@ fn main() -> eframe::Result<()> {
                                     for frame in frames {
                                         match frame {
                                             av::DecodedFrame::Video(vf) => {
-                                                video_frames_tx.try_send_latest(
-                                                    &video_frames_rx_for_drop,
-                                                    vf,
-                                                );
+                                                video_frames_tx
+                                                    .try_send_latest(&video_frames_rx_for_drop, vf);
                                             }
                                             av::DecodedFrame::Audio(af) => {
                                                 audio_frames_tx.try_send(af);
@@ -447,7 +445,7 @@ fn main() -> eframe::Result<()> {
                                     *n += 1;
                                     // Loga o primeiro erro e depois a cada 200 ocorrencias
                                     // do mesmo PID, evitando saturar o terminal.
-                                    if *n == 1 || *n % 200 == 0 {
+                                    if *n == 1 || (*n).is_multiple_of(200) {
                                         tracing::warn!(
                                             %e,
                                             pid = packet.pid,
@@ -485,8 +483,37 @@ fn main() -> eframe::Result<()> {
                 .name("audio-out".into())
                 .spawn(move || {
                     let mut audio_out: Option<av::AudioOutput> = None;
+                    let mut rebuild_failures = 0u64;
 
-                    for frame in audio_frames_rx.iter() {
+                    loop {
+                        if let Some(out) = audio_out.as_mut() {
+                            if out.needs_rebuild() {
+                                match out.rebuild_stream() {
+                                    Ok(()) => {
+                                        rebuild_failures = 0;
+                                    }
+                                    Err(e) => {
+                                        rebuild_failures += 1;
+                                        if rebuild_failures == 1 || rebuild_failures.is_multiple_of(20) {
+                                            tracing::warn!(
+                                                %e,
+                                                retries = rebuild_failures,
+                                                sample_rate = out.sample_rate,
+                                                channels = out.channels,
+                                                "audio-out: falha ao recriar AudioOutput; mantendo retry"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let frame = match audio_frames_rx.recv_timeout(Duration::from_millis(50)) {
+                            Ok(frame) => frame,
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        };
+
                         // Lazy-init: cria AudioOutput na primeira frame (ou quando
                         // sample_rate/channels mudam, reiniciando o stream).
                         let needs_reinit = audio_out.as_ref().is_none_or(|out| {
@@ -500,6 +527,7 @@ fn main() -> eframe::Result<()> {
                                 jitter_buffer_ms,
                             ) {
                                 Ok(out) => {
+                                    rebuild_failures = 0;
                                     out.set_volume(initial_volume);
                                     tracing::info!(
                                         sample_rate = frame.sample_rate,

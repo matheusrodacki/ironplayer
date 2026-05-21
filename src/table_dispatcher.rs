@@ -1079,3 +1079,350 @@ mod tests {
         );
     }
 }
+
+    /// Integration: codecs obrigat├│rios continuam registrando v├¡deo, mant├¬m o
+    /// parse de PMT e atualizam o snapshot de ├íudio ao selecionar um servi├ºo.
+    #[test]
+    fn spec_integration_mandatory_audio_codecs_keep_video_pid_and_ui_snapshot() {
+        let (_sections_tx, sections_rx) = crossbeam_channel::bounded(64);
+        let (table_events_tx, table_events_rx) = crossbeam_channel::bounded(64);
+        let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded(128);
+        let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded(128);
+        let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded(16);
+        let bounded_tx = BoundedSender::new(table_events_tx, "test_mandatory_audio_codecs");
+        let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
+        let selected_service_ctrl = Arc::clone(&selected_service);
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
+
+        let mut dispatcher = TableDispatcher::new(
+            sections_rx,
+            bounded_tx,
+            demux_cmd_tx,
+            pes_cmd_tx,
+            decode_cmd_tx,
+            selected_service,
+            Arc::clone(&audio_status),
+        );
+
+        dispatcher.process_section(make_pat_section(
+            0x0001,
+            1,
+            &[(1, 0x100), (2, 0x200), (3, 0x300), (4, 0x400)],
+        ));
+
+        let mp2_lang = [0x0A, 0x04, b'p', b'o', b'r', 0x00];
+        let aac_adts_lang = [0x0A, 0x04, b'e', b'n', b'g', 0x00];
+        let aac_latm_desc = [
+            0x7C, 0x03, 0x11, 0x90, 0x00, 0x0A, 0x04, b's', b'p', b'a', 0x00,
+        ];
+        let ac3_desc = [0x6A, 0x00, 0x0A, 0x04, b'd', b'e', b'u', 0x00];
+
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x100,
+            1,
+            0,
+            0x101,
+            &[(0x1B, 0x101, &[]), (0x03, 0x120, &mp2_lang)],
+        ));
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x200,
+            2,
+            0,
+            0x201,
+            &[(0x1B, 0x201, &[]), (0x0F, 0x220, &aac_adts_lang)],
+        ));
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x300,
+            3,
+            0,
+            0x301,
+            &[(0x1B, 0x301, &[]), (0x06, 0x320, &aac_latm_desc)],
+        ));
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x400,
+            4,
+            0,
+            0x401,
+            &[(0x1B, 0x401, &[]), (0x06, 0x420, &ac3_desc)],
+        ));
+
+        let demux_cmds: Vec<DemuxCommand> =
+            std::iter::from_fn(|| demux_cmd_rx.try_recv().ok()).collect();
+        let pes_cmds: Vec<PesCommand> = std::iter::from_fn(|| pes_cmd_rx.try_recv().ok()).collect();
+        let pmt_events: Vec<u16> = table_events_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                TableEvent::Pmt(pmt) => Some(pmt.program_number),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            pmt_events,
+            vec![1, 2, 3, 4],
+            "PMTs v├ílidas devem continuar chegando ├á UI sem regress├úo de parse"
+        );
+        for pid in [0x101, 0x120, 0x201, 0x220, 0x301, 0x320, 0x401, 0x420] {
+            assert!(
+                demux_cmds.contains(&DemuxCommand::RegisterAvPid(pid)),
+                "PID 0x{pid:04X} deve ser registrado no demuxer"
+            );
+        }
+        assert!(
+            pes_cmds.iter().any(|command| {
+                matches!(
+                    command,
+                    PesCommand::RegisterPid {
+                        pid: 0x120,
+                        codec: MediaCodec::Audio(av::AudioCodec::Mp2),
+                    }
+                )
+            }),
+            "MP2 obrigat├│rio deve ser identificado"
+        );
+        assert!(
+            pes_cmds.iter().any(|command| {
+                matches!(
+                    command,
+                    PesCommand::RegisterPid {
+                        pid: 0x220,
+                        codec: MediaCodec::Audio(av::AudioCodec::AacAdts),
+                    }
+                )
+            }),
+            "AAC ADTS obrigat├│rio deve ser identificado"
+        );
+        assert!(
+            pes_cmds.iter().any(|command| {
+                matches!(
+                    command,
+                    PesCommand::RegisterPid {
+                        pid: 0x320,
+                        codec: MediaCodec::Audio(av::AudioCodec::AacLatm),
+                    }
+                )
+            }),
+            "AAC LATM/HE-AAC obrigat├│rio deve ser identificado"
+        );
+        assert!(
+            pes_cmds.iter().any(|command| {
+                matches!(
+                    command,
+                    PesCommand::RegisterPid {
+                        pid: 0x420,
+                        codec: MediaCodec::Audio(av::AudioCodec::Ac3),
+                    }
+                )
+            }),
+            "AC-3 obrigat├│rio deve ser identificado"
+        );
+        assert!(
+            decode_cmd_rx.try_recv().is_err(),
+            "processar PMTs n├úo deve resetar o decoder"
+        );
+
+        *selected_service_ctrl.write().unwrap() = Some(3);
+        dispatcher.on_service_changed(Some(3));
+
+        let switch_demux_cmds: Vec<DemuxCommand> =
+            std::iter::from_fn(|| demux_cmd_rx.try_recv().ok()).collect();
+        let switch_pes_cmds: Vec<PesCommand> =
+            std::iter::from_fn(|| pes_cmd_rx.try_recv().ok()).collect();
+
+        assert!(
+            switch_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x301)),
+            "troca de servi├ºo deve preservar o PID de v├¡deo do servi├ºo selecionado"
+        );
+        assert!(
+            switch_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x320)),
+            "troca de servi├ºo deve registrar o PID de ├íudio LATM"
+        );
+        assert!(
+            !switch_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x420)),
+            "troca de servi├ºo n├úo deve manter ├íudio de outros servi├ºos"
+        );
+        assert!(
+            switch_pes_cmds.iter().any(|command| {
+                matches!(
+                    command,
+                    PesCommand::RegisterPid {
+                        pid: 0x320,
+                        codec: MediaCodec::Audio(av::AudioCodec::AacLatm),
+                    }
+                )
+            }),
+            "assembler deve receber o codec LATM do servi├ºo ativo"
+        );
+        assert_eq!(
+            decode_cmd_rx.try_recv().unwrap(),
+            DecodeCommand::Reset,
+            "troca de servi├ºo deve resetar o decoder"
+        );
+
+        let snapshot = audio_status.read().unwrap().clone();
+        assert_eq!(
+            snapshot.active_track,
+            Some(AudioTrackInfo {
+                service_id: 3,
+                pid: 0x320,
+                codec_label: av::AudioCodec::AacLatm.name().to_string(),
+                language: Some("spa".to_string()),
+            })
+        );
+        assert_eq!(snapshot.state, AudioOperationalState::Buffering);
+    }
+
+    /// Integration: mudan├ºa de PMT no mesmo servi├ºo troca a trilha ativa,
+    /// preserva o PID de v├¡deo e atualiza o snapshot consumido pela UI.
+    #[test]
+    fn spec_integration_audio_track_switch_updates_snapshot_without_video_regression() {
+        let (_sections_tx, sections_rx) = crossbeam_channel::bounded(64);
+        let (table_events_tx, _table_events_rx) = crossbeam_channel::bounded(64);
+        let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded(64);
+        let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded(64);
+        let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded(16);
+        let bounded_tx = BoundedSender::new(table_events_tx, "test_audio_track_switch");
+        let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(Some(1)));
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
+
+        let mut dispatcher = TableDispatcher::new(
+            sections_rx,
+            bounded_tx,
+            demux_cmd_tx,
+            pes_cmd_tx,
+            decode_cmd_tx,
+            selected_service,
+            Arc::clone(&audio_status),
+        );
+        dispatcher.last_selected_service = Some(1);
+
+        dispatcher.process_section(make_pat_section(0x0001, 1, &[(1, 0x100)]));
+        let _ = demux_cmd_rx.try_recv();
+
+        let mp2_lang = [0x0A, 0x04, b'p', b'o', b'r', 0x00];
+        let aac_adts_lang = [0x0A, 0x04, b'e', b'n', b'g', 0x00];
+
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x100,
+            1,
+            0,
+            0x101,
+            &[
+                (0x1B, 0x101, &[]),
+                (0x03, 0x120, &mp2_lang),
+                (0x0F, 0x121, &aac_adts_lang),
+            ],
+        ));
+
+        let initial_demux_cmds: Vec<DemuxCommand> =
+            std::iter::from_fn(|| demux_cmd_rx.try_recv().ok()).collect();
+        let initial_pes_cmds: Vec<PesCommand> =
+            std::iter::from_fn(|| pes_cmd_rx.try_recv().ok()).collect();
+
+        assert!(
+            initial_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x101)),
+            "v├¡deo do servi├ºo selecionado deve continuar registrado"
+        );
+        assert!(
+            initial_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x120)),
+            "primeira trilha de ├íudio deve ser registrada"
+        );
+        assert!(
+            !initial_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x121)),
+            "segunda trilha de ├íudio n├úo deve ser registrada enquanto n├úo estiver ativa"
+        );
+        assert!(
+            initial_pes_cmds.iter().any(|command| {
+                matches!(
+                    command,
+                    PesCommand::RegisterPid {
+                        pid: 0x120,
+                        codec: MediaCodec::Audio(av::AudioCodec::Mp2),
+                    }
+                )
+            }),
+            "trilha MP2 inicial deve ser encaminhada ao assembler"
+        );
+
+        let initial_snapshot = audio_status.read().unwrap().clone();
+        assert_eq!(
+            initial_snapshot.active_track,
+            Some(AudioTrackInfo {
+                service_id: 1,
+                pid: 0x120,
+                codec_label: av::AudioCodec::Mp2.name().to_string(),
+                language: Some("por".to_string()),
+            })
+        );
+        assert_eq!(initial_snapshot.state, AudioOperationalState::Buffering);
+
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x100,
+            1,
+            1,
+            0x101,
+            &[
+                (0x1B, 0x101, &[]),
+                (0x0F, 0x121, &aac_adts_lang),
+                (0x03, 0x120, &mp2_lang),
+            ],
+        ));
+
+        let updated_demux_cmds: Vec<DemuxCommand> =
+            std::iter::from_fn(|| demux_cmd_rx.try_recv().ok()).collect();
+        let updated_pes_cmds: Vec<PesCommand> =
+            std::iter::from_fn(|| pes_cmd_rx.try_recv().ok()).collect();
+
+        assert!(
+            updated_demux_cmds.contains(&DemuxCommand::DeregisterAvPid(0x101)),
+            "mudan├ºa de PMT deve desregistrar o PID de v├¡deo antigo antes do re-registro"
+        );
+        assert!(
+            updated_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x101)),
+            "PID de v├¡deo deve ser re-registrado na troca de trilha"
+        );
+        assert!(
+            updated_demux_cmds.contains(&DemuxCommand::DeregisterAvPid(0x120)),
+            "trilha MP2 antiga deve ser removida"
+        );
+        assert!(
+            updated_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x121)),
+            "nova trilha AAC ADTS deve ser registrada"
+        );
+        assert!(
+            !updated_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x120)),
+            "trilha antiga n├úo deve voltar a ser registrada ap├│s a troca"
+        );
+        assert!(
+            updated_pes_cmds.contains(&PesCommand::DeregisterPid { pid: 0x120 }),
+            "assembler deve remover a trilha antiga"
+        );
+        assert!(
+            updated_pes_cmds.iter().any(|command| {
+                matches!(
+                    command,
+                    PesCommand::RegisterPid {
+                        pid: 0x121,
+                        codec: MediaCodec::Audio(av::AudioCodec::AacAdts),
+                    }
+                )
+            }),
+            "assembler deve registrar a nova trilha AAC ADTS"
+        );
+        assert!(
+            decode_cmd_rx.try_recv().is_err(),
+            "troca autom├ítica de trilha via PMT n├úo deve resetar o decoder inteiro"
+        );
+
+        let updated_snapshot = audio_status.read().unwrap().clone();
+        assert_eq!(
+            updated_snapshot.active_track,
+            Some(AudioTrackInfo {
+                service_id: 1,
+                pid: 0x121,
+                codec_label: av::AudioCodec::AacAdts.name().to_string(),
+                language: Some("eng".to_string()),
+            })
+        );
+        assert_eq!(updated_snapshot.state, AudioOperationalState::Buffering);
+    }

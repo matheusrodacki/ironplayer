@@ -238,6 +238,39 @@ mod tests {
         }
     }
 
+    /// Após uma descontinuidade sinalizada, o próximo PCR deve usar a nova
+    /// baseline e não gerar falso positivo de jitter.
+    ///
+    /// SPEC-TS-004b
+    #[test]
+    fn spec_ts_004b_discontinuity_resets_baseline_for_following_pcr() {
+        let (mut tracker, rx) = make_tracker();
+        let pid = 301u16;
+
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_micros(50_000);
+        let t2 = t1 + Duration::from_micros(1_000);
+
+        tracker.update_with_time(pid, 0, false, t0);
+        tracker.update_with_time(pid, us_to_ticks(50_000), true, t1);
+
+        let ev = rx.try_recv().expect("esperava PcrEvent::Discontinuity");
+        match ev {
+            PcrEvent::Discontinuity {
+                pid: p,
+                reason: DiscontinuityReason::Flag,
+            } => assert_eq!(p, pid),
+            other => panic!("evento inesperado: {other:?}"),
+        }
+
+        tracker.update_with_time(pid, us_to_ticks(51_000), false, t2);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "após reset de baseline, o PCR seguinte não deve gerar jitter espúrio"
+        );
+    }
+
     /// Salto de PCR acima de 100 ms emite `PcrEvent::Discontinuity { reason: LargeJump }`.
     ///
     /// SPEC-TS-004b

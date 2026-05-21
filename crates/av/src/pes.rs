@@ -511,6 +511,43 @@ mod tests {
         assert_eq!(p1.pts_duration(&p2), Some(201));
     }
 
+    /// Salto grande de PTS entre PES consecutivos é preservado sem quebrar a
+    /// remontagem do stream.
+    ///
+    /// SPEC-AV-001a
+    #[test]
+    fn spec_av_001a_pts_discontinuity_large_jump_is_preserved() {
+        let (tx, rx) = bounded::<PesPacket>(16);
+        let mut asm = PesAssembler::new(tx);
+        let pid: Pid = 0x0160;
+        let codec = MediaCodec::Audio(crate::AudioCodec::AacAdts);
+        asm.register_pid(pid, codec);
+
+        let pes1 = build_pes_packet(90_000, &[0x11u8; 12]);
+        let pes2 = build_pes_packet(990_000, &[0x22u8; 12]);
+        let flush = vec![0x00u8, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+
+        asm.push(pid, true, Bytes::from(pes1));
+        asm.push(pid, true, Bytes::from(pes2));
+        asm.push(pid, true, Bytes::from(flush));
+
+        let packets: Vec<PesPacket> = rx.try_iter().collect();
+        assert!(
+            packets.len() >= 2,
+            "a remontagem deve preservar os dois PES mesmo com descontinuidade de PTS"
+        );
+
+        let first = &packets[0];
+        let second = &packets[1];
+        assert_eq!(first.pid, pid);
+        assert_eq!(second.pid, pid);
+        assert_eq!(first.codec, codec);
+        assert_eq!(second.codec, codec);
+        assert_eq!(first.pts, Some(90_000));
+        assert_eq!(second.pts, Some(990_000));
+        assert_eq!(first.pts_duration(second), Some(900_000));
+    }
+
     // ── Testes do PesAssembler ────────────────────────────────────────────────
 
     /// PES H.264 fragmentado em 4 pacotes TS é remontado corretamente.

@@ -2,10 +2,17 @@
 //!
 //! SPEC-UI-004
 
+use std::collections::{HashMap, HashSet};
+
 use crossbeam_channel::Sender;
 use eframe::egui;
+use ts::metrics::{
+    AudioCodec as MetricsAudioCodec, PidEntry, PidType, VideoCodec as MetricsVideoCodec,
+};
 use ts::tables::pmt::stream_type_label;
 use ts::tables::sdt::RunningStatus;
+use ts::tables::PmtStream;
+use ts::Pid;
 
 use crate::state::AppState;
 use crate::AppCommand;
@@ -69,6 +76,171 @@ fn format_eit_time_range(ev: &ts::tables::EitEvent) -> String {
         Some(e) => format!("{start_str}\u{2013}{e}"),
         None => start_str,
     }
+}
+
+fn pmt_stream_language(stream: &PmtStream) -> Option<String> {
+    stream
+        .descriptors
+        .iter()
+        .find(|descriptor| descriptor.tag == 0x0A && descriptor.data.len() >= 3)
+        .map(|descriptor| {
+            String::from_utf8_lossy(&descriptor.data[..3])
+                .trim()
+                .to_lowercase()
+        })
+        .filter(|language| !language.is_empty())
+}
+
+fn stream_pid_type(stream: &PmtStream) -> PidType {
+    match stream.stream_type {
+        0x02 => PidType::Video {
+            codec: MetricsVideoCodec::Mpeg2,
+        },
+        0x1B => PidType::Video {
+            codec: MetricsVideoCodec::H264,
+        },
+        0x24 => PidType::Video {
+            codec: MetricsVideoCodec::H265,
+        },
+        0x03 | 0x04 => PidType::Audio {
+            codec: MetricsAudioCodec::MpegAudio,
+        },
+        0x0F | 0x11 => PidType::Audio {
+            codec: MetricsAudioCodec::Aac,
+        },
+        0x81 => PidType::Audio {
+            codec: MetricsAudioCodec::Ac3,
+        },
+        0x87 => PidType::Audio {
+            codec: MetricsAudioCodec::Eac3,
+        },
+        0x06 if stream.is_audio() => PidType::Audio {
+            codec: match stream.label() {
+                "E-AC-3 Audio (DVB)" => MetricsAudioCodec::Eac3,
+                "AC-3 Audio (DVB)" => MetricsAudioCodec::Ac3,
+                _ => MetricsAudioCodec::Aac,
+            },
+        },
+        _ => PidType::Unknown,
+    }
+}
+
+fn fixed_pid_info(pid: Pid) -> Option<(PidType, String)> {
+    match pid {
+        0x0000 => Some((PidType::Pat, "PAT".to_string())),
+        0x0010 => Some((PidType::Nit, "NIT".to_string())),
+        0x0011 => Some((PidType::Sdt, "SDT/BAT".to_string())),
+        0x0012 => Some((PidType::Eit, "EIT".to_string())),
+        0x0014 => Some((PidType::Tdt, "TDT/TOT".to_string())),
+        0x1FFF => Some((PidType::NullPacket, "Null packets".to_string())),
+        _ => None,
+    }
+}
+
+fn known_pid_info(state: &AppState) -> HashMap<Pid, (PidType, String)> {
+    let mut info = HashMap::new();
+
+    if let Some(pat) = &state.tables.pat {
+        info.insert(0x0000, (PidType::Pat, "PAT".to_string()));
+        for program in &pat.programs {
+            if program.program_number == 0 {
+                info.insert(program.pid, (PidType::Nit, "NIT".to_string()));
+            } else {
+                info.insert(
+                    program.pid,
+                    (
+                        PidType::Pmt,
+                        format!("PMT - Serviço {}", program.program_number),
+                    ),
+                );
+            }
+        }
+    }
+
+    if state.tables.nit.is_some() {
+        info.insert(0x0010, (PidType::Nit, "NIT".to_string()));
+    }
+    if state.tables.sdt.is_some() || state.tables.bat.is_some() {
+        info.insert(0x0011, (PidType::Sdt, "SDT/BAT".to_string()));
+    }
+    if !state.tables.eit_pf.is_empty() {
+        info.insert(0x0012, (PidType::Eit, "EIT".to_string()));
+    }
+    if state.tables.tdt.is_some() {
+        info.insert(0x0014, (PidType::Tdt, "TDT/TOT".to_string()));
+    }
+
+    for pmt in state.tables.pmts.values() {
+        info.entry(pmt.pcr_pid).or_insert_with(|| {
+            (
+                PidType::Pcr,
+                format!("PCR - Serviço {}", pmt.program_number),
+            )
+        });
+
+        for stream in &pmt.streams {
+            let pid_type = stream_pid_type(stream);
+            let language = pmt_stream_language(stream)
+                .map(|language| format!(" [{language}]"))
+                .unwrap_or_default();
+            let pcr_suffix = if stream.elementary_pid == pmt.pcr_pid {
+                " + PCR"
+            } else {
+                ""
+            };
+            info.insert(
+                stream.elementary_pid,
+                (
+                    pid_type,
+                    format!(
+                        "{}{}{} - Serviço {}",
+                        stream.label(),
+                        language,
+                        pcr_suffix,
+                        pmt.program_number
+                    ),
+                ),
+            );
+        }
+    }
+
+    info
+}
+
+fn enriched_pid_entries(state: &AppState) -> Vec<PidEntry> {
+    let mut known = known_pid_info(state);
+    let mut rows = state.metrics.pid_table.clone();
+    let mut seen = HashSet::new();
+
+    for row in &mut rows {
+        seen.insert(row.pid);
+        if let Some((pid_type, label)) = known.remove(&row.pid).or_else(|| fixed_pid_info(row.pid))
+        {
+            row.pid_type = pid_type;
+            row.label = label;
+        }
+    }
+
+    for (pid, (pid_type, label)) in known {
+        if seen.insert(pid) {
+            rows.push(PidEntry {
+                pid,
+                pid_type,
+                label,
+                bitrate_kbps: 0.0,
+                cc_errors: state
+                    .metrics
+                    .errors
+                    .cc_errors
+                    .get(&pid)
+                    .copied()
+                    .unwrap_or(0),
+                packet_count: 0,
+            });
+        }
+    }
+
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -140,8 +312,9 @@ impl TablesPanel {
     // ── Aba PIDs ──────────────────────────────────────────────────────────────
 
     fn show_pids(&mut self, ui: &mut egui::Ui, state: &AppState, cmd_tx: &Sender<AppCommand>) {
+        let entries = enriched_pid_entries(state);
         self.pid_panel
-            .show(ui, &state.metrics.pid_table, state.selected_pid, cmd_tx);
+            .show(ui, &entries, state.selected_pid, cmd_tx);
     }
 
     // ── Aba Tables ────────────────────────────────────────────────────────────
@@ -430,6 +603,8 @@ impl TablesPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ts::metrics::{MetricsSnapshot, PidEntry, PidType};
+    use ts::tables::{Pat, PatProgram, Pmt, PmtStream};
 
     #[test]
     fn spec_ui_004_tables_panel_default_tab_is_pids() {
@@ -457,6 +632,80 @@ mod tests {
         assert_eq!(service_type_label(0x02), "Rádio Digital");
         assert_eq!(service_type_label(0x19), "H.264/AVC HD TV");
         assert_eq!(service_type_label(0xFF), "Privado");
+    }
+
+    #[test]
+    fn spec_ui_004_enriched_pid_entries_empty_without_metrics_or_tables() {
+        let state = AppState::default();
+        assert!(enriched_pid_entries(&state).is_empty());
+    }
+
+    #[test]
+    fn spec_ui_004_enriched_pid_entries_labels_pmt_streams() {
+        let mut state = AppState::default();
+        state.metrics = MetricsSnapshot {
+            pid_table: vec![PidEntry {
+                pid: 0x0100,
+                pid_type: PidType::Unknown,
+                label: String::new(),
+                bitrate_kbps: 18_000.0,
+                cc_errors: 0,
+                packet_count: 120,
+            }],
+            ..MetricsSnapshot::default()
+        };
+        state.tables.pat = Some(Pat {
+            transport_stream_id: 1,
+            version: 0,
+            current_next: true,
+            programs: vec![PatProgram {
+                program_number: 16,
+                pid: 0x1000,
+            }],
+        });
+        state.tables.pmts.insert(
+            16,
+            Pmt {
+                program_number: 16,
+                version: 0,
+                current_next: true,
+                pcr_pid: 0x0100,
+                program_descriptors: vec![],
+                streams: vec![
+                    PmtStream {
+                        stream_type: 0x1B,
+                        elementary_pid: 0x0100,
+                        descriptors: vec![],
+                    },
+                    PmtStream {
+                        stream_type: 0x11,
+                        elementary_pid: 0x0101,
+                        descriptors: vec![],
+                    },
+                ],
+            },
+        );
+
+        let entries = enriched_pid_entries(&state);
+        let video = entries
+            .iter()
+            .find(|entry| entry.pid == 0x0100)
+            .expect("video PID deve existir");
+        let audio = entries
+            .iter()
+            .find(|entry| entry.pid == 0x0101)
+            .expect("audio PID deve ser adicionado a partir da PMT");
+        let pmt = entries
+            .iter()
+            .find(|entry| entry.pid == 0x1000)
+            .expect("PMT PID deve ser adicionado a partir da PAT");
+
+        assert!(matches!(video.pid_type, PidType::Video { .. }));
+        assert_eq!(video.label, "H.264 / AVC Video + PCR - Serviço 16");
+        assert!(matches!(audio.pid_type, PidType::Audio { .. }));
+        assert_eq!(audio.label, "AAC Audio (LATM) - Serviço 16");
+        assert_eq!(audio.packet_count, 0);
+        assert_eq!(pmt.pid_type, PidType::Pmt);
     }
 
     #[test]

@@ -223,7 +223,7 @@ pub fn format_pid_type(pid_type: &PidType) -> &'static str {
         PidType::Audio { .. } => "Audio",
         PidType::Pcr => "PCR",
         PidType::NullPacket => "Null",
-        PidType::Unknown => "Unknown",
+        PidType::Unknown => "Desconhecido",
     }
 }
 

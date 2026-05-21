@@ -29,6 +29,7 @@ Entregar reprodução de áudio estável, sincronizada e compatível com os prin
 - Reproduzir áudio do serviço selecionado automaticamente junto com o vídeo.
 - Suportar MPEG-1 Layer II, AAC-LC, HE-AAC v1/v2 e AC-3.
 - Exibir na UI codec, PID, taxa de amostragem, canais, bitrate e estado do buffer de áudio.
+- Exibir PIDs e `stream_type` sempre em decimal e hexadecimal, alinhados com MediaInfo e ferramentas broadcast.
 - Manter baixa latência e comportamento previsível sob perda de pacotes, troca de serviço e loop/descontinuidade de fonte.
 - Preparar a arquitetura para E-AC-3, múltiplas trilhas, seleção manual de áudio e futuras opções de passthrough.
 
@@ -57,6 +58,7 @@ Entregar reprodução de áudio estável, sincronizada e compatível com os prin
 - A conversão para PCM depende de offsets frágeis do `AVFrame`; o subsistema precisa migrar para uma abordagem mais robusta.
 - Ainda não há seleção explícita de trilha de áudio na UI.
 - O estado do buffer de áudio e underruns/overruns não aparecem em painel operacional.
+- A aba PIDs pode exibir todos os elementary streams como `Unknown` quando os metadados derivados da PMT/descriptors não chegam ao snapshot de métricas; isso impede validação operacional contra MediaInfo.
 
 ## 4. Personas e casos de uso
 
@@ -214,6 +216,20 @@ Critérios de aceite:
 - Indicadores: `sem áudio`, `codec não suportado`, `buffer underrun`, `dispositivo indisponível`.
 - Em MPTS com múltiplas trilhas, a primeira fase seleciona a primeira trilha compatível; fase posterior permite seleção manual.
 
+### RF-AUD-011 - Identificação operacional de PIDs e stream types
+
+A aba PIDs e os painéis de serviço devem exibir PIDs, tipos de stream e codecs de forma compatível com MediaInfo e ferramentas de operação broadcast.
+
+Critérios de aceite:
+
+- Todo PID deve ser exibido em decimal e hexadecimal, por exemplo `160 (0x00A0)`.
+- Todo `stream_type` conhecido deve ser exibido em decimal e hexadecimal, por exemplo `129 (0x81)`.
+- PIDs identificados pela PMT/descriptors não devem permanecer como `Unknown` após a PMT do serviço ser processada.
+- A aba PIDs deve diferenciar pelo menos PAT, PMT, PCR, Null, vídeo, áudio, legendas e dados privados.
+- Elementary streams devem mostrar codec legível quando o mapeamento for conhecido: `AVC/H.264`, `HEVC/H.265`, `AC-3`, `AAC LATM`, `HE-AAC`, `DVB Subtitle`.
+- `Unknown` só deve aparecer antes da PMT correspondente ser conhecida ou para `stream_type`/descriptor realmente não suportado.
+- Em streams com idioma disponível via descriptor ISO 639 ou metadata equivalente, a UI deve mostrar idioma junto da trilha: `160 (0x00A0) AC-3 English`, `161 (0x00A1) AC-3 Portuguese`.
+
 ## 6. Requisitos não funcionais
 
 | Requisito       | Critério de aceite                                                                              |
@@ -335,16 +351,16 @@ Done when:
 
 ## 9. Matriz mínima de validação
 
-| Codec           | Encapsulamento TS             | Sample rates        | Canais  | Obrigatório    |
-| --------------- | ----------------------------- | ------------------- | ------- | -------------- |
-| MPEG-1 Layer II | `0x03`                        | 32/44.1/48 kHz      | 1.0/2.0 | Sim            |
-| MPEG-2 Layer II | `0x04`                        | 32/44.1/48 kHz      | 1.0/2.0 | Sim            |
-| AAC-LC ADTS     | `0x0F`                        | 44.1/48 kHz         | 1.0/2.0 | Sim            |
-| AAC-LC LATM     | `0x11`                        | 44.1/48 kHz         | 1.0/2.0 | Sim            |
-| HE-AAC v1       | AAC + SBR                     | 24/48 kHz, 44.1 kHz | 2.0     | Sim            |
-| HE-AAC v2       | AAC + SBR + PS                | 24/48 kHz, 44.1 kHz | 2.0     | Sim            |
-| AC-3            | `0x81` ou `0x06` + descriptor | 48 kHz              | 2.0/5.1 | Sim            |
-| E-AC-3          | `0x87` ou descriptor          | 48 kHz              | 2.0/5.1 | Futuro próximo |
+| Codec           | Encapsulamento TS                        | `stream_type` decimal/hex  | Sample rates        | Canais  | Obrigatório    |
+| --------------- | ---------------------------------------- | -------------------------- | ------------------- | ------- | -------------- |
+| MPEG-1 Layer II | MPEG-1 Audio                             | `3 (0x03)`                 | 32/44.1/48 kHz      | 1.0/2.0 | Sim            |
+| MPEG-2 Layer II | MPEG-2 Audio                             | `4 (0x04)`                 | 32/44.1/48 kHz      | 1.0/2.0 | Sim            |
+| AAC-LC ADTS     | AAC ADTS                                 | `15 (0x0F)`                | 44.1/48 kHz         | 1.0/2.0 | Sim            |
+| AAC-LC LATM     | AAC LATM/LOAS                            | `17 (0x11)`                | 44.1/48 kHz         | 1.0/2.0 | Sim            |
+| HE-AAC v1       | AAC LATM/ADTS + SBR                      | `17 (0x11)` ou `15 (0x0F)` | 24/48 kHz, 44.1 kHz | 2.0     | Sim            |
+| HE-AAC v2       | AAC LATM/ADTS + SBR + PS                 | `17 (0x11)` ou `15 (0x0F)` | 24/48 kHz, 44.1 kHz | 2.0     | Sim            |
+| AC-3            | ATSC AC-3 ou DVB private data descriptor | `129 (0x81)` ou `6 (0x06)` | 48 kHz              | 2.0/5.1 | Sim            |
+| E-AC-3          | E-AC-3 ou private data descriptor        | `135 (0x87)` ou descriptor | 48 kHz              | 2.0/5.1 | Futuro próximo |
 
 ## 10. Métricas de sucesso
 
@@ -354,6 +370,7 @@ Done when:
 - Menos de 1 underrun por minuto em rede local estável.
 - Troca de serviço ou trilha conclui em até 2 s.
 - Usuário consegue identificar codec, PID e estado de áudio sem olhar logs.
+- A aba PIDs mostra PID decimal/hex e codec legível para todos os elementary streams conhecidos do serviço selecionado.
 
 ## 11. Riscos
 
@@ -380,5 +397,49 @@ Done when:
 3. Introduzir conversão robusta com `swresample` para PCM f32 interleaved.
 4. Adicionar telemetria de buffer e erros de áudio na UI.
 5. Expandir mapeamento por descriptors DVB para `stream_type=0x06`.
-6. Montar fixtures de MP2, AAC ADTS, AAC LATM, HE-AAC e AC-3.
-7. Implementar seleção manual de trilha de áudio.
+6. Corrigir propagação de metadados PMT/descriptors para a aba PIDs, eliminando `Unknown` para streams reconhecidos.
+7. Montar fixtures de MP2, AAC ADTS, AAC LATM, HE-AAC e AC-3.
+8. Implementar seleção manual de trilha de áudio.
+
+## 14. Casos reais de alinhamento com MediaInfo
+
+Os exemplos abaixo devem ser usados como referência para labels de UI, fixtures e validação manual. MediaInfo geralmente mostra `Codec ID` em decimal; no MPEG-TS esse valor deve ser alinhado ao `stream_type` da PMT e exibido também em hexadecimal.
+
+### 14.1 P1123_HBO.ts
+
+Serviço/programa: `1 (0x0001)`.
+
+| Componente | PID decimal/hex | MediaInfo Codec ID | Mapeamento esperado no IronPlayer                         |
+| ---------- | --------------- | ------------------ | --------------------------------------------------------- |
+| PMT/Menu   | `128 (0x0080)`  | -                  | `PMT` do serviço `1 (0x0001)`                             |
+| Vídeo      | `144 (0x0090)`  | `36 (0x24)`        | `HEVC/H.265 Video`                                        |
+| Áudio #1   | `160 (0x00A0)`  | `129 (0x81)`       | `AC-3 / Dolby Digital, English, 2.0, 48 kHz, 384 kbps`    |
+| Áudio #2   | `161 (0x00A1)`  | `129 (0x81)`       | `AC-3 / Dolby Digital, Portuguese, 2.0, 48 kHz, 192 kbps` |
+| Legenda #1 | `210 (0x00D2)`  | `6 (0x06)`         | `DVB Subtitle, Portuguese` via descriptor                 |
+| Legenda #2 | `211 (0x00D3)`  | `6 (0x06)`         | `DVB Subtitle, Portuguese` via descriptor                 |
+
+Critérios específicos:
+
+- A aba PIDs não deve mostrar `144`, `160`, `161`, `210` ou `211` como `Unknown` depois da PMT.
+- A UI deve preservar o idioma das trilhas AC-3 quando descriptor/metadata estiver disponível.
+- Os PIDs privados `208 (0x00D0)` e `209 (0x00D1)`, quando não identificados por descriptor, podem permanecer como dados privados/unknown com `stream_type` visível.
+
+### 14.2 P1148_GLOBO_EPTV_SC.ts
+
+Serviço/programa: `16 (0x0010)`.
+
+| Componente | PID decimal/hex | MediaInfo Codec ID | Mapeamento esperado no IronPlayer                             |
+| ---------- | --------------- | ------------------ | ------------------------------------------------------------- |
+| PMT/Menu   | `257 (0x0101)`  | -                  | `PMT` do serviço `16 (0x0010)`                                |
+| Vídeo      | `273 (0x0111)`  | `27 (0x1B)`        | `AVC/H.264 Video`                                             |
+| Áudio #1   | `274 (0x0112)`  | `17-5`             | `HE-AAC / AAC LATM, Portuguese, 2.0, 48 kHz`                  |
+| Áudio #2   | `275 (0x0113)`  | `17-5`             | `HE-AAC / AAC LATM, sap, 2.0, 48 kHz`                         |
+| Áudio #3   | `276 (0x0114)`  | `17-5`             | `HE-AAC / AAC LATM, English, 2.0, 48 kHz`                     |
+| Áudio #4   | `277 (0x0115)`  | `17-5`             | `HE-AAC / AAC LATM, Portuguese, 5.1/6ch, 48 kHz`              |
+| Legendas   | muxed no vídeo  | -                  | `EIA-608/EIA-708` associado ao PID de vídeo quando detectável |
+
+Observações:
+
+- `17-5` do MediaInfo deve ser tratado como `stream_type=17 (0x11)` AAC LATM com perfil HE-AAC/SBR detectado pelo decoder ou metadata; o `-5` não deve virar um `stream_type` separado.
+- A aba PIDs deve identificar `274 (0x0112)` a `277 (0x0115)` como áudio AAC/HE-AAC, não como `Unknown`.
+- O áudio #4 com 6 canais deve acionar a política de suporte multicanal/downmix definida em RF-AUD-005.

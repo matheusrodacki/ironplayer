@@ -79,10 +79,14 @@ pub struct TableDispatcher {
     active_av_pids: HashSet<Pid>,
     /// Serviço selecionado, compartilhado com o cmd-handler.
     selected_service: Arc<RwLock<Option<u16>>>,
+    /// PID de áudio selecionado manualmente no serviço atual.
+    selected_audio_pid: Arc<RwLock<Option<Pid>>>,
     /// Snapshot compartilhado de telemetria e estado operacional do áudio.
     audio_status: Arc<RwLock<AudioStatusSnapshot>>,
     /// Última leitura do serviço selecionado (para detectar trocas).
     last_selected_service: Option<u16>,
+    /// Última leitura do PID de áudio selecionado (para detectar trocas).
+    last_selected_audio_pid: Option<Pid>,
     /// Seleciona automaticamente o primeiro serviço com A/V válidos se ainda
     /// não houver seleção manual (`selected_service == None`).
     auto_play: bool,
@@ -111,6 +115,7 @@ impl TableDispatcher {
             pes_tx,
             decode_tx,
             selected_service,
+            Arc::new(RwLock::new(None)),
             audio_status,
             false,
         )
@@ -125,6 +130,7 @@ impl TableDispatcher {
         pes_tx: Sender<PesCommand>,
         decode_tx: Sender<DecodeCommand>,
         selected_service: Arc<RwLock<Option<u16>>>,
+        selected_audio_pid: Arc<RwLock<Option<Pid>>>,
         audio_status: Arc<RwLock<AudioStatusSnapshot>>,
         auto_play: bool,
     ) -> Self {
@@ -141,8 +147,10 @@ impl TableDispatcher {
             pmt_cache: HashMap::new(),
             active_av_pids: HashSet::new(),
             selected_service,
+            selected_audio_pid,
             audio_status,
             last_selected_service: None,
+            last_selected_audio_pid: None,
             auto_play,
             auto_play_triggered: false,
         }
@@ -155,9 +163,14 @@ impl TableDispatcher {
         while let Ok(section) = self.rx.recv() {
             // Verifica troca de serviço antes de processar cada seção.
             let current_service = self.selected_service.read().map(|g| *g).unwrap_or(None);
+            let current_audio_pid = self.selected_audio_pid.read().map(|g| *g).unwrap_or(None);
             if current_service != self.last_selected_service {
                 self.on_service_changed(current_service);
                 self.last_selected_service = current_service;
+                self.last_selected_audio_pid = current_audio_pid;
+            } else if current_audio_pid != self.last_selected_audio_pid {
+                self.on_audio_changed(current_service, current_audio_pid);
+                self.last_selected_audio_pid = current_audio_pid;
             }
 
             trace!(
@@ -211,8 +224,8 @@ impl TableDispatcher {
                 // SPEC-TABLE-001d: quando a PAT muda, invalida o cache para
                 // todos os PIDs de PMT conhecidos, forçando o re-parse das PMTs.
                 let new_pmt_pids: HashSet<Pid> = pat.pmt_pids().collect();
-                let pat_changed = self.pat_version != Some(pat.version)
-                    || self.pat_pmt_pids != new_pmt_pids;
+                let pat_changed =
+                    self.pat_version != Some(pat.version) || self.pat_pmt_pids != new_pmt_pids;
                 if pat_changed {
                     if self.pat_version.is_some() {
                         tracing::info!(
@@ -315,6 +328,9 @@ impl TableDispatcher {
                             if let Ok(mut guard) = self.selected_service.write() {
                                 *guard = Some(pmt.program_number);
                             }
+                            if let Ok(mut audio_guard) = self.selected_audio_pid.write() {
+                                *audio_guard = None;
+                            }
                             tracing::info!(
                                 program_number = pmt.program_number,
                                 "auto_play: primeiro serviço com A/V selecionado automaticamente"
@@ -381,7 +397,10 @@ impl TableDispatcher {
 
     fn registerable_streams(&self, pmt: &Pmt) -> Vec<(Pid, MediaCodec)> {
         let mut registerable = Vec::new();
-        let mut selected_audio_pid = None;
+        let selected_audio_pid = self.selected_audio_pid.read().map(|g| *g).unwrap_or(None);
+        let active_audio_pid = selected_audio_pid
+            .filter(|pid| pmt_audio_codec(pmt, *pid).is_some())
+            .or_else(|| first_audio_track_from_pmt(pmt).map(|track| track.pid));
 
         for stream in &pmt.streams {
             let Some(codec) = MediaCodec::from_pmt_stream(stream) else {
@@ -390,8 +409,7 @@ impl TableDispatcher {
 
             match codec {
                 MediaCodec::Video(_) => registerable.push((stream.elementary_pid, codec)),
-                MediaCodec::Audio(_) if selected_audio_pid.is_none() => {
-                    selected_audio_pid = Some(stream.elementary_pid);
+                MediaCodec::Audio(_) if Some(stream.elementary_pid) == active_audio_pid => {
                     registerable.push((stream.elementary_pid, codec));
                 }
                 MediaCodec::Audio(_) => {}
@@ -403,9 +421,10 @@ impl TableDispatcher {
 
     fn sync_active_audio_track(&self) {
         let selected_service = self.selected_service.read().map(|g| *g).unwrap_or(None);
+        let selected_audio_pid = self.selected_audio_pid.read().map(|g| *g).unwrap_or(None);
         let active_track = selected_service
             .and_then(|service_id| self.pmt_cache.get(&service_id))
-            .and_then(active_audio_track_from_pmt);
+            .and_then(|pmt| active_audio_track_from_pmt(pmt, selected_audio_pid));
 
         if let Ok(mut audio_status) = self.audio_status.write() {
             audio_status.active_track = active_track;
@@ -420,6 +439,43 @@ impl TableDispatcher {
                 audio_status.state = AudioOperationalState::Buffering;
             }
         }
+    }
+
+    fn on_audio_changed(&mut self, selected_service: Option<u16>, selected_audio_pid: Option<Pid>) {
+        let Some(service_id) = selected_service else {
+            self.sync_active_audio_track();
+            return;
+        };
+        let Some(pmt) = self.pmt_cache.get(&service_id).cloned() else {
+            self.sync_active_audio_track();
+            return;
+        };
+
+        for stream in &pmt.streams {
+            if stream.is_audio() && self.active_av_pids.remove(&stream.elementary_pid) {
+                self.send_demux_command(DemuxCommand::DeregisterAvPid(stream.elementary_pid));
+                self.send_pes_command(PesCommand::DeregisterPid {
+                    pid: stream.elementary_pid,
+                });
+            }
+        }
+
+        let active_audio_pid = selected_audio_pid
+            .filter(|pid| pmt_audio_codec(&pmt, *pid).is_some())
+            .or_else(|| first_audio_track_from_pmt(&pmt).map(|track| track.pid));
+        if let Some(pid) = active_audio_pid {
+            if let Some(codec) = pmt_audio_codec(&pmt, pid) {
+                self.active_av_pids.insert(pid);
+                self.send_demux_command(DemuxCommand::RegisterAvPid(pid));
+                self.send_pes_command(PesCommand::RegisterPid { pid, codec });
+            }
+        }
+
+        if self.decode_tx.try_send(DecodeCommand::Reset).is_err() {
+            warn!("canal decode-control cheio — Reset descartado");
+        }
+
+        self.sync_active_audio_track();
     }
 
     fn dispatch_full_section<T, F, E>(
@@ -506,7 +562,20 @@ impl TableDispatcher {
     }
 }
 
-fn active_audio_track_from_pmt(pmt: &Pmt) -> Option<AudioTrackInfo> {
+fn first_audio_track_from_pmt(pmt: &Pmt) -> Option<AudioTrackInfo> {
+    active_audio_track_from_pmt(pmt, None)
+}
+
+fn active_audio_track_from_pmt(
+    pmt: &Pmt,
+    selected_audio_pid: Option<Pid>,
+) -> Option<AudioTrackInfo> {
+    if let Some(pid) = selected_audio_pid {
+        if let Some(track) = audio_track_by_pid(pmt, pid) {
+            return Some(track);
+        }
+    }
+
     pmt.streams.iter().find_map(|stream| {
         let codec = MediaCodec::from_pmt_stream(stream)?;
         let MediaCodec::Audio(audio_codec) = codec else {
@@ -519,6 +588,37 @@ fn active_audio_track_from_pmt(pmt: &Pmt) -> Option<AudioTrackInfo> {
             codec_label: audio_codec.name().to_string(),
             language: audio_language(&stream.descriptors),
         })
+    })
+}
+
+fn audio_track_by_pid(pmt: &Pmt, pid: Pid) -> Option<AudioTrackInfo> {
+    pmt.streams.iter().find_map(|stream| {
+        if stream.elementary_pid != pid {
+            return None;
+        }
+        let codec = MediaCodec::from_pmt_stream(stream)?;
+        let MediaCodec::Audio(audio_codec) = codec else {
+            return None;
+        };
+
+        Some(AudioTrackInfo {
+            service_id: pmt.program_number,
+            pid: stream.elementary_pid,
+            codec_label: audio_codec.name().to_string(),
+            language: audio_language(&stream.descriptors),
+        })
+    })
+}
+
+fn pmt_audio_codec(pmt: &Pmt, pid: Pid) -> Option<MediaCodec> {
+    pmt.streams.iter().find_map(|stream| {
+        if stream.elementary_pid != pid {
+            return None;
+        }
+        match MediaCodec::from_pmt_stream(stream)? {
+            codec @ MediaCodec::Audio(_) => Some(codec),
+            MediaCodec::Video(_) => None,
+        }
     })
 }
 
@@ -1150,6 +1250,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_auto_play");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_read = Arc::clone(&selected_service);
+        let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
         let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new_with_auto_play(
@@ -1159,6 +1260,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            selected_audio_pid,
             audio_status,
             true,
         );
@@ -1204,6 +1306,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_auto_play_manual");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_ctrl = Arc::clone(&selected_service);
+        let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
         let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new_with_auto_play(
@@ -1213,6 +1316,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            selected_audio_pid,
             audio_status,
             true,
         );
@@ -1253,6 +1357,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_auto_play_rearm");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_ctrl = Arc::clone(&selected_service);
+        let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
         let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new_with_auto_play(
@@ -1262,6 +1367,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            selected_audio_pid,
             audio_status,
             true,
         );
@@ -1310,6 +1416,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_no_deadlock");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_ctrl = Arc::clone(&selected_service);
+        let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
         let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let dispatcher = TableDispatcher::new_with_auto_play(
@@ -1319,6 +1426,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            selected_audio_pid,
             audio_status,
             false,
         );
@@ -1703,5 +1811,99 @@ mod tests {
             })
         );
         assert_eq!(updated_snapshot.state, AudioOperationalState::Buffering);
+    }
+
+    #[test]
+    fn spec_integration_manual_audio_selection_reroutes_selected_pid() {
+        let (_sections_tx, sections_rx) = crossbeam_channel::bounded(64);
+        let (table_events_tx, _table_events_rx) = crossbeam_channel::bounded(64);
+        let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded(64);
+        let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded(64);
+        let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded(16);
+        let bounded_tx = BoundedSender::new(table_events_tx, "test_manual_audio_switch");
+        let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(Some(1)));
+        let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
+
+        let mut dispatcher = TableDispatcher::new_with_auto_play(
+            sections_rx,
+            bounded_tx,
+            demux_cmd_tx,
+            pes_cmd_tx,
+            decode_cmd_tx,
+            selected_service,
+            Arc::clone(&selected_audio_pid),
+            Arc::clone(&audio_status),
+            false,
+        );
+        dispatcher.last_selected_service = Some(1);
+
+        dispatcher.process_section(make_pat_section(0x0001, 1, &[(1, 0x100)]));
+        let _ = demux_cmd_rx.try_recv();
+
+        let por_lang = [0x0A, 0x04, b'p', b'o', b'r', 0x00];
+        let eng_lang = [0x0A, 0x04, b'e', b'n', b'g', 0x00];
+        dispatcher.process_section(make_pmt_section_with_streams(
+            0x100,
+            1,
+            0,
+            0x101,
+            &[
+                (0x1B, 0x101, &[]),
+                (0x11, 0x120, &por_lang),
+                (0x11, 0x121, &eng_lang),
+            ],
+        ));
+        while demux_cmd_rx.try_recv().is_ok() {}
+        while pes_cmd_rx.try_recv().is_ok() {}
+
+        *selected_audio_pid.write().unwrap() = Some(0x121);
+        dispatcher.on_audio_changed(Some(1), Some(0x121));
+
+        let demux_cmds: Vec<DemuxCommand> =
+            std::iter::from_fn(|| demux_cmd_rx.try_recv().ok()).collect();
+        let pes_cmds: Vec<PesCommand> = std::iter::from_fn(|| pes_cmd_rx.try_recv().ok()).collect();
+
+        assert!(
+            demux_cmds.contains(&DemuxCommand::DeregisterAvPid(0x120)),
+            "áudio anterior deve ser removido do demuxer"
+        );
+        assert!(
+            demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x121)),
+            "áudio escolhido deve ser registrado no demuxer"
+        );
+        assert!(
+            !demux_cmds.contains(&DemuxCommand::DeregisterAvPid(0x101)),
+            "troca de áudio não deve desregistrar o vídeo"
+        );
+        assert!(
+            pes_cmds.contains(&PesCommand::DeregisterPid { pid: 0x120 }),
+            "assembler deve descartar a faixa antiga"
+        );
+        assert!(
+            pes_cmds.iter().any(|command| {
+                matches!(
+                    command,
+                    PesCommand::RegisterPid {
+                        pid: 0x121,
+                        codec: MediaCodec::Audio(av::AudioCodec::AacLatm),
+                    }
+                )
+            }),
+            "assembler deve registrar a faixa escolhida"
+        );
+        assert_eq!(decode_cmd_rx.try_recv().unwrap(), DecodeCommand::Reset);
+
+        let snapshot = audio_status.read().unwrap().clone();
+        assert_eq!(
+            snapshot.active_track,
+            Some(AudioTrackInfo {
+                service_id: 1,
+                pid: 0x121,
+                codec_label: av::AudioCodec::AacLatm.name().to_string(),
+                language: Some("eng".to_string()),
+            })
+        );
+        assert_eq!(snapshot.state, AudioOperationalState::Buffering);
     }
 }

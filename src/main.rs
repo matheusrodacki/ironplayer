@@ -153,12 +153,16 @@ fn refresh_audio_status_from_output(
 
 fn reset_stream_routing(
     selected_service: &Arc<std::sync::RwLock<Option<u16>>>,
+    selected_audio_pid: &Arc<std::sync::RwLock<Option<u16>>>,
     demux_cmd_tx: &crossbeam_channel::Sender<DemuxCommand>,
     pes_cmd_tx: &crossbeam_channel::Sender<PesCommand>,
     decode_cmd_tx: &crossbeam_channel::Sender<DecodeCommand>,
 ) {
     if let Ok(mut service) = selected_service.write() {
         *service = None;
+    }
+    if let Ok(mut audio_pid) = selected_audio_pid.write() {
+        *audio_pid = None;
     }
     if demux_cmd_tx.try_send(DemuxCommand::Reset).is_err() {
         tracing::warn!("canal demux-control cheio — Reset descartado");
@@ -232,6 +236,8 @@ fn main() -> eframe::Result<()> {
     // Serviço selecionado, compartilhado entre cmd-handler, TableDispatcher e UI.
     let selected_service: Arc<std::sync::RwLock<Option<u16>>> =
         Arc::new(std::sync::RwLock::new(None));
+    let selected_audio_pid: Arc<std::sync::RwLock<Option<u16>>> =
+        Arc::new(std::sync::RwLock::new(None));
 
     // 7. Instancia MetricsAggregator
     let (metrics_agg, snapshot_rx) =
@@ -258,6 +264,7 @@ fn main() -> eframe::Result<()> {
         pes_cmd_tx.clone(),
         decode_cmd_tx.clone(),
         selected_service.clone(),
+        selected_audio_pid.clone(),
         audio_status.clone(),
         true,
     );
@@ -668,6 +675,7 @@ fn main() -> eframe::Result<()> {
         let audio_status = audio_status.clone();
         let current_net_stop = current_net_stop.clone();
         let selected_service = selected_service.clone();
+        let selected_audio_pid = selected_audio_pid.clone();
         let demux_cmd_tx = demux_cmd_tx.clone();
         let pes_cmd_tx = pes_cmd_tx.clone();
         let decode_cmd_tx = decode_cmd_tx.clone();
@@ -690,6 +698,7 @@ fn main() -> eframe::Result<()> {
                             }
                             reset_stream_routing(
                                 &selected_service,
+                                &selected_audio_pid,
                                 &demux_cmd_tx,
                                 &pes_cmd_tx,
                                 &decode_cmd_tx,
@@ -770,6 +779,7 @@ fn main() -> eframe::Result<()> {
                             }
                             reset_stream_routing(
                                 &selected_service,
+                                &selected_audio_pid,
                                 &demux_cmd_tx,
                                 &pes_cmd_tx,
                                 &decode_cmd_tx,
@@ -788,8 +798,23 @@ fn main() -> eframe::Result<()> {
                                 status.state = ui::AudioOperationalState::Buffering;
                                 status.errors.last_error = None;
                             }
+                            if let Ok(mut audio_pid) = selected_audio_pid.write() {
+                                *audio_pid = None;
+                            }
                             *selected_service.write().unwrap() = Some(service_id);
                             tracing::info!(service_id, "serviço selecionado pelo usuário");
+                        }
+                        ui::AppCommand::SelectAudio { service_id, pid } => {
+                            if let Ok(mut status) = audio_status.write() {
+                                status.sample_rate_hz = None;
+                                status.channels = None;
+                                status.buffer_level = 0.0;
+                                status.state = ui::AudioOperationalState::Buffering;
+                                status.errors.last_error = None;
+                            }
+                            *selected_service.write().unwrap() = Some(service_id);
+                            *selected_audio_pid.write().unwrap() = Some(pid);
+                            tracing::info!(service_id, pid, "trilha de áudio selecionada pelo usuário");
                         }
                         _ => {}
                     }

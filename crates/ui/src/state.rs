@@ -252,6 +252,8 @@ pub enum AppCommand {
     Disconnect,
     /// Seleciona um serviço DVB para exibição no `VideoPanel`.
     SelectService { service_id: u16 },
+    /// Seleciona uma trilha de áudio dentro do serviço DVB atual.
+    SelectAudio { service_id: u16, pid: Pid },
     /// Seleciona um PID para destaque nas métricas.
     SelectPid { pid: Pid },
     /// Ajusta o volume de áudio (0.0 – 1.0).

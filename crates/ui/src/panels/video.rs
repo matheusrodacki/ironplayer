@@ -180,7 +180,7 @@ impl VideoPanel {
 
         // ── Submenu: Áudio ────────────────────────────────────────────────
         ui.menu_button("Áudio", |ui| {
-            let audio_streams: Vec<String> = state
+            let audio_streams: Vec<(u16, String)> = state
                 .selected_service
                 .and_then(|svc_id| state.tables.pmts.get(&svc_id))
                 .map(|pmt| {
@@ -197,12 +197,15 @@ impl VideoPanel {
                             let language = audio_language(stream)
                                 .map(|language| format!(" [{language}]"))
                                 .unwrap_or_default();
-                            format!(
-                                "{marker} {} / 0x{:04X}  {}{}",
+                            (
                                 stream.elementary_pid,
-                                stream.elementary_pid,
-                                stream.label(),
-                                language,
+                                format!(
+                                    "{marker} {} / 0x{:04X}  {}{}",
+                                    stream.elementary_pid,
+                                    stream.elementary_pid,
+                                    stream.label(),
+                                    language,
+                                ),
                             )
                         })
                         .collect()
@@ -212,8 +215,16 @@ impl VideoPanel {
             if audio_streams.is_empty() {
                 ui.add_enabled(false, egui::Button::new("(nenhum)"));
             } else {
-                for label in audio_streams {
-                    ui.add_enabled(false, egui::Button::new(label));
+                for (pid, label) in audio_streams {
+                    if ui
+                        .add_enabled(connected, egui::Button::new(label))
+                        .clicked()
+                    {
+                        if let Some(service_id) = state.selected_service {
+                            let _ = cmd_tx.try_send(AppCommand::SelectAudio { service_id, pid });
+                        }
+                        ui.close_menu();
+                    }
                 }
             }
         });

@@ -4,10 +4,11 @@
 /// emite [`TableEvent`] para o `AppState`.
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use av::MediaCodec;
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tracing::{trace, warn};
 use ts::tables::{Bat, Descriptor, Eit, Nit, Pat, Pmt, Sdt, Tdt};
 use ts::{CompleteSection, Pid};
@@ -50,6 +51,14 @@ pub enum DecodeCommand {
     Reset,
 }
 
+/// SPEC-TABLE
+/// Comando de controle do próprio `TableDispatcher`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableCommand {
+    /// Limpa caches PSI/SI e notifica a UI para zerar dados do stream.
+    Reset,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SectionKey {
     pid: Pid,
@@ -62,6 +71,7 @@ struct SectionKey {
 /// Despacha seções PSI/SI completas para o `AppState`.
 pub struct TableDispatcher {
     rx: Receiver<CompleteSection>,
+    control_rx: Option<Receiver<TableCommand>>,
     tx: BoundedSender<TableEvent>,
     demux_tx: Sender<DemuxCommand>,
     pes_tx: Sender<PesCommand>,
@@ -134,8 +144,37 @@ impl TableDispatcher {
         audio_status: Arc<RwLock<AudioStatusSnapshot>>,
         auto_play: bool,
     ) -> Self {
+        Self::new_with_auto_play_and_control(
+            rx,
+            tx,
+            demux_tx,
+            pes_tx,
+            decode_tx,
+            selected_service,
+            selected_audio_pid,
+            audio_status,
+            auto_play,
+            None,
+        )
+    }
+
+    /// Cria um novo `TableDispatcher` com canal de controle opcional.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_auto_play_and_control(
+        rx: Receiver<CompleteSection>,
+        tx: BoundedSender<TableEvent>,
+        demux_tx: Sender<DemuxCommand>,
+        pes_tx: Sender<PesCommand>,
+        decode_tx: Sender<DecodeCommand>,
+        selected_service: Arc<RwLock<Option<u16>>>,
+        selected_audio_pid: Arc<RwLock<Option<Pid>>>,
+        audio_status: Arc<RwLock<AudioStatusSnapshot>>,
+        auto_play: bool,
+        control_rx: Option<Receiver<TableCommand>>,
+    ) -> Self {
         Self {
             rx,
+            control_rx,
             tx,
             demux_tx,
             pes_tx,
@@ -160,7 +199,14 @@ impl TableDispatcher {
     ///
     /// Termina quando o sender do canal `complete_sections` é fechado.
     pub fn run(mut self) {
-        while let Ok(section) = self.rx.recv() {
+        loop {
+            self.drain_control_commands();
+            let section = match self.rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(section) => section,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+
             // Verifica troca de serviço antes de processar cada seção.
             let current_service = self.selected_service.read().map(|g| *g).unwrap_or(None);
             let current_audio_pid = self.selected_audio_pid.read().map(|g| *g).unwrap_or(None);
@@ -181,6 +227,36 @@ impl TableDispatcher {
             );
             self.process_section(section);
         }
+    }
+
+    fn drain_control_commands(&mut self) {
+        let Some(control_rx) = self.control_rx.as_ref().cloned() else {
+            return;
+        };
+
+        while let Ok(command) = control_rx.try_recv() {
+            match command {
+                TableCommand::Reset => self.reset_stream_data(),
+            }
+        }
+    }
+
+    fn reset_stream_data(&mut self) {
+        self.last_sections.clear();
+        self.pat_version = None;
+        self.pat_pmt_pids.clear();
+        self.pmt_versions.clear();
+        self.pmt_cache.clear();
+        self.active_av_pids.clear();
+        self.last_selected_service = None;
+        self.last_selected_audio_pid = None;
+        self.auto_play_triggered = false;
+
+        if let Ok(mut audio_status) = self.audio_status.write() {
+            audio_status.reset_stream_runtime(AudioOperationalState::Idle);
+        }
+
+        self.tx.try_send(TableEvent::Reset);
     }
 
     /// Processa uma seção com deduplicação e despacho.
@@ -835,6 +911,40 @@ mod tests {
         assert_eq!(cmd, DemuxCommand::RegisterPmtPid(0x100));
         assert_eq!(dispatcher.pat_version, Some(1));
         assert!(dispatcher.pat_pmt_pids.contains(&0x100));
+    }
+
+    #[test]
+    fn spec_table_reset_clears_cached_stream_data() {
+        let (mut dispatcher, _tx, events_rx, _demux_rx, _pes_rx, _decode_rx, audio_status) =
+            make_dispatcher();
+        dispatcher.process_section(make_pat_section(0x0001, 1, &[(1, 0x100)]));
+        dispatcher.process_section(make_pmt_section(0x100, 1, 1, 0x0101));
+        if let Ok(mut status) = audio_status.write() {
+            status.active_track = Some(AudioTrackInfo {
+                service_id: 1,
+                pid: 0x0101,
+                codec_label: "H.264".to_owned(),
+                language: None,
+            });
+        }
+
+        assert!(dispatcher.pat_version.is_some());
+        assert!(!dispatcher.pat_pmt_pids.is_empty());
+        assert!(!dispatcher.pmt_cache.is_empty());
+        assert!(!dispatcher.active_av_pids.is_empty());
+        while events_rx.try_recv().is_ok() {}
+
+        dispatcher.reset_stream_data();
+
+        assert!(dispatcher.last_sections.is_empty());
+        assert!(dispatcher.pat_version.is_none());
+        assert!(dispatcher.pat_pmt_pids.is_empty());
+        assert!(dispatcher.pmt_versions.is_empty());
+        assert!(dispatcher.pmt_cache.is_empty());
+        assert!(dispatcher.active_av_pids.is_empty());
+        assert!(!dispatcher.auto_play_triggered);
+        assert!(audio_status.read().unwrap().active_track.is_none());
+        assert!(matches!(events_rx.try_recv(), Ok(TableEvent::Reset)));
     }
 
     /// SPEC-TABLE-001d: mesma versão PAT não re-registra PIDs (dedup ativo).

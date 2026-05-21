@@ -129,6 +129,8 @@ impl AudioStatusSnapshot {
 /// SPEC-UI-002
 #[derive(Debug, Clone)]
 pub enum TableEvent {
+    /// Limpa todos os dados PSI/SI do stream atual.
+    Reset,
     /// Snapshot mais recente da PAT.
     Pat(Pat),
     /// Snapshot mais recente de uma PMT.
@@ -212,11 +214,23 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Limpa dados derivados do stream atual, preservando preferências externas.
+    pub(crate) fn reset_stream_data(&mut self) {
+        self.metrics = MetricsSnapshot::default();
+        self.tables = TablesSnapshot::default();
+        self.selected_pid = None;
+        self.selected_service = None;
+        self.bitrate_history.clear();
+        self.pcr_history.clear();
+        self.audio.reset_stream_runtime(AudioOperationalState::Idle);
+    }
+
     /// Aplica um evento incremental de tabela ao snapshot imutável da UI.
     ///
     /// SPEC-UI-002
     pub(crate) fn apply_table_event(&mut self, event: TableEvent) {
         match event {
+            TableEvent::Reset => self.reset_stream_data(),
             TableEvent::Pat(pat) => self.tables.pat = Some(pat),
             TableEvent::Pmt(pmt) => {
                 self.tables.pmts.insert(pmt.program_number, pmt);
@@ -341,5 +355,37 @@ mod tests {
         state.apply_table_event(TableEvent::Pat(pat.clone()));
 
         assert_eq!(state.tables.pat, Some(pat));
+    }
+
+    #[test]
+    fn spec_ui_002_table_reset_clears_stream_state() {
+        let mut state = AppState::default();
+        state.selected_pid = Some(0x0100);
+        state.selected_service = Some(16);
+        state.bitrate_history.push_back((Instant::now(), 1_000.0));
+        state.metrics.total_bitrate_kbps = 1_000.0;
+        state.audio.active_track = Some(AudioTrackInfo {
+            service_id: 16,
+            pid: 0x0112,
+            codec_label: "AAC".to_owned(),
+            language: Some("por".to_owned()),
+        });
+        state.tables.pat = Some(Pat {
+            transport_stream_id: 1,
+            version: 3,
+            current_next: true,
+            programs: Vec::new(),
+        });
+
+        state.apply_table_event(TableEvent::Reset);
+
+        assert!(state.tables.pat.is_none());
+        assert!(state.selected_pid.is_none());
+        assert!(state.selected_service.is_none());
+        assert!(state.bitrate_history.is_empty());
+        assert!(state.pcr_history.is_empty());
+        assert_eq!(state.metrics.total_bitrate_kbps, 0.0);
+        assert!(state.audio.active_track.is_none());
+        assert_eq!(state.audio.state, AudioOperationalState::Idle);
     }
 }

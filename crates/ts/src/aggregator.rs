@@ -123,6 +123,8 @@ impl SnapshotReceiver {
 /// SPEC-METRICS-003
 #[derive(Debug, Clone)]
 pub enum AggregatorNetEvent {
+    /// Limpa métricas acumuladas ao reiniciar/trocar a fonte do stream.
+    Reset,
     /// Overflow do buffer UDP.
     UdpBufferOverflow,
     /// Pacote RTP recebido fora de ordem.
@@ -232,6 +234,12 @@ impl MetricsAggregator {
         loop {
             let mut had_events = false;
 
+            // --- Drenar canal AggregatorNetEvent ---
+            while let Ok(event) = self.net_rx.try_recv() {
+                had_events = true;
+                self.handle_net_event(event);
+            }
+
             // --- Drenar canal TsEvent ---
             while let Ok(event) = self.ts_rx.try_recv() {
                 had_events = true;
@@ -242,12 +250,6 @@ impl MetricsAggregator {
             while let Ok(event) = self.pcr_rx.try_recv() {
                 had_events = true;
                 self.handle_pcr_event(event);
-            }
-
-            // --- Drenar canal AggregatorNetEvent ---
-            while let Ok(event) = self.net_rx.try_recv() {
-                had_events = true;
-                self.handle_net_event(event);
             }
 
             // --- Publicar snapshot a cada 1 s ---
@@ -316,6 +318,14 @@ impl MetricsAggregator {
 
     fn handle_net_event(&mut self, event: AggregatorNetEvent) {
         match event {
+            AggregatorNetEvent::Reset => {
+                while self.ts_rx.try_recv().is_ok() {}
+                while self.pcr_rx.try_recv().is_ok() {}
+                self.bitrate = BitrateMonitor::new(Duration::from_secs(1));
+                self.errors.reset();
+                self.pid_info.clear();
+                self.snapshot_tx.send(MetricsSnapshot::default());
+            }
             AggregatorNetEvent::UdpBufferOverflow => {
                 self.errors.record_udp_overflow();
             }
@@ -507,6 +517,44 @@ mod tests {
         let snap = agg.build_snapshot();
         assert_eq!(snap.errors.udp_overflows, 1);
         assert_eq!(snap.errors.rtp_out_of_order, 2);
+    }
+
+    /// SPEC-METRICS-003 — Reset limpa métricas acumuladas e publica snapshot vazio.
+    #[test]
+    fn spec_metrics_003_reset_clears_snapshot() {
+        let (ts_tx, ts_rx) = bounded::<TsEvent>(4);
+        let (_pcr_tx, pcr_rx) = bounded::<PcrEvent>(4);
+        let (net_tx, net_rx) = bounded::<AggregatorNetEvent>(4);
+
+        let (mut agg, snap_rx) = MetricsAggregator::new(ts_rx, pcr_rx, net_rx);
+
+        ts_tx
+            .send(TsEvent::Packet {
+                pid: 0x0100,
+                bytes: 188,
+            })
+            .unwrap();
+        ts_tx
+            .send(TsEvent::CcError {
+                pid: 0x0100,
+                expected: 1,
+                got: 2,
+            })
+            .unwrap();
+        while let Ok(event) = agg.ts_rx.try_recv() {
+            agg.handle_ts_event(event);
+        }
+        assert!(agg.build_snapshot().total_bitrate_kbps > 0.0);
+
+        net_tx.send(AggregatorNetEvent::Reset).unwrap();
+        while let Ok(event) = agg.net_rx.try_recv() {
+            agg.handle_net_event(event);
+        }
+
+        let snap = snap_rx.borrow();
+        assert!(snap.pid_table.is_empty());
+        assert_eq!(snap.total_bitrate_kbps, 0.0);
+        assert!(snap.errors.cc_errors.is_empty());
     }
 
     /// SPEC-METRICS-003 — PcrEvent Jitter e Discontinuity são processados.

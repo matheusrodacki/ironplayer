@@ -12,7 +12,7 @@ use net::{
 };
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use table_dispatcher::{DecodeCommand, DemuxCommand, PesCommand, TableDispatcher};
+use table_dispatcher::{DecodeCommand, DemuxCommand, PesCommand, TableCommand, TableDispatcher};
 use ts::{
     aggregator::{
         AggregatorNetEvent, MetricsAggregator, StopHandle as MetricsStopHandle,
@@ -154,6 +154,8 @@ fn refresh_audio_status_from_output(
 fn reset_stream_routing(
     selected_service: &Arc<std::sync::RwLock<Option<u16>>>,
     selected_audio_pid: &Arc<std::sync::RwLock<Option<u16>>>,
+    table_cmd_tx: &crossbeam_channel::Sender<TableCommand>,
+    agg_net_tx: &crossbeam_channel::Sender<AggregatorNetEvent>,
     demux_cmd_tx: &crossbeam_channel::Sender<DemuxCommand>,
     pes_cmd_tx: &crossbeam_channel::Sender<PesCommand>,
     decode_cmd_tx: &crossbeam_channel::Sender<DecodeCommand>,
@@ -163,6 +165,12 @@ fn reset_stream_routing(
     }
     if let Ok(mut audio_pid) = selected_audio_pid.write() {
         *audio_pid = None;
+    }
+    if table_cmd_tx.try_send(TableCommand::Reset).is_err() {
+        tracing::warn!("canal table-control cheio — Reset descartado");
+    }
+    if agg_net_tx.try_send(AggregatorNetEvent::Reset).is_err() {
+        tracing::warn!("canal metrics-control cheio — Reset descartado");
     }
     if demux_cmd_tx.try_send(DemuxCommand::Reset).is_err() {
         tracing::warn!("canal demux-control cheio — Reset descartado");
@@ -238,6 +246,7 @@ fn main() -> eframe::Result<()> {
         Arc::new(std::sync::RwLock::new(None));
     let selected_audio_pid: Arc<std::sync::RwLock<Option<u16>>> =
         Arc::new(std::sync::RwLock::new(None));
+    let (table_cmd_tx, table_cmd_rx) = crossbeam_channel::bounded::<TableCommand>(32);
 
     // 7. Instancia MetricsAggregator
     let (metrics_agg, snapshot_rx) =
@@ -257,7 +266,7 @@ fn main() -> eframe::Result<()> {
 
     // 10. Instancia TableDispatcher (auto_play: seleciona o primeiro serviço
     // com A/V automaticamente; o usuário pode trocar via menu do VideoPanel).
-    let table_disp = TableDispatcher::new_with_auto_play(
+    let table_disp = TableDispatcher::new_with_auto_play_and_control(
         ch.complete_sections_rx,
         ch.table_events_tx,
         demux_cmd_tx.clone(),
@@ -267,6 +276,7 @@ fn main() -> eframe::Result<()> {
         selected_audio_pid.clone(),
         audio_status.clone(),
         true,
+        Some(table_cmd_rx),
     );
     let table_events_rx = ch.table_events_rx;
 
@@ -679,6 +689,8 @@ fn main() -> eframe::Result<()> {
         let demux_cmd_tx = demux_cmd_tx.clone();
         let pes_cmd_tx = pes_cmd_tx.clone();
         let decode_cmd_tx = decode_cmd_tx.clone();
+        let table_cmd_tx = table_cmd_tx.clone();
+        let agg_net_tx = agg_net_tx.clone();
         let net_raw_tx = sender_guard.net_raw_tx.sender();
         let net_events_tx = ch.net_events_tx.sender();
         let receiver_cfg = ReceiverConfig {
@@ -699,6 +711,8 @@ fn main() -> eframe::Result<()> {
                             reset_stream_routing(
                                 &selected_service,
                                 &selected_audio_pid,
+                                &table_cmd_tx,
+                                &agg_net_tx,
                                 &demux_cmd_tx,
                                 &pes_cmd_tx,
                                 &decode_cmd_tx,
@@ -780,6 +794,8 @@ fn main() -> eframe::Result<()> {
                             reset_stream_routing(
                                 &selected_service,
                                 &selected_audio_pid,
+                                &table_cmd_tx,
+                                &agg_net_tx,
                                 &demux_cmd_tx,
                                 &pes_cmd_tx,
                                 &decode_cmd_tx,

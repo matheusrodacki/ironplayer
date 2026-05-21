@@ -50,6 +50,13 @@ impl MetricsPanel {
         Self::default()
     }
 
+    /// Limpa dados acumulados do stream atual.
+    pub(crate) fn reset_stream_data(&mut self) {
+        self.error_log.clear();
+        self.seen_jitter = 0;
+        self.seen_discontinuity = 0;
+    }
+
     /// Renderiza o painel de métricas completo dentro de `ui`.
     ///
     /// SPEC-UI-005
@@ -390,9 +397,18 @@ mod tests {
     #[test]
     fn spec_ui_005_audio_state_label_maps_variants() {
         assert_eq!(audio_state_label(AudioOperationalState::Idle), "Ocioso");
-        assert_eq!(audio_state_label(AudioOperationalState::Buffering), "Bufferizando");
-        assert_eq!(audio_state_label(AudioOperationalState::Playing), "Reproduzindo");
-        assert_eq!(audio_state_label(AudioOperationalState::Recovering), "Recuperando");
+        assert_eq!(
+            audio_state_label(AudioOperationalState::Buffering),
+            "Bufferizando"
+        );
+        assert_eq!(
+            audio_state_label(AudioOperationalState::Playing),
+            "Reproduzindo"
+        );
+        assert_eq!(
+            audio_state_label(AudioOperationalState::Recovering),
+            "Recuperando"
+        );
         assert_eq!(audio_state_label(AudioOperationalState::Error), "Erro");
     }
 

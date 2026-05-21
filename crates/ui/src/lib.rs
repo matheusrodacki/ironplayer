@@ -70,6 +70,10 @@ pub struct IronPlayerApp {
     video_renderer: Option<VideoRenderer>,
     /// Dimensões do último frame renderizado `(width, height)`.
     video_dims: Option<(u32, u32)>,
+    /// Timestamp do último snapshot usado para alimentar históricos de gráficos.
+    last_metrics_snapshot_timestamp: Option<Instant>,
+    /// Número de eventos de jitter PCR já incorporados ao histórico da UI.
+    seen_pcr_jitter_records: usize,
 }
 
 impl IronPlayerApp {
@@ -122,6 +126,8 @@ impl IronPlayerApp {
             video_frames_rx,
             video_renderer,
             video_dims: None,
+            last_metrics_snapshot_timestamp: None,
+            seen_pcr_jitter_records: 0,
         }
     }
 
@@ -142,31 +148,13 @@ impl IronPlayerApp {
         };
         let snapshot = rx.borrow();
         let now = Instant::now();
-        let cutoff = now - Duration::from_secs(60);
-
-        // Histórico de bitrate total (janela 60 s).
-        self.state
-            .bitrate_history
-            .push_back((now, snapshot.total_bitrate_kbps));
-        while self
-            .state
-            .bitrate_history
-            .front()
-            .is_some_and(|(t, _)| *t < cutoff)
-        {
-            self.state.bitrate_history.pop_front();
-        }
-
-        // Histórico de jitter PCR por PID (janela 60 s).
-        for record in &snapshot.errors.pcr_jitter_events {
-            let history = self.state.pcr_history.entry(record.pid).or_default();
-            history.push_back(record.clone());
-        }
-        for history in self.state.pcr_history.values_mut() {
-            while history.front().is_some_and(|r| r.timestamp < cutoff) {
-                history.pop_front();
-            }
-        }
+        update_metric_histories_if_new_snapshot(
+            &mut self.state,
+            &snapshot,
+            &mut self.last_metrics_snapshot_timestamp,
+            &mut self.seen_pcr_jitter_records,
+            now,
+        );
 
         // Atualiza o snapshot de métricas.
         self.state.metrics = snapshot;
@@ -201,7 +189,23 @@ impl IronPlayerApp {
         };
 
         for event in rx.try_iter().take(512) {
+            if matches!(event, TableEvent::Reset) {
+                self.reset_stream_data();
+                continue;
+            }
             self.state.apply_table_event(event);
+        }
+    }
+
+    fn reset_stream_data(&mut self) {
+        self.state.reset_stream_data();
+        self.metrics_panel.reset_stream_data();
+        self.video_dims = None;
+        self.last_metrics_snapshot_timestamp = None;
+        self.seen_pcr_jitter_records = 0;
+
+        if let Some(rx) = &self.video_frames_rx {
+            while rx.try_recv().is_ok() {}
         }
     }
 
@@ -237,6 +241,57 @@ impl IronPlayerApp {
             }
         }
     }
+}
+
+fn update_metric_histories_if_new_snapshot(
+    state: &mut AppState,
+    snapshot: &ts::metrics::MetricsSnapshot,
+    last_snapshot_timestamp: &mut Option<Instant>,
+    seen_pcr_jitter_records: &mut usize,
+    now: Instant,
+) {
+    if last_snapshot_timestamp.is_some_and(|timestamp| timestamp == snapshot.timestamp) {
+        return;
+    }
+    *last_snapshot_timestamp = Some(snapshot.timestamp);
+
+    let cutoff = now - Duration::from_secs(60);
+
+    state
+        .bitrate_history
+        .push_back((snapshot.timestamp, snapshot.total_bitrate_kbps));
+    while state
+        .bitrate_history
+        .front()
+        .is_some_and(|(timestamp, _)| *timestamp < cutoff)
+    {
+        state.bitrate_history.pop_front();
+    }
+
+    let jitter_events = &snapshot.errors.pcr_jitter_events;
+    if jitter_events.len() < *seen_pcr_jitter_records {
+        *seen_pcr_jitter_records = 0;
+        state.pcr_history.clear();
+    }
+
+    for record in jitter_events.iter().skip(*seen_pcr_jitter_records) {
+        state
+            .pcr_history
+            .entry(record.pid)
+            .or_default()
+            .push_back(record.clone());
+    }
+    *seen_pcr_jitter_records = jitter_events.len();
+
+    for history in state.pcr_history.values_mut() {
+        while history
+            .front()
+            .is_some_and(|record| record.timestamp < cutoff)
+        {
+            history.pop_front();
+        }
+    }
+    state.pcr_history.retain(|_, history| !history.is_empty());
 }
 
 impl eframe::App for IronPlayerApp {
@@ -357,4 +412,97 @@ pub fn run(title: &str) -> eframe::Result {
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ts::metrics::{ErrorSnapshot, MetricsSnapshot, PcrJitterRecord};
+
+    #[test]
+    fn spec_ui_008_metric_histories_ignore_repainted_snapshot() {
+        let base_time = Instant::now();
+        let mut state = AppState::default();
+        let mut last_snapshot_timestamp = None;
+        let mut seen_pcr_jitter_records = 0;
+
+        let first_record = PcrJitterRecord {
+            pid: 0x0111,
+            timestamp: base_time,
+            expected_us: 1_000,
+            measured_us: 1_700,
+        };
+        let first_snapshot = MetricsSnapshot {
+            total_bitrate_kbps: 32_000.0,
+            errors: ErrorSnapshot {
+                pcr_jitter_events: vec![first_record.clone()],
+                ..ErrorSnapshot::default()
+            },
+            timestamp: base_time,
+            ..MetricsSnapshot::default()
+        };
+
+        update_metric_histories_if_new_snapshot(
+            &mut state,
+            &first_snapshot,
+            &mut last_snapshot_timestamp,
+            &mut seen_pcr_jitter_records,
+            base_time,
+        );
+        update_metric_histories_if_new_snapshot(
+            &mut state,
+            &first_snapshot,
+            &mut last_snapshot_timestamp,
+            &mut seen_pcr_jitter_records,
+            base_time + Duration::from_millis(16),
+        );
+
+        assert_eq!(state.bitrate_history.len(), 1);
+        assert_eq!(state.pcr_history[&0x0111].len(), 1);
+        assert_eq!(seen_pcr_jitter_records, 1);
+
+        let second_record = PcrJitterRecord {
+            pid: 0x0111,
+            timestamp: base_time + Duration::from_secs(1),
+            expected_us: 2_000,
+            measured_us: 2_800,
+        };
+        let second_snapshot = MetricsSnapshot {
+            total_bitrate_kbps: 32_500.0,
+            errors: ErrorSnapshot {
+                pcr_jitter_events: vec![first_record, second_record],
+                ..ErrorSnapshot::default()
+            },
+            timestamp: base_time + Duration::from_secs(1),
+            ..MetricsSnapshot::default()
+        };
+
+        update_metric_histories_if_new_snapshot(
+            &mut state,
+            &second_snapshot,
+            &mut last_snapshot_timestamp,
+            &mut seen_pcr_jitter_records,
+            base_time + Duration::from_secs(1),
+        );
+
+        assert_eq!(state.bitrate_history.len(), 2);
+        assert_eq!(state.pcr_history[&0x0111].len(), 2);
+        assert_eq!(seen_pcr_jitter_records, 2);
+
+        let reset_snapshot = MetricsSnapshot {
+            timestamp: base_time + Duration::from_secs(2),
+            ..MetricsSnapshot::default()
+        };
+
+        update_metric_histories_if_new_snapshot(
+            &mut state,
+            &reset_snapshot,
+            &mut last_snapshot_timestamp,
+            &mut seen_pcr_jitter_records,
+            base_time + Duration::from_secs(2),
+        );
+
+        assert!(state.pcr_history.is_empty());
+        assert_eq!(seen_pcr_jitter_records, 0);
+    }
 }

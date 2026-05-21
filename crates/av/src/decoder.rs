@@ -215,9 +215,9 @@ impl FfmpegDecoder {
                             tracing::warn!(%e, pid = pid_raw, "falha ao ler metadata de áudio do codec context");
                             e
                         })?;
-                        let (pts_raw, samples) = av_frame.to_pcm_f32(sr, ch)?;
+                        let (pts_raw, out_sr, out_ch, samples) = av_frame.to_pcm_f32(sr, ch)?;
                         let pts = pts_raw_to_option(pts_raw);
-                        DecodedFrame::Audio(AudioFrame::new(sr, ch, pts, samples))
+                        DecodedFrame::Audio(AudioFrame::new(out_sr, out_ch, pts, samples))
                     };
                     frames.push(decoded);
                     // Limpa o frame para reutilização.

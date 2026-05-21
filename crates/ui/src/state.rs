@@ -11,6 +11,116 @@ use ts::tables::{Bat, EitEvent, Nit, Pat, Pmt, Sdt, Tdt};
 use ts::Pid;
 
 // ---------------------------------------------------------------------------
+// AudioStatusSnapshot
+// ---------------------------------------------------------------------------
+
+/// Estado operacional atual do pipeline de áudio.
+///
+/// SPEC-UI-002
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AudioOperationalState {
+    /// Sem stream de áudio selecionado ou pipeline parado.
+    #[default]
+    Idle,
+    /// A UI já conhece a trilha, mas ainda aguarda frames suficientes.
+    Buffering,
+    /// Reprodução em andamento.
+    Playing,
+    /// Saída de áudio em recuperação após falha do dispositivo.
+    Recovering,
+    /// Pipeline com falha operacional recente.
+    Error,
+}
+
+/// Metadados da trilha de áudio atualmente ativa.
+///
+/// SPEC-UI-002
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioTrackInfo {
+    /// Serviço DVB ao qual a trilha pertence.
+    pub service_id: u16,
+    /// PID elementar do áudio.
+    pub pid: Pid,
+    /// Nome legível do codec atual.
+    pub codec_label: String,
+    /// Idioma ISO-639 quando disponível.
+    pub language: Option<String>,
+}
+
+/// Snapshot dos contadores de erro observados pelo pipeline de áudio.
+///
+/// SPEC-UI-002
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioErrorSnapshot {
+    /// Total de falhas de decode acumuladas.
+    pub decode_errors: u64,
+    /// Total de falhas de saída/recriação do dispositivo.
+    pub output_errors: u64,
+    /// Total de underruns reportados pelo callback WASAPI.
+    pub underruns: u64,
+    /// Total de overruns no jitter buffer.
+    pub overruns: u64,
+    /// Última mensagem de erro relevante observada.
+    pub last_error: Option<String>,
+}
+
+/// Snapshot imutável das métricas e estado operacional do áudio.
+///
+/// SPEC-UI-002
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioStatusSnapshot {
+    /// Volume atual normalizado em `[0.0, 1.0]`.
+    pub volume: f32,
+    /// `true` quando o áudio está mutado.
+    pub muted: bool,
+    /// Trilha de áudio atualmente ativa.
+    pub active_track: Option<AudioTrackInfo>,
+    /// Taxa de amostragem efetiva da saída em Hz.
+    pub sample_rate_hz: Option<u32>,
+    /// Número de canais efetivos da saída.
+    pub channels: Option<u16>,
+    /// Nível atual do jitter buffer em `[0.0, 1.0]`.
+    pub buffer_level: f32,
+    /// Estado operacional do pipeline.
+    pub state: AudioOperationalState,
+    /// Contadores de erro acumulados.
+    pub errors: AudioErrorSnapshot,
+}
+
+impl Default for AudioStatusSnapshot {
+    fn default() -> Self {
+        Self {
+            volume: 1.0,
+            muted: false,
+            active_track: None,
+            sample_rate_hz: None,
+            channels: None,
+            buffer_level: 0.0,
+            state: AudioOperationalState::Idle,
+            errors: AudioErrorSnapshot::default(),
+        }
+    }
+}
+
+impl AudioStatusSnapshot {
+    /// Atualiza o volume normalizado e recalcula o flag de mute.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+        self.muted = self.volume <= f32::EPSILON;
+    }
+
+    /// Limpa os dados transitórios do stream mantendo preferências do usuário.
+    pub fn reset_stream_runtime(&mut self, state: AudioOperationalState) {
+        self.active_track = None;
+        self.sample_rate_hz = None;
+        self.channels = None;
+        self.buffer_level = 0.0;
+        self.state = state;
+        self.errors = AudioErrorSnapshot::default();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TableEvent
 // ---------------------------------------------------------------------------
 
@@ -91,6 +201,7 @@ pub struct TablesSnapshot {
 pub struct AppState {
     pub connection: ConnectionState,
     pub metrics: MetricsSnapshot,
+    pub audio: AudioStatusSnapshot,
     pub tables: TablesSnapshot,
     pub selected_pid: Option<Pid>,
     pub selected_service: Option<u16>,
@@ -163,10 +274,38 @@ mod tests {
     fn spec_ui_002_app_state_default_is_idle() {
         let state = AppState::default();
         assert!(matches!(state.connection, ConnectionState::Idle));
+        assert_eq!(state.audio.volume, 1.0);
+        assert!(!state.audio.muted);
+        assert_eq!(state.audio.state, AudioOperationalState::Idle);
         assert!(state.selected_pid.is_none());
         assert!(state.selected_service.is_none());
         assert!(state.bitrate_history.is_empty());
         assert!(state.pcr_history.is_empty());
+    }
+
+    #[test]
+    fn spec_ui_002_audio_status_snapshot_default_is_idle() {
+        let audio = AudioStatusSnapshot::default();
+        assert_eq!(audio.volume, 1.0);
+        assert!(!audio.muted);
+        assert!(audio.active_track.is_none());
+        assert_eq!(audio.sample_rate_hz, None);
+        assert_eq!(audio.channels, None);
+        assert_eq!(audio.buffer_level, 0.0);
+        assert_eq!(audio.state, AudioOperationalState::Idle);
+        assert_eq!(audio.errors, AudioErrorSnapshot::default());
+    }
+
+    #[test]
+    fn spec_ui_002_audio_status_snapshot_set_volume_updates_mute() {
+        let mut audio = AudioStatusSnapshot::default();
+        audio.set_volume(0.0);
+        assert_eq!(audio.volume, 0.0);
+        assert!(audio.muted);
+
+        audio.set_volume(0.75);
+        assert_eq!(audio.volume, 0.75);
+        assert!(!audio.muted);
     }
 
     #[test]

@@ -2,6 +2,8 @@
 //!
 //! SPEC-AV-002a · SPEC-AV-002c
 
+use ts::tables::{Descriptor, PmtStream};
+
 // ── VideoCodec ────────────────────────────────────────────────────────────────
 
 /// Codec de vídeo suportado pelo decodificador `av`.
@@ -97,6 +99,28 @@ impl AudioCodec {
         }
     }
 
+    /// Resolve um codec de áudio a partir do `stream_type` e dos descriptors
+    /// do ES na PMT.
+    pub fn from_pmt(stream_type: u8, descriptors: &[Descriptor]) -> Option<Self> {
+        Self::from_stream_type(stream_type).or_else(|| {
+            if stream_type != 0x06 {
+                return None;
+            }
+
+            if has_descriptor_tag(descriptors, 0x7A) || has_registration(descriptors, b"EAC3") {
+                return Some(Self::Eac3);
+            }
+            if has_descriptor_tag(descriptors, 0x6A) || has_registration(descriptors, b"AC-3") {
+                return Some(Self::Ac3);
+            }
+            if has_descriptor_tag(descriptors, 0x7C) {
+                return Some(Self::AacLatm);
+            }
+
+            None
+        })
+    }
+
     /// Retorna o nome legível do codec.
     ///
     /// SPEC-AV-002c
@@ -139,6 +163,33 @@ impl MediaCodec {
         }
         None
     }
+
+    /// Tenta derivar um `MediaCodec` a partir de uma entrada de PMT, incluindo
+    /// descriptors DVB/ATSC para streams privados (`stream_type=0x06`).
+    pub fn from_pmt(stream_type: u8, descriptors: &[Descriptor]) -> Option<Self> {
+        if let Some(v) = VideoCodec::from_stream_type(stream_type) {
+            return Some(Self::Video(v));
+        }
+        if let Some(a) = AudioCodec::from_pmt(stream_type, descriptors) {
+            return Some(Self::Audio(a));
+        }
+        None
+    }
+
+    /// Variante conveniente para entradas já parseadas da PMT.
+    pub fn from_pmt_stream(stream: &PmtStream) -> Option<Self> {
+        Self::from_pmt(stream.stream_type, &stream.descriptors)
+    }
+}
+
+fn has_descriptor_tag(descriptors: &[Descriptor], tag: u8) -> bool {
+    descriptors.iter().any(|descriptor| descriptor.tag == tag)
+}
+
+fn has_registration(descriptors: &[Descriptor], format_identifier: &[u8; 4]) -> bool {
+    descriptors
+        .iter()
+        .any(|descriptor| descriptor.is_registration_format(format_identifier))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -146,6 +197,7 @@ impl MediaCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ts::tables::Descriptor;
 
     #[test]
     fn spec_av_002a_video_codec_from_stream_type() {
@@ -187,6 +239,34 @@ mod tests {
     }
 
     #[test]
+    fn spec_av_002a_audio_codec_private_stream_uses_descriptors() {
+        assert_eq!(
+            AudioCodec::from_pmt(0x06, &[Descriptor::new(0x6A, vec![])]),
+            Some(AudioCodec::Ac3)
+        );
+        assert_eq!(
+            AudioCodec::from_pmt(0x06, &[Descriptor::new(0x7A, vec![])]),
+            Some(AudioCodec::Eac3)
+        );
+        assert_eq!(
+            AudioCodec::from_pmt(0x06, &[Descriptor::new(0x7C, vec![0x11, 0x90, 0x00])]),
+            Some(AudioCodec::AacLatm)
+        );
+    }
+
+    #[test]
+    fn spec_av_002a_audio_codec_private_stream_uses_registration_descriptor() {
+        assert_eq!(
+            AudioCodec::from_pmt(0x06, &[Descriptor::new(0x05, b"AC-3".to_vec())]),
+            Some(AudioCodec::Ac3)
+        );
+        assert_eq!(
+            AudioCodec::from_pmt(0x06, &[Descriptor::new(0x05, b"EAC3".to_vec())]),
+            Some(AudioCodec::Eac3)
+        );
+    }
+
+    #[test]
     fn spec_av_002c_media_codec_video_routes() {
         assert_eq!(
             MediaCodec::from_stream_type(0x1B),
@@ -214,5 +294,19 @@ mod tests {
     fn spec_av_002c_media_codec_unsupported_returns_none() {
         assert_eq!(MediaCodec::from_stream_type(0x06), None);
         assert_eq!(MediaCodec::from_stream_type(0xFF), None);
+    }
+
+    #[test]
+    fn spec_av_002c_media_codec_from_pmt_stream_supports_private_audio() {
+        let stream = PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x0120,
+            descriptors: vec![Descriptor::new(0x6A, vec![])],
+        };
+
+        assert_eq!(
+            MediaCodec::from_pmt_stream(&stream),
+            Some(MediaCodec::Audio(AudioCodec::Ac3))
+        );
     }
 }

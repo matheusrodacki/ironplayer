@@ -133,6 +133,24 @@ fn join_with_deadline(handle: std::thread::JoinHandle<()>, deadline: Instant) {
     }
 }
 
+fn refresh_audio_status_from_output(
+    audio_status: &Arc<std::sync::RwLock<ui::AudioStatusSnapshot>>,
+    audio_out: &av::AudioOutput,
+) {
+    if let Ok(mut status) = audio_status.write() {
+        status.sample_rate_hz = Some(audio_out.sample_rate);
+        status.channels = Some(audio_out.channels);
+        status.buffer_level = audio_out.buffer_level();
+        status.errors.underruns = audio_out.underrun_count();
+        status.errors.overruns = audio_out.overrun_count();
+        status.state = if status.buffer_level >= 0.5 {
+            ui::AudioOperationalState::Playing
+        } else {
+            ui::AudioOperationalState::Buffering
+        };
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> eframe::Result<()> {
@@ -182,6 +200,11 @@ fn main() -> eframe::Result<()> {
     // Estado de conexão compartilhado entre cmd-handler e IronPlayerApp
     let conn_state: Arc<std::sync::RwLock<ui::ConnectionState>> =
         Arc::new(std::sync::RwLock::new(ui::ConnectionState::Idle));
+    let audio_status: Arc<std::sync::RwLock<ui::AudioStatusSnapshot>> =
+        Arc::new(std::sync::RwLock::new(ui::AudioStatusSnapshot::default()));
+    if let Ok(mut status) = audio_status.write() {
+        status.set_volume(cfg.player.volume);
+    }
 
     // Handle da conexão de rede atual; compartilhado entre cmd-handler e PipelineGuard
     let current_net_stop: Arc<Mutex<Option<NetStopHandle>>> = Arc::new(Mutex::new(None));
@@ -215,6 +238,7 @@ fn main() -> eframe::Result<()> {
         pes_cmd_tx,
         decode_cmd_tx,
         selected_service.clone(),
+        audio_status.clone(),
         true,
     );
     let table_events_rx = ch.table_events_rx;
@@ -388,6 +412,7 @@ fn main() -> eframe::Result<()> {
         let video_frames_tx = ch.video_frames_tx;
         let video_frames_rx_for_drop = ch.video_frames_rx.clone();
         let audio_frames_tx = ch.audio_frames_tx;
+        let audio_status = audio_status.clone();
         handles.push(
             std::thread::Builder::new()
                 .name("av-decode".into())
@@ -441,6 +466,13 @@ fn main() -> eframe::Result<()> {
                                     }
                                 }
                                 Err(e) => {
+                                    if matches!(packet.codec, av::MediaCodec::Audio(_)) {
+                                        if let Ok(mut status) = audio_status.write() {
+                                            status.errors.decode_errors += 1;
+                                            status.errors.last_error = Some(e.to_string());
+                                            status.state = ui::AudioOperationalState::Error;
+                                        }
+                                    }
                                     let n = decode_err_count.entry(packet.pid).or_insert(0);
                                     *n += 1;
                                     // Loga o primeiro erro e depois a cada 200 ocorrencias
@@ -478,6 +510,7 @@ fn main() -> eframe::Result<()> {
         let audio_frames_rx = ch.audio_frames_rx;
         let jitter_buffer_ms = cfg.player.jitter_buffer_ms as u32;
         let initial_volume = cfg.player.volume;
+        let audio_status = audio_status.clone();
         handles.push(
             std::thread::Builder::new()
                 .name("audio-out".into())
@@ -488,12 +521,21 @@ fn main() -> eframe::Result<()> {
                     loop {
                         if let Some(out) = audio_out.as_mut() {
                             if out.needs_rebuild() {
+                                if let Ok(mut status) = audio_status.write() {
+                                    status.state = ui::AudioOperationalState::Recovering;
+                                }
                                 match out.rebuild_stream() {
                                     Ok(()) => {
                                         rebuild_failures = 0;
+                                        refresh_audio_status_from_output(&audio_status, out);
                                     }
                                     Err(e) => {
                                         rebuild_failures += 1;
+                                        if let Ok(mut status) = audio_status.write() {
+                                            status.errors.output_errors += 1;
+                                            status.errors.last_error = Some(e.to_string());
+                                            status.state = ui::AudioOperationalState::Error;
+                                        }
                                         if rebuild_failures == 1 || rebuild_failures.is_multiple_of(20) {
                                             tracing::warn!(
                                                 %e,
@@ -510,7 +552,12 @@ fn main() -> eframe::Result<()> {
 
                         let frame = match audio_frames_rx.recv_timeout(Duration::from_millis(50)) {
                             Ok(frame) => frame,
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                if let Some(out) = audio_out.as_ref() {
+                                    refresh_audio_status_from_output(&audio_status, out);
+                                }
+                                continue;
+                            }
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         };
 
@@ -529,6 +576,13 @@ fn main() -> eframe::Result<()> {
                                 Ok(out) => {
                                     rebuild_failures = 0;
                                     out.set_volume(initial_volume);
+                                    if let Ok(mut status) = audio_status.write() {
+                                        status.set_volume(initial_volume);
+                                        status.sample_rate_hz = Some(frame.sample_rate);
+                                        status.channels = Some(frame.channels);
+                                        status.buffer_level = 0.0;
+                                        status.state = ui::AudioOperationalState::Buffering;
+                                    }
                                     tracing::info!(
                                         sample_rate = frame.sample_rate,
                                         channels = frame.channels,
@@ -537,6 +591,11 @@ fn main() -> eframe::Result<()> {
                                     audio_out = Some(out);
                                 }
                                 Err(e) => {
+                                    if let Ok(mut status) = audio_status.write() {
+                                        status.errors.output_errors += 1;
+                                        status.errors.last_error = Some(e.to_string());
+                                        status.state = ui::AudioOperationalState::Error;
+                                    }
                                     tracing::error!(
                                         %e,
                                         sample_rate = frame.sample_rate,
@@ -550,7 +609,12 @@ fn main() -> eframe::Result<()> {
 
                         if let Some(ref out) = audio_out {
                             out.push_samples(&frame);
+                            refresh_audio_status_from_output(&audio_status, out);
                         }
+                    }
+
+                    if let Ok(mut status) = audio_status.write() {
+                        status.reset_stream_runtime(ui::AudioOperationalState::Idle);
                     }
 
                     tracing::info!("audio-out: encerrado normalmente");
@@ -575,6 +639,7 @@ fn main() -> eframe::Result<()> {
     // 14. Thread: cmd-handler — processa Connect/Disconnect da UI dinamicamente
     {
         let conn_state = conn_state.clone();
+        let audio_status = audio_status.clone();
         let current_net_stop = current_net_stop.clone();
         let selected_service = selected_service.clone();
         let net_raw_tx = sender_guard.net_raw_tx.sender();
@@ -598,12 +663,20 @@ fn main() -> eframe::Result<()> {
                             match StreamUrl::parse(&url) {
                                 Err(e) => {
                                     tracing::error!(error = %e, url, "URL de stream inválida");
+                                    if let Ok(mut status) = audio_status.write() {
+                                        status.reset_stream_runtime(ui::AudioOperationalState::Error);
+                                        status.errors.last_error = Some(e.to_string());
+                                    }
                                     *conn_state.write().unwrap() = ui::ConnectionState::Error {
                                         url,
                                         reason: e.to_string(),
                                     };
                                 }
                                 Ok(parsed_url) => {
+                                    if let Ok(mut status) = audio_status.write() {
+                                        status.reset_stream_runtime(ui::AudioOperationalState::Buffering);
+                                        status.set_volume(cfg.player.volume);
+                                    }
                                     *conn_state.write().unwrap() =
                                         ui::ConnectionState::Connecting { url: url.clone() };
                                     tracing::info!(url, "conectando...");
@@ -618,6 +691,7 @@ fn main() -> eframe::Result<()> {
                                         receiver_cfg.clone(),
                                     );
                                     let conn_state_t = conn_state.clone();
+                                    let audio_status_t = audio_status.clone();
                                     let url_t = url.clone();
 
                                     std::thread::Builder::new()
@@ -630,12 +704,19 @@ fn main() -> eframe::Result<()> {
                                                 };
                                             match receiver.run(stop_token) {
                                                 Ok(()) => {
+                                                    if let Ok(mut status) = audio_status_t.write() {
+                                                        status.reset_stream_runtime(ui::AudioOperationalState::Idle);
+                                                    }
                                                     *conn_state_t.write().unwrap() =
                                                         ui::ConnectionState::Idle;
                                                     tracing::info!("net-recv encerrado normalmente");
                                                 }
                                                 Err(e) => {
                                                     tracing::error!(error = %e, "net-recv encerrou com erro");
+                                                    if let Ok(mut status) = audio_status_t.write() {
+                                                        status.reset_stream_runtime(ui::AudioOperationalState::Error);
+                                                        status.errors.last_error = Some(e.to_string());
+                                                    }
                                                     *conn_state_t.write().unwrap() =
                                                         ui::ConnectionState::Error {
                                                             url: url_t,
@@ -652,10 +733,20 @@ fn main() -> eframe::Result<()> {
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
                                 h.stop();
                             }
+                            if let Ok(mut status) = audio_status.write() {
+                                status.reset_stream_runtime(ui::AudioOperationalState::Idle);
+                            }
                             *conn_state.write().unwrap() = ui::ConnectionState::Idle;
                             tracing::info!("desconectado pelo usuário");
                         }
                         ui::AppCommand::SelectService { service_id } => {
+                            if let Ok(mut status) = audio_status.write() {
+                                status.sample_rate_hz = None;
+                                status.channels = None;
+                                status.buffer_level = 0.0;
+                                status.state = ui::AudioOperationalState::Buffering;
+                                status.errors.last_error = None;
+                            }
                             *selected_service.write().unwrap() = Some(service_id);
                             tracing::info!(service_id, "serviço selecionado pelo usuário");
                         }
@@ -692,6 +783,7 @@ fn main() -> eframe::Result<()> {
                     cmd_tx,
                     Some(snapshot_rx),
                     Some(conn_state),
+                    Some(audio_status),
                     Some(selected_service),
                     Some(table_events_rx.clone()),
                     Some(video_frames_rx),

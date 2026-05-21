@@ -6,7 +6,10 @@ pub mod panels;
 pub mod state;
 pub mod status_bar;
 
-pub use state::{AppCommand, AppState, ConnectionState, TableEvent, TablesSnapshot};
+pub use state::{
+    AppCommand, AppState, AudioErrorSnapshot, AudioOperationalState, AudioStatusSnapshot,
+    AudioTrackInfo, ConnectionState, TableEvent, TablesSnapshot,
+};
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -51,6 +54,8 @@ pub struct IronPlayerApp {
     snapshot_rx: Option<ts::aggregator::SnapshotReceiver>,
     /// Estado de conexão compartilhado com o command handler do pipeline.
     connection_rx: Option<Arc<RwLock<ConnectionState>>>,
+    /// Snapshot compartilhado de métricas/estado operacional do áudio.
+    audio_status_rx: Option<Arc<RwLock<AudioStatusSnapshot>>>,
     /// Serviço selecionado compartilhado com o command handler do pipeline.
     selected_service_rx: Option<Arc<RwLock<Option<u16>>>>,
     /// Eventos incrementais de tabelas PSI/SI vindos do `TableDispatcher`.
@@ -78,11 +83,13 @@ impl IronPlayerApp {
     /// (D3D11 via wgpu) se disponível, ou modo CPU como fallback.
     ///
     /// SPEC-UI-001 · SPEC-UI-008 · SPEC-AV-003
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         cmd_tx: Sender<AppCommand>,
         snapshot_rx: Option<ts::aggregator::SnapshotReceiver>,
         connection_rx: Option<Arc<RwLock<ConnectionState>>>,
+        audio_status_rx: Option<Arc<RwLock<AudioStatusSnapshot>>>,
         selected_service_rx: Option<Arc<RwLock<Option<u16>>>>,
         table_events_rx: Option<Receiver<TableEvent>>,
         video_frames_rx: Option<Receiver<VideoFrame>>,
@@ -109,6 +116,7 @@ impl IronPlayerApp {
             metrics_panel: MetricsPanel::new(),
             snapshot_rx,
             connection_rx,
+            audio_status_rx,
             selected_service_rx,
             table_events_rx,
             video_frames_rx,
@@ -167,6 +175,12 @@ impl IronPlayerApp {
         if let Some(conn_rx) = &self.connection_rx {
             if let Ok(state) = conn_rx.read() {
                 self.state.connection = state.clone();
+            }
+        }
+
+        if let Some(audio_rx) = &self.audio_status_rx {
+            if let Ok(audio) = audio_rx.read() {
+                self.state.audio = audio.clone();
             }
         }
 
@@ -339,7 +353,7 @@ pub fn run(title: &str) -> eframe::Result {
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(IronPlayerApp::new(
-                cc, cmd_tx, None, None, None, None, None,
+                cc, cmd_tx, None, None, None, None, None, None,
             )))
         }),
     )

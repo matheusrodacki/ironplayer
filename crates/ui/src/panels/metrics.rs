@@ -8,7 +8,7 @@ use crossbeam_channel::Sender;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
-use crate::state::AppState;
+use crate::state::{AppState, AudioOperationalState};
 use crate::AppCommand;
 
 // ---------------------------------------------------------------------------
@@ -60,6 +60,9 @@ impl MetricsPanel {
         ui.heading("Métricas");
         ui.add_space(4.0);
 
+        self.show_audio_summary(ui, state);
+        ui.add_space(8.0);
+
         // ── Gráfico de bitrate (60 s) ──────────────────────────────────────
         self.show_bitrate_plot(ui, state);
         ui.add_space(6.0);
@@ -108,6 +111,101 @@ impl MetricsPanel {
             self.push_error(entry);
         }
         self.seen_discontinuity = new_disc;
+    }
+
+    fn show_audio_summary(&self, ui: &mut egui::Ui, state: &AppState) {
+        let audio = &state.audio;
+        ui.label("Áudio");
+        egui::Grid::new("audio_summary_grid")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Estado");
+                ui.label(audio_state_label(audio.state));
+                ui.end_row();
+
+                ui.label("Volume");
+                ui.label(if audio.muted {
+                    "Mudo".to_string()
+                } else {
+                    format!("{:.0}%", audio.volume * 100.0)
+                });
+                ui.end_row();
+
+                ui.label("Trilha ativa");
+                ui.label(
+                    audio
+                        .active_track
+                        .as_ref()
+                        .map(|track| track.codec_label.clone())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.end_row();
+
+                ui.label("PID");
+                ui.label(
+                    audio
+                        .active_track
+                        .as_ref()
+                        .map(|track| format!("{} / 0x{:04X}", track.pid, track.pid))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.end_row();
+
+                ui.label("Idioma");
+                ui.label(
+                    audio
+                        .active_track
+                        .as_ref()
+                        .and_then(|track| track.language.clone())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.end_row();
+
+                ui.label("Sample rate");
+                ui.label(
+                    audio
+                        .sample_rate_hz
+                        .map(|sample_rate_hz| format!("{:.1} kHz", sample_rate_hz as f32 / 1000.0))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.end_row();
+
+                ui.label("Canais");
+                ui.label(
+                    audio
+                        .channels
+                        .map(|channels| channels.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.end_row();
+
+                ui.label("Erros");
+                ui.label(format!(
+                    "decode={} saída={} underrun={} overrun={}",
+                    audio.errors.decode_errors,
+                    audio.errors.output_errors,
+                    audio.errors.underruns,
+                    audio.errors.overruns,
+                ));
+                ui.end_row();
+
+                ui.label("Último erro");
+                ui.label(
+                    audio
+                        .errors
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.end_row();
+            });
+
+        ui.add(
+            egui::ProgressBar::new(audio.buffer_level)
+                .text(format!("Buffer {:.0}%", audio.buffer_level * 100.0))
+                .show_percentage(),
+        );
     }
 
     /// Adiciona uma entrada ao log, descartando a mais antiga quando cheio.
@@ -271,6 +369,16 @@ impl MetricsPanel {
     }
 }
 
+fn audio_state_label(state: AudioOperationalState) -> &'static str {
+    match state {
+        AudioOperationalState::Idle => "Ocioso",
+        AudioOperationalState::Buffering => "Bufferizando",
+        AudioOperationalState::Playing => "Reproduzindo",
+        AudioOperationalState::Recovering => "Recuperando",
+        AudioOperationalState::Error => "Erro",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Testes
 // ---------------------------------------------------------------------------
@@ -278,6 +386,15 @@ impl MetricsPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spec_ui_005_audio_state_label_maps_variants() {
+        assert_eq!(audio_state_label(AudioOperationalState::Idle), "Ocioso");
+        assert_eq!(audio_state_label(AudioOperationalState::Buffering), "Bufferizando");
+        assert_eq!(audio_state_label(AudioOperationalState::Playing), "Reproduzindo");
+        assert_eq!(audio_state_label(AudioOperationalState::Recovering), "Recuperando");
+        assert_eq!(audio_state_label(AudioOperationalState::Error), "Erro");
+    }
 
     /// SPEC-UI-005 — push_error descarta a entrada mais antiga ao atingir MAX_ERROR_LOG.
     #[test]

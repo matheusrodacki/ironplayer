@@ -25,6 +25,7 @@ pub fn stream_type_label(st: u8) -> &'static str {
         0x1B => "H.264 / AVC Video",
         0x24 => "H.265 / HEVC Video",
         0x81 => "AC-3 Audio (ATSC)",
+        0x87 => "E-AC-3 Audio (ATSC)",
         0x86 => "SCTE-35 Splice",
         _ => "Unknown",
     }
@@ -46,11 +47,49 @@ pub struct PmtStream {
 }
 
 impl PmtStream {
+    fn has_descriptor_tag(&self, tag: u8) -> bool {
+        self.descriptors
+            .iter()
+            .any(|descriptor| descriptor.tag == tag)
+    }
+
+    fn has_registration(&self, format_identifier: &[u8; 4]) -> bool {
+        self.descriptors
+            .iter()
+            .any(|descriptor| descriptor.is_registration_format(format_identifier))
+    }
+
+    /// Retorna `true` quando a entrada representa um stream de áudio.
+    pub fn is_audio(&self) -> bool {
+        matches!(self.stream_type, 0x03 | 0x04 | 0x0F | 0x11 | 0x81 | 0x87)
+            || (self.stream_type == 0x06
+                && (self.has_descriptor_tag(0x6A)
+                    || self.has_descriptor_tag(0x7A)
+                    || self.has_descriptor_tag(0x7C)
+                    || self.has_registration(b"AC-3")
+                    || self.has_registration(b"EAC3")))
+    }
+
+    /// Retorna `true` quando a entrada continua sendo um stream privado não
+    /// identificado como áudio.
+    pub fn is_private_data(&self) -> bool {
+        self.stream_type == 0x06 && !self.is_audio()
+    }
+
     /// Label legível para o `stream_type` desta entrada.
     ///
     /// SPEC-TABLE-002b
     pub fn label(&self) -> &'static str {
-        stream_type_label(self.stream_type)
+        match self.stream_type {
+            0x06 if self.has_descriptor_tag(0x7A) || self.has_registration(b"EAC3") => {
+                "E-AC-3 Audio (DVB)"
+            }
+            0x06 if self.has_descriptor_tag(0x6A) || self.has_registration(b"AC-3") => {
+                "AC-3 Audio (DVB)"
+            }
+            0x06 if self.has_descriptor_tag(0x7C) => "AAC/HE-AAC Audio",
+            _ => stream_type_label(self.stream_type),
+        }
     }
 }
 
@@ -241,6 +280,7 @@ mod tests {
         assert_eq!(aac.stream_type, 0x0F);
         assert_eq!(aac.elementary_pid, 0x0120);
         assert_eq!(aac.label(), "AAC Audio (ADTS)");
+        assert!(aac.is_audio());
     }
 
     /// Verifica que `stream_type_label` retorna strings corretas para os
@@ -260,6 +300,7 @@ mod tests {
             (0x1B, "H.264 / AVC Video"),
             (0x24, "H.265 / HEVC Video"),
             (0x81, "AC-3 Audio (ATSC)"),
+            (0x87, "E-AC-3 Audio (ATSC)"),
             (0x86, "SCTE-35 Splice"),
         ];
 
@@ -330,5 +371,54 @@ mod tests {
         assert_eq!(pmt.program_descriptors[0].tag, 0x09);
         assert_eq!(pmt.streams.len(), 1);
         assert_eq!(pmt.streams[0].stream_type, 0x1B);
+    }
+
+    #[test]
+    fn spec_table_002_private_audio_descriptors_update_labels_and_classification() {
+        let ac3 = PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x0120,
+            descriptors: vec![Descriptor::new(0x6A, vec![])],
+        };
+        assert_eq!(ac3.label(), "AC-3 Audio (DVB)");
+        assert!(ac3.is_audio());
+        assert!(!ac3.is_private_data());
+
+        let eac3 = PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x0121,
+            descriptors: vec![Descriptor::new(0x7A, vec![])],
+        };
+        assert_eq!(eac3.label(), "E-AC-3 Audio (DVB)");
+        assert!(eac3.is_audio());
+
+        let aac = PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x0122,
+            descriptors: vec![Descriptor::new(0x7C, vec![0x11, 0x90, 0x00])],
+        };
+        assert_eq!(aac.label(), "AAC/HE-AAC Audio");
+        assert!(aac.is_audio());
+
+        let private = PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x0123,
+            descriptors: vec![],
+        };
+        assert_eq!(private.label(), "Private Data");
+        assert!(!private.is_audio());
+        assert!(private.is_private_data());
+    }
+
+    #[test]
+    fn spec_table_002_private_registration_descriptor_updates_label() {
+        let ac3 = PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x0120,
+            descriptors: vec![Descriptor::new(0x05, b"AC-3".to_vec())],
+        };
+
+        assert_eq!(ac3.label(), "AC-3 Audio (DVB)");
+        assert!(ac3.is_audio());
     }
 }

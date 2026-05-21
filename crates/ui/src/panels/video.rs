@@ -4,6 +4,7 @@
 
 use crossbeam_channel::Sender;
 use eframe::egui;
+use ts::tables::PmtStream;
 
 use crate::state::{AppCommand, ConnectionState};
 use crate::AppState;
@@ -26,13 +27,26 @@ fn service_name(state: &AppState, service_id: u16) -> String {
 }
 
 /// Retorna `true` se o `stream_type` corresponde a um stream de áudio.
-fn is_audio_stream(stream_type: u8) -> bool {
-    matches!(stream_type, 0x03 | 0x04 | 0x0F | 0x11 | 0x81)
+fn is_audio_stream(stream: &PmtStream) -> bool {
+    stream.is_audio()
 }
 
 /// Retorna `true` se o `stream_type` corresponde a um stream de legendas/dados.
-fn is_subtitle_stream(stream_type: u8) -> bool {
-    stream_type == 0x06
+fn is_subtitle_stream(stream: &PmtStream) -> bool {
+    stream.is_private_data()
+}
+
+fn audio_language(stream: &PmtStream) -> Option<String> {
+    stream
+        .descriptors
+        .iter()
+        .find(|descriptor| descriptor.tag == 0x0A && descriptor.data.len() >= 3)
+        .map(|descriptor| {
+            String::from_utf8_lossy(&descriptor.data[..3])
+                .trim()
+                .to_lowercase()
+        })
+        .filter(|language| !language.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -166,14 +180,31 @@ impl VideoPanel {
 
         // ── Submenu: Áudio ────────────────────────────────────────────────
         ui.menu_button("Áudio", |ui| {
-            let audio_streams: Vec<(u16, &'static str)> = state
+            let audio_streams: Vec<String> = state
                 .selected_service
                 .and_then(|svc_id| state.tables.pmts.get(&svc_id))
                 .map(|pmt| {
                     pmt.streams
                         .iter()
-                        .filter(|s| is_audio_stream(s.stream_type))
-                        .map(|s| (s.elementary_pid, s.label()))
+                        .filter(|s| is_audio_stream(s))
+                        .map(|stream| {
+                            let active = state
+                                .audio
+                                .active_track
+                                .as_ref()
+                                .is_some_and(|track| track.pid == stream.elementary_pid);
+                            let marker = if active { "✓" } else { " " };
+                            let language = audio_language(stream)
+                                .map(|language| format!(" [{language}]"))
+                                .unwrap_or_default();
+                            format!(
+                                "{marker} {} / 0x{:04X}  {}{}",
+                                stream.elementary_pid,
+                                stream.elementary_pid,
+                                stream.label(),
+                                language,
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -181,8 +212,8 @@ impl VideoPanel {
             if audio_streams.is_empty() {
                 ui.add_enabled(false, egui::Button::new("(nenhum)"));
             } else {
-                for (pid, label) in audio_streams {
-                    ui.add_enabled(false, egui::Button::new(format!("0x{pid:04X}  {label}")));
+                for label in audio_streams {
+                    ui.add_enabled(false, egui::Button::new(label));
                 }
             }
         });
@@ -195,7 +226,7 @@ impl VideoPanel {
                 .map(|pmt| {
                     pmt.streams
                         .iter()
-                        .filter(|s| is_subtitle_stream(s.stream_type))
+                        .filter(|s| is_subtitle_stream(s))
                         .map(|s| s.elementary_pid)
                         .collect()
                 })
@@ -219,6 +250,7 @@ impl VideoPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ts::tables::Descriptor;
     use ts::tables::{Pat, PatProgram, Sdt, SdtService};
 
     #[test]
@@ -310,21 +342,66 @@ mod tests {
     #[test]
     fn spec_ui_001_is_audio_stream_types() {
         // Tipos de stream de áudio conhecidos.
-        assert!(is_audio_stream(0x03));
-        assert!(is_audio_stream(0x04));
-        assert!(is_audio_stream(0x0F));
-        assert!(is_audio_stream(0x11));
-        assert!(is_audio_stream(0x81));
+        assert!(is_audio_stream(&PmtStream {
+            stream_type: 0x03,
+            elementary_pid: 0x0101,
+            descriptors: vec![],
+        }));
+        assert!(is_audio_stream(&PmtStream {
+            stream_type: 0x04,
+            elementary_pid: 0x0102,
+            descriptors: vec![],
+        }));
+        assert!(is_audio_stream(&PmtStream {
+            stream_type: 0x0F,
+            elementary_pid: 0x0103,
+            descriptors: vec![],
+        }));
+        assert!(is_audio_stream(&PmtStream {
+            stream_type: 0x11,
+            elementary_pid: 0x0104,
+            descriptors: vec![],
+        }));
+        assert!(is_audio_stream(&PmtStream {
+            stream_type: 0x81,
+            elementary_pid: 0x0105,
+            descriptors: vec![],
+        }));
+        assert!(is_audio_stream(&PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x0106,
+            descriptors: vec![Descriptor::new(0x6A, vec![])],
+        }));
         // Vídeo não é áudio.
-        assert!(!is_audio_stream(0x1B));
-        assert!(!is_audio_stream(0x24));
+        assert!(!is_audio_stream(&PmtStream {
+            stream_type: 0x1B,
+            elementary_pid: 0x0110,
+            descriptors: vec![],
+        }));
+        assert!(!is_audio_stream(&PmtStream {
+            stream_type: 0x24,
+            elementary_pid: 0x0111,
+            descriptors: vec![],
+        }));
     }
 
     #[test]
     fn spec_ui_001_is_subtitle_stream_type() {
-        assert!(is_subtitle_stream(0x06));
-        assert!(!is_subtitle_stream(0x0F));
-        assert!(!is_subtitle_stream(0x1B));
+        assert!(is_subtitle_stream(&PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x0120,
+            descriptors: vec![],
+        }));
+        assert!(!is_subtitle_stream(&PmtStream {
+            stream_type: 0x0F,
+            elementary_pid: 0x0121,
+            descriptors: vec![],
+        }));
+        assert!(!is_subtitle_stream(&PmtStream {
+            stream_type: 0x06,
+            elementary_pid: 0x0122,
+            descriptors: vec![Descriptor::new(0x6A, vec![])],
+        }));
     }
 
     #[test]
@@ -389,5 +466,16 @@ mod tests {
             format!("    {}", "Canal 2")
         };
         assert!(label2.starts_with("    "));
+    }
+
+    #[test]
+    fn spec_ui_001_audio_language_reads_iso639_descriptor() {
+        let stream = PmtStream {
+            stream_type: 0x0F,
+            elementary_pid: 0x0120,
+            descriptors: vec![Descriptor::new(0x0A, b"por\x00".to_vec())],
+        };
+
+        assert_eq!(audio_language(&stream), Some("por".to_string()));
     }
 }

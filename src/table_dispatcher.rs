@@ -9,9 +9,9 @@ use av::MediaCodec;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 use tracing::{trace, warn};
-use ts::tables::{Bat, Eit, Nit, Pat, Pmt, Sdt, Tdt};
+use ts::tables::{Bat, Descriptor, Eit, Nit, Pat, Pmt, Sdt, Tdt};
 use ts::{CompleteSection, Pid};
-use ui::TableEvent;
+use ui::{AudioOperationalState, AudioStatusSnapshot, AudioTrackInfo, TableEvent};
 
 use crate::channels::BoundedSender;
 
@@ -75,6 +75,8 @@ pub struct TableDispatcher {
     active_av_pids: HashSet<Pid>,
     /// Serviço selecionado, compartilhado com o cmd-handler.
     selected_service: Arc<RwLock<Option<u16>>>,
+    /// Snapshot compartilhado de telemetria e estado operacional do áudio.
+    audio_status: Arc<RwLock<AudioStatusSnapshot>>,
     /// Última leitura do serviço selecionado (para detectar trocas).
     last_selected_service: Option<u16>,
     /// Seleciona automaticamente o primeiro serviço com A/V válidos se ainda
@@ -96,11 +98,22 @@ impl TableDispatcher {
         pes_tx: Sender<PesCommand>,
         decode_tx: Sender<DecodeCommand>,
         selected_service: Arc<RwLock<Option<u16>>>,
+        audio_status: Arc<RwLock<AudioStatusSnapshot>>,
     ) -> Self {
-        Self::new_with_auto_play(rx, tx, demux_tx, pes_tx, decode_tx, selected_service, false)
+        Self::new_with_auto_play(
+            rx,
+            tx,
+            demux_tx,
+            pes_tx,
+            decode_tx,
+            selected_service,
+            audio_status,
+            false,
+        )
     }
 
     /// Cria um novo `TableDispatcher` com controle explícito do auto-play.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_auto_play(
         rx: Receiver<CompleteSection>,
         tx: BoundedSender<TableEvent>,
@@ -108,6 +121,7 @@ impl TableDispatcher {
         pes_tx: Sender<PesCommand>,
         decode_tx: Sender<DecodeCommand>,
         selected_service: Arc<RwLock<Option<u16>>>,
+        audio_status: Arc<RwLock<AudioStatusSnapshot>>,
         auto_play: bool,
     ) -> Self {
         Self {
@@ -123,6 +137,7 @@ impl TableDispatcher {
             pmt_cache: HashMap::new(),
             active_av_pids: HashSet::new(),
             selected_service,
+            audio_status,
             last_selected_service: None,
             auto_play,
             auto_play_triggered: false,
@@ -273,17 +288,10 @@ impl TableDispatcher {
                         selected.is_none() || selected == Some(pmt.program_number);
 
                     if should_register {
-                        for stream in &pmt.streams {
-                            if let Some(codec) = MediaCodec::from_stream_type(stream.stream_type) {
-                                self.active_av_pids.insert(stream.elementary_pid);
-                                self.send_demux_command(DemuxCommand::RegisterAvPid(
-                                    stream.elementary_pid,
-                                ));
-                                self.send_pes_command(PesCommand::RegisterPid {
-                                    pid: stream.elementary_pid,
-                                    codec,
-                                });
-                            }
+                        for (pid, codec) in self.registerable_streams(&pmt) {
+                            self.active_av_pids.insert(pid);
+                            self.send_demux_command(DemuxCommand::RegisterAvPid(pid));
+                            self.send_pes_command(PesCommand::RegisterPid { pid, codec });
                         }
                     }
                 }
@@ -293,7 +301,7 @@ impl TableDispatcher {
                     let has_av = pmt
                         .streams
                         .iter()
-                        .any(|s| MediaCodec::from_stream_type(s.stream_type).is_some());
+                        .any(|s| MediaCodec::from_pmt_stream(s).is_some());
                     if has_av {
                         let current_selected =
                             self.selected_service.read().map(|g| *g).unwrap_or(None);
@@ -311,6 +319,8 @@ impl TableDispatcher {
                         self.auto_play_triggered = true;
                     }
                 }
+
+                self.sync_active_audio_track();
 
                 self.tx.try_send(TableEvent::Pmt(pmt));
             }
@@ -348,16 +358,56 @@ impl TableDispatcher {
         // Registra PIDs do novo serviço (se a PMT já foi recebida).
         if let Some(service_id) = new_service {
             if let Some(pmt) = self.pmt_cache.get(&service_id).cloned() {
-                for stream in &pmt.streams {
-                    if let Some(codec) = MediaCodec::from_stream_type(stream.stream_type) {
-                        self.active_av_pids.insert(stream.elementary_pid);
-                        self.send_demux_command(DemuxCommand::RegisterAvPid(stream.elementary_pid));
-                        self.send_pes_command(PesCommand::RegisterPid {
-                            pid: stream.elementary_pid,
-                            codec,
-                        });
-                    }
+                for (pid, codec) in self.registerable_streams(&pmt) {
+                    self.active_av_pids.insert(pid);
+                    self.send_demux_command(DemuxCommand::RegisterAvPid(pid));
+                    self.send_pes_command(PesCommand::RegisterPid { pid, codec });
                 }
+            }
+        }
+
+        self.sync_active_audio_track();
+    }
+
+    fn registerable_streams(&self, pmt: &Pmt) -> Vec<(Pid, MediaCodec)> {
+        let mut registerable = Vec::new();
+        let mut selected_audio_pid = None;
+
+        for stream in &pmt.streams {
+            let Some(codec) = MediaCodec::from_pmt_stream(stream) else {
+                continue;
+            };
+
+            match codec {
+                MediaCodec::Video(_) => registerable.push((stream.elementary_pid, codec)),
+                MediaCodec::Audio(_) if selected_audio_pid.is_none() => {
+                    selected_audio_pid = Some(stream.elementary_pid);
+                    registerable.push((stream.elementary_pid, codec));
+                }
+                MediaCodec::Audio(_) => {}
+            }
+        }
+
+        registerable
+    }
+
+    fn sync_active_audio_track(&self) {
+        let selected_service = self.selected_service.read().map(|g| *g).unwrap_or(None);
+        let active_track = selected_service
+            .and_then(|service_id| self.pmt_cache.get(&service_id))
+            .and_then(active_audio_track_from_pmt);
+
+        if let Ok(mut audio_status) = self.audio_status.write() {
+            audio_status.active_track = active_track;
+            if audio_status.active_track.is_none() {
+                audio_status.sample_rate_hz = None;
+                audio_status.channels = None;
+                audio_status.buffer_level = 0.0;
+                if !matches!(audio_status.state, AudioOperationalState::Recovering) {
+                    audio_status.state = AudioOperationalState::Idle;
+                }
+            } else if matches!(audio_status.state, AudioOperationalState::Idle) {
+                audio_status.state = AudioOperationalState::Buffering;
             }
         }
     }
@@ -444,6 +494,34 @@ impl TableDispatcher {
         self.last_sections.insert(key, section.data.clone());
         false
     }
+}
+
+fn active_audio_track_from_pmt(pmt: &Pmt) -> Option<AudioTrackInfo> {
+    pmt.streams.iter().find_map(|stream| {
+        let codec = MediaCodec::from_pmt_stream(stream)?;
+        let MediaCodec::Audio(audio_codec) = codec else {
+            return None;
+        };
+
+        Some(AudioTrackInfo {
+            service_id: pmt.program_number,
+            pid: stream.elementary_pid,
+            codec_label: audio_codec.name().to_string(),
+            language: audio_language(&stream.descriptors),
+        })
+    })
+}
+
+fn audio_language(descriptors: &[Descriptor]) -> Option<String> {
+    descriptors
+        .iter()
+        .find(|descriptor| descriptor.tag == 0x0A && descriptor.data.len() >= 3)
+        .map(|descriptor| {
+            String::from_utf8_lossy(&descriptor.data[..3])
+                .trim()
+                .to_lowercase()
+        })
+        .filter(|language| !language.is_empty())
 }
 
 fn section_body(section: &CompleteSection) -> Option<&[u8]> {
@@ -561,6 +639,44 @@ mod tests {
         }
     }
 
+    fn make_pmt_section_with_streams(
+        pmt_pid: u16,
+        program_number: u16,
+        version: u8,
+        pcr_pid: u16,
+        streams: &[(u8, u16, &[u8])],
+    ) -> CompleteSection {
+        let version_byte = ((version & 0x1F) << 1) | 0x01;
+        let mut body: Vec<u8> = vec![
+            (program_number >> 8) as u8,
+            program_number as u8,
+            version_byte,
+            0x00,
+            0x00,
+            0xE0 | ((pcr_pid >> 8) as u8 & 0x1F),
+            pcr_pid as u8,
+            0xF0,
+            0x00,
+        ];
+
+        for (stream_type, elementary_pid, descriptors) in streams {
+            body.push(*stream_type);
+            body.push(0xE0 | ((*elementary_pid >> 8) as u8 & 0x1F));
+            body.push(*elementary_pid as u8);
+            body.push(0xF0 | (((descriptors.len() as u16) >> 8) as u8 & 0x0F));
+            body.push((descriptors.len() as u16 & 0xFF) as u8);
+            body.extend_from_slice(descriptors);
+        }
+
+        let mut data = vec![0x02u8, 0x80, (body.len() + 4) as u8];
+        data.extend_from_slice(&body);
+        CompleteSection {
+            pid: pmt_pid,
+            table_id: 0x02,
+            data: Bytes::from(data),
+        }
+    }
+
     fn make_dispatcher() -> (
         TableDispatcher,
         crossbeam_channel::Sender<CompleteSection>,
@@ -568,6 +684,7 @@ mod tests {
         crossbeam_channel::Receiver<DemuxCommand>,
         crossbeam_channel::Receiver<PesCommand>,
         crossbeam_channel::Receiver<DecodeCommand>,
+        Arc<RwLock<AudioStatusSnapshot>>,
     ) {
         let (sections_tx, sections_rx) = bounded(64);
         let (table_events_tx, table_events_rx) = bounded(64);
@@ -576,6 +693,7 @@ mod tests {
         let (decode_cmd_tx, decode_cmd_rx) = bounded(64);
         let bounded_tx = BoundedSender::new(table_events_tx, "test_table_events");
         let selected_service = Arc::new(RwLock::new(None));
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
         let dispatcher = TableDispatcher::new(
             sections_rx,
             bounded_tx,
@@ -583,6 +701,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            Arc::clone(&audio_status),
         );
         (
             dispatcher,
@@ -591,13 +710,15 @@ mod tests {
             demux_cmd_rx,
             pes_cmd_rx,
             decode_cmd_rx,
+            audio_status,
         )
     }
 
     /// SPEC-TABLE-001d: primeira PAT registra PMT PID e armazena versão.
     #[test]
     fn spec_table_001d_first_pat_registers_pmt_pid() {
-        let (mut dispatcher, _tx, _events_rx, demux_rx, _pes_rx, _decode_rx) = make_dispatcher();
+        let (mut dispatcher, _tx, _events_rx, demux_rx, _pes_rx, _decode_rx, _audio_status) =
+            make_dispatcher();
         let pat = make_pat_section(0x0001, 1, &[(1, 0x100)]);
         dispatcher.process_section(pat);
         let cmd = demux_rx.try_recv().expect("deve ter RegisterPmtPid");
@@ -609,7 +730,8 @@ mod tests {
     /// SPEC-TABLE-001d: mesma versão PAT não re-registra PIDs (dedup ativo).
     #[test]
     fn spec_table_001d_same_pat_version_is_deduped() {
-        let (mut dispatcher, _tx, _events_rx, demux_rx, _pes_rx, _decode_rx) = make_dispatcher();
+        let (mut dispatcher, _tx, _events_rx, demux_rx, _pes_rx, _decode_rx, _audio_status) =
+            make_dispatcher();
         let pat = make_pat_section(0x0001, 1, &[(1, 0x100)]);
         dispatcher.process_section(pat.clone());
         let _ = demux_rx.try_recv(); // consome o primeiro RegisterPmtPid
@@ -624,7 +746,8 @@ mod tests {
     /// SPEC-TABLE-001d: mudança de versão PAT invalida cache de PMTs e re-registra PIDs.
     #[test]
     fn spec_table_001d_pat_version_change_invalidates_pmt_cache() {
-        let (mut dispatcher, _tx, _events_rx, demux_rx, _pes_rx, _decode_rx) = make_dispatcher();
+        let (mut dispatcher, _tx, _events_rx, demux_rx, _pes_rx, _decode_rx, _audio_status) =
+            make_dispatcher();
 
         // Processa PAT versão 1 com PMT PID 0x100
         let pat_v1 = make_pat_section(0x0001, 1, &[(1, 0x100)]);
@@ -666,7 +789,8 @@ mod tests {
     /// SPEC-TABLE-001d: mudança de versão PMT re-registra streams A/V.
     #[test]
     fn spec_table_001d_pmt_version_change_reregisters_av_pids() {
-        let (mut dispatcher, _tx, _events_rx, demux_rx, pes_rx, _decode_rx) = make_dispatcher();
+        let (mut dispatcher, _tx, _events_rx, demux_rx, pes_rx, _decode_rx, _audio_status) =
+            make_dispatcher();
 
         // PAT
         let pat = make_pat_section(0x0001, 1, &[(1, 0x100)]);
@@ -698,6 +822,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spec_table_private_audio_descriptor_registers_audio_pid() {
+        let (mut dispatcher, _tx, _events_rx, demux_rx, pes_rx, _decode_rx, _audio_status) =
+            make_dispatcher();
+
+        dispatcher.process_section(make_pat_section(0x0001, 1, &[(1, 0x100)]));
+        let _ = demux_rx.try_recv();
+
+        let pmt =
+            make_pmt_section_with_streams(0x100, 1, 0, 0x0110, &[(0x06, 0x0120, &[0x6A, 0x00])]);
+        dispatcher.process_section(pmt);
+
+        assert_eq!(
+            demux_rx.try_recv().unwrap(),
+            DemuxCommand::RegisterAvPid(0x0120)
+        );
+        assert_eq!(
+            pes_rx.try_recv().unwrap(),
+            PesCommand::RegisterPid {
+                pid: 0x0120,
+                codec: MediaCodec::Audio(av::AudioCodec::Ac3),
+            }
+        );
+    }
+
     /// Troca de serviço desregistra PIDs do serviço anterior e registra os do novo.
     #[test]
     fn spec_table_service_change_reroutes_av_pids() {
@@ -709,6 +858,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_service_change");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_clone = Arc::clone(&selected_service);
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new(
             sections_rx,
@@ -717,6 +867,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            audio_status,
         );
 
         // Envia PAT com dois programas: 1 → PID 0x100, 2 → PID 0x200
@@ -795,6 +946,7 @@ mod tests {
         let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded(64);
         let bounded_tx = BoundedSender::new(table_events_tx, "test_pid_isolation");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(Some(1)));
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new(
             sections_rx,
@@ -803,6 +955,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            audio_status,
         );
         // Sem troca pendente (last_selected_service = Some(1))
         dispatcher.last_selected_service = Some(1);
@@ -860,6 +1013,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_switch_reset");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_ctrl = Arc::clone(&selected_service);
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new(
             sections_rx,
@@ -868,6 +1022,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            audio_status,
         );
 
         // Bootstrap: PAT + ambas as PMTs sem serviço selecionado → todos os PIDs registrados
@@ -930,6 +1085,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_auto_play");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_read = Arc::clone(&selected_service);
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new_with_auto_play(
             sections_rx,
@@ -938,6 +1094,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            audio_status,
             true,
         );
 
@@ -982,6 +1139,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_auto_play_manual");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_ctrl = Arc::clone(&selected_service);
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new_with_auto_play(
             sections_rx,
@@ -990,6 +1148,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            audio_status,
             true,
         );
 
@@ -1033,6 +1192,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_no_deadlock");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_ctrl = Arc::clone(&selected_service);
+        let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let dispatcher = TableDispatcher::new_with_auto_play(
             sections_rx,
@@ -1041,6 +1201,7 @@ mod tests {
             pes_cmd_tx,
             decode_cmd_tx,
             selected_service,
+            audio_status,
             false,
         );
 
@@ -1078,10 +1239,9 @@ mod tests {
             "dispatcher.run() deve encerrar sem deadlock em <= 1s ao fechar o canal"
         );
     }
-}
 
-    /// Integration: codecs obrigat├│rios continuam registrando v├¡deo, mant├¬m o
-    /// parse de PMT e atualizam o snapshot de ├íudio ao selecionar um servi├ºo.
+    /// Integration: codecs obrigatórios continuam registrando vídeo, mantêm o
+    /// parse de PMT e atualizam o snapshot de áudio ao selecionar um serviço.
     #[test]
     fn spec_integration_mandatory_audio_codecs_keep_video_pid_and_ui_snapshot() {
         let (_sections_tx, sections_rx) = crossbeam_channel::bounded(64);
@@ -1160,7 +1320,7 @@ mod tests {
         assert_eq!(
             pmt_events,
             vec![1, 2, 3, 4],
-            "PMTs v├ílidas devem continuar chegando ├á UI sem regress├úo de parse"
+            "PMTs válidas devem continuar chegando à UI sem regressão de parse"
         );
         for pid in [0x101, 0x120, 0x201, 0x220, 0x301, 0x320, 0x401, 0x420] {
             assert!(
@@ -1178,7 +1338,7 @@ mod tests {
                     }
                 )
             }),
-            "MP2 obrigat├│rio deve ser identificado"
+            "MP2 obrigatório deve ser identificado"
         );
         assert!(
             pes_cmds.iter().any(|command| {
@@ -1190,7 +1350,7 @@ mod tests {
                     }
                 )
             }),
-            "AAC ADTS obrigat├│rio deve ser identificado"
+            "AAC ADTS obrigatório deve ser identificado"
         );
         assert!(
             pes_cmds.iter().any(|command| {
@@ -1202,7 +1362,7 @@ mod tests {
                     }
                 )
             }),
-            "AAC LATM/HE-AAC obrigat├│rio deve ser identificado"
+            "AAC LATM/HE-AAC obrigatório deve ser identificado"
         );
         assert!(
             pes_cmds.iter().any(|command| {
@@ -1214,11 +1374,11 @@ mod tests {
                     }
                 )
             }),
-            "AC-3 obrigat├│rio deve ser identificado"
+            "AC-3 obrigatório deve ser identificado"
         );
         assert!(
             decode_cmd_rx.try_recv().is_err(),
-            "processar PMTs n├úo deve resetar o decoder"
+            "processar PMTs não deve resetar o decoder"
         );
 
         *selected_service_ctrl.write().unwrap() = Some(3);
@@ -1231,15 +1391,15 @@ mod tests {
 
         assert!(
             switch_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x301)),
-            "troca de servi├ºo deve preservar o PID de v├¡deo do servi├ºo selecionado"
+            "troca de serviço deve preservar o PID de vídeo do serviço selecionado"
         );
         assert!(
             switch_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x320)),
-            "troca de servi├ºo deve registrar o PID de ├íudio LATM"
+            "troca de serviço deve registrar o PID de áudio LATM"
         );
         assert!(
             !switch_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x420)),
-            "troca de servi├ºo n├úo deve manter ├íudio de outros servi├ºos"
+            "troca de serviço não deve manter áudio de outros serviços"
         );
         assert!(
             switch_pes_cmds.iter().any(|command| {
@@ -1251,12 +1411,12 @@ mod tests {
                     }
                 )
             }),
-            "assembler deve receber o codec LATM do servi├ºo ativo"
+            "assembler deve receber o codec LATM do serviço ativo"
         );
         assert_eq!(
             decode_cmd_rx.try_recv().unwrap(),
             DecodeCommand::Reset,
-            "troca de servi├ºo deve resetar o decoder"
+            "troca de serviço deve resetar o decoder"
         );
 
         let snapshot = audio_status.read().unwrap().clone();
@@ -1272,8 +1432,8 @@ mod tests {
         assert_eq!(snapshot.state, AudioOperationalState::Buffering);
     }
 
-    /// Integration: mudan├ºa de PMT no mesmo servi├ºo troca a trilha ativa,
-    /// preserva o PID de v├¡deo e atualiza o snapshot consumido pela UI.
+    /// Integration: mudança de PMT no mesmo serviço troca a trilha ativa,
+    /// preserva o PID de vídeo e atualiza o snapshot consumido pela UI.
     #[test]
     fn spec_integration_audio_track_switch_updates_snapshot_without_video_regression() {
         let (_sections_tx, sections_rx) = crossbeam_channel::bounded(64);
@@ -1321,15 +1481,15 @@ mod tests {
 
         assert!(
             initial_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x101)),
-            "v├¡deo do servi├ºo selecionado deve continuar registrado"
+            "vídeo do serviço selecionado deve continuar registrado"
         );
         assert!(
             initial_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x120)),
-            "primeira trilha de ├íudio deve ser registrada"
+            "primeira trilha de áudio deve ser registrada"
         );
         assert!(
             !initial_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x121)),
-            "segunda trilha de ├íudio n├úo deve ser registrada enquanto n├úo estiver ativa"
+            "segunda trilha de áudio não deve ser registrada enquanto não estiver ativa"
         );
         assert!(
             initial_pes_cmds.iter().any(|command| {
@@ -1375,11 +1535,11 @@ mod tests {
 
         assert!(
             updated_demux_cmds.contains(&DemuxCommand::DeregisterAvPid(0x101)),
-            "mudan├ºa de PMT deve desregistrar o PID de v├¡deo antigo antes do re-registro"
+            "mudança de PMT deve desregistrar o PID de vídeo antigo antes do re-registro"
         );
         assert!(
             updated_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x101)),
-            "PID de v├¡deo deve ser re-registrado na troca de trilha"
+            "PID de vídeo deve ser re-registrado na troca de trilha"
         );
         assert!(
             updated_demux_cmds.contains(&DemuxCommand::DeregisterAvPid(0x120)),
@@ -1391,7 +1551,7 @@ mod tests {
         );
         assert!(
             !updated_demux_cmds.contains(&DemuxCommand::RegisterAvPid(0x120)),
-            "trilha antiga n├úo deve voltar a ser registrada ap├│s a troca"
+            "trilha antiga não deve voltar a ser registrada após a troca"
         );
         assert!(
             updated_pes_cmds.contains(&PesCommand::DeregisterPid { pid: 0x120 }),
@@ -1411,7 +1571,7 @@ mod tests {
         );
         assert!(
             decode_cmd_rx.try_recv().is_err(),
-            "troca autom├ítica de trilha via PMT n├úo deve resetar o decoder inteiro"
+            "troca automática de trilha via PMT não deve resetar o decoder inteiro"
         );
 
         let updated_snapshot = audio_status.read().unwrap().clone();
@@ -1426,3 +1586,4 @@ mod tests {
         );
         assert_eq!(updated_snapshot.state, AudioOperationalState::Buffering);
     }
+}

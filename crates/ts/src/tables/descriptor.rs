@@ -123,6 +123,23 @@ impl Descriptor {
         }
     }
 
+    /// Retorna o `format_identifier` de um registration descriptor (tag `0x05`).
+    ///
+    /// O identificador usa os 4 primeiros bytes do payload, quando presentes.
+    pub fn registration_format_identifier(&self) -> Option<[u8; 4]> {
+        if self.tag != 0x05 || self.data.len() < 4 {
+            return None;
+        }
+
+        Some([self.data[0], self.data[1], self.data[2], self.data[3]])
+    }
+
+    /// Retorna `true` quando este descriptor é um registration descriptor com
+    /// o `format_identifier` informado.
+    pub fn is_registration_format(&self, expected: &[u8; 4]) -> bool {
+        self.registration_format_identifier().as_ref() == Some(expected)
+    }
+
     /// Lê uma lista de descriptors de um slice, retornando quantos foram
     /// consumidos com sucesso.
     ///
@@ -413,6 +430,24 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].tag, 0x40);
         assert_eq!(list[1].tag, 0x47);
+    }
+
+    #[test]
+    fn spec_table_008_registration_descriptor_identifier() {
+        let desc = Descriptor::new(0x05, b"AC-3".to_vec());
+
+        assert_eq!(desc.registration_format_identifier(), Some(*b"AC-3"));
+        assert!(desc.is_registration_format(b"AC-3"));
+        assert!(!desc.is_registration_format(b"EAC3"));
+    }
+
+    #[test]
+    fn spec_table_008_registration_descriptor_requires_tag_and_length() {
+        let wrong_tag = Descriptor::new(0x06, b"AC-3".to_vec());
+        let too_short = Descriptor::new(0x05, vec![0x41, 0x42, 0x43]);
+
+        assert_eq!(wrong_tag.registration_format_identifier(), None);
+        assert_eq!(too_short.registration_format_identifier(), None);
     }
 
     // ── KnownDescriptor::NetworkName (0x40) ──────────────────────────────────

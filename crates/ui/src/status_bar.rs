@@ -4,7 +4,7 @@
 
 use egui::Ui;
 
-use crate::state::{AppState, ConnectionState};
+use crate::state::{AppState, AudioOperationalState, AudioStatusSnapshot, ConnectionState};
 
 /// Retorna `(ícone, texto)` para o estado de conexão.
 ///
@@ -18,6 +18,42 @@ pub fn status_icon_text(state: &ConnectionState) -> (&'static str, String) {
         ConnectionState::Connected { url, .. } => ("●", format!("Conectado  {url}")),
         ConnectionState::Error { reason, .. } => ("⚠", format!("Erro: {reason}")),
     }
+}
+
+fn audio_status_text(audio: &AudioStatusSnapshot) -> String {
+    let mut parts = vec![match audio.state {
+        AudioOperationalState::Idle => "Áudio ocioso".to_string(),
+        AudioOperationalState::Buffering => "Áudio bufferizando".to_string(),
+        AudioOperationalState::Playing => "Áudio reproduzindo".to_string(),
+        AudioOperationalState::Recovering => "Áudio recuperando".to_string(),
+        AudioOperationalState::Error => "Áudio com erro".to_string(),
+    }];
+
+    if audio.muted {
+        parts.push("mudo".to_string());
+    } else {
+        parts.push(format!("vol {:.0}%", audio.volume * 100.0));
+    }
+
+    if let Some(track) = &audio.active_track {
+        parts.push(format!(
+            "{} PID {}/0x{:04X}",
+            track.codec_label, track.pid, track.pid
+        ));
+        if let Some(language) = &track.language {
+            parts.push(language.to_uppercase());
+        }
+    }
+
+    if let Some(sample_rate_hz) = audio.sample_rate_hz {
+        parts.push(format!("{:.1} kHz", sample_rate_hz as f32 / 1000.0));
+    }
+    if let Some(channels) = audio.channels {
+        parts.push(format!("{channels} ch"));
+    }
+
+    parts.push(format!("buf {:.0}%", audio.buffer_level * 100.0));
+    parts.join("  ")
 }
 
 /// Renderiza a barra de status na parte inferior da janela.
@@ -48,6 +84,9 @@ impl StatusBar {
             let total_cc: u64 = state.metrics.errors.cc_errors.values().sum();
             ui.label(format!("CC: {total_cc}"));
 
+            ui.separator();
+            ui.label(audio_status_text(&state.audio));
+
             if let Some(offset) = state.metrics.tdt_offset_secs {
                 ui.separator();
                 ui.label(format!("TDT: {offset:+}s"));
@@ -64,6 +103,8 @@ impl StatusBar {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    use crate::state::{AudioStatusSnapshot, AudioTrackInfo};
 
     #[test]
     fn spec_ui_006_status_bar_text_idle() {
@@ -109,5 +150,40 @@ mod tests {
         let (icon, text) = status_icon_text(&state);
         assert_eq!(icon, "⚠");
         assert!(text.contains("timeout"), "expected reason in '{text}'");
+    }
+
+    #[test]
+    fn spec_ui_006_audio_status_text_includes_track_and_buffer() {
+        let mut audio = AudioStatusSnapshot::default();
+        audio.state = AudioOperationalState::Playing;
+        audio.set_volume(0.8);
+        audio.active_track = Some(AudioTrackInfo {
+            service_id: 1,
+            pid: 0x0120,
+            codec_label: "AAC (ADTS)".to_string(),
+            language: Some("por".to_string()),
+        });
+        audio.sample_rate_hz = Some(48_000);
+        audio.channels = Some(2);
+        audio.buffer_level = 0.42;
+
+        let text = audio_status_text(&audio);
+        assert!(text.contains("Áudio reproduzindo"));
+        assert!(text.contains("AAC (ADTS) PID 288/0x0120"));
+        assert!(text.contains("POR"));
+        assert!(text.contains("48.0 kHz"));
+        assert!(text.contains("2 ch"));
+        assert!(text.contains("buf 42%"));
+    }
+
+    #[test]
+    fn spec_ui_006_audio_status_text_marks_mute() {
+        let mut audio = AudioStatusSnapshot::default();
+        audio.state = AudioOperationalState::Buffering;
+        audio.set_volume(0.0);
+
+        let text = audio_status_text(&audio);
+        assert!(text.contains("Áudio bufferizando"));
+        assert!(text.contains("mudo"));
     }
 }

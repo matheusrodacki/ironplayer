@@ -452,6 +452,7 @@ name = "av"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "bytes",
  "cpal",
  "crossbeam-channel",

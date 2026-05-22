@@ -19,9 +19,11 @@
 //!
 //! SPEC-AV-002b
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_void, CString};
 use std::path::Path;
 use std::sync::Arc;
+
+use crate::codec::{CodecConfig, ThreadType};
 
 use libloading::Library;
 
@@ -36,7 +38,7 @@ const DLL_AVCODEC: &str = "avcodec-62.dll";
 #[cfg(windows)]
 const DLL_SWRESAMPLE: &str = "swresample-6.dll";
 #[cfg(windows)]
-const DLL_SWSCALE: &str = "swscale-9.dll";
+const DLL_AVFILTER: &str = "avfilter-11.dll";
 
 #[cfg(not(windows))]
 const DLL_AVUTIL: &str = "libavutil.so.60";
@@ -45,7 +47,7 @@ const DLL_AVCODEC: &str = "libavcodec.so.62";
 #[cfg(not(windows))]
 const DLL_SWRESAMPLE: &str = "libswresample.so.6";
 #[cfg(not(windows))]
-const DLL_SWSCALE: &str = "libswscale.so.9";
+const DLL_AVFILTER: &str = "libavfilter.so.11";
 
 // ─── Constantes FFmpeg ────────────────────────────────────────────────────────
 
@@ -61,21 +63,24 @@ pub const AV_CODEC_ID_AC3: u32 = 0x15003;
 pub const AV_CODEC_ID_EAC3: u32 = 0x15028;
 pub const AV_CODEC_ID_AAC_LATM: u32 = 0x15031;
 
-/// Formatos de pixel.
-pub const AV_PIX_FMT_RGB24: c_int = 2;
+/// Formatos de pixel YUV planar suportados pelo decoder.
+pub const AV_PIX_FMT_YUV420P: c_int = 0;
+pub const AV_PIX_FMT_YUV420P10LE: c_int = 63;
 
 /// Formatos de sample de áudio.
 pub const AV_SAMPLE_FMT_FLT: c_int = 3;
 pub const AV_SAMPLE_FMT_S16P: c_int = 6;
 pub const AV_SAMPLE_FMT_FLTP: c_int = 8;
 
-/// Flags de escalonamento para swscale.
-pub const SWS_BILINEAR: c_int = 2;
-
 /// Códigos de erro FFmpeg.
 pub const AVERROR_EAGAIN: c_int = -11;
 /// AVERROR_EOF = FFERRTAG(0xF8,'E','O','F') = -0x20464F45
 pub const AVERROR_EOF: c_int = -541_478_725_i32;
+
+/// `AV_FRAME_FLAG_INTERLACED` — frame tem campos entrelaçados (bit 0 de `AVFrame::flags`).
+///
+/// Introduzido em FFmpeg 6.x em substituição ao campo deprecated `interlaced_frame`.
+pub const AV_FRAME_FLAG_INTERLACED: c_int = 1;
 
 // ─── Tipos opacos FFmpeg ──────────────────────────────────────────────────────
 
@@ -91,15 +96,15 @@ pub struct AvCodecContext {
     _opaque: [u8; 0],
 }
 
-/// Tipo opaco para `SwsContext*`.
-#[repr(C)]
-pub struct SwsContext {
-    _opaque: [u8; 0],
-}
-
 /// Tipo opaco para `SwrContext*`.
 #[repr(C)]
 pub struct SwrContext {
+    _opaque: [u8; 0],
+}
+
+/// Tipo opaco para `AVDictionary*`.
+#[repr(C)]
+pub struct AvDictionary {
     _opaque: [u8; 0],
 }
 
@@ -271,6 +276,50 @@ pub(crate) unsafe fn frame_channel_count(frame: *mut c_void) -> c_int {
     *((frame as *const u8).add(388) as *const c_int)
 }
 
+/// Lê `color_range` de um `AVFrame*` opaco (offset 280).
+///
+/// Valores: `0` = não especificado, `1` = MPEG/TV range (16..235),
+/// `2` = JPEG/full range (0..255).
+///
+/// Offset derivado do layout x86-64 de FFmpeg 8.0 (avutil-60):
+/// após `buf[8]`(184..248) + `extended_buf`(8) + `nb_extended_buf+pad`(8)
+/// + `side_data`(8) + `nb_side_data+flags`(8) = offset 280.
+///
+/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn frame_color_range(frame: *mut c_void) -> i32 {
+    *((frame as *const u8).add(280) as *const i32)
+}
+
+/// Lê `colorspace` de um `AVFrame*` opaco (offset 292).
+///
+/// Valores relevantes: `1` = BT.709, `2` = não especificado,
+/// `5`/`6` = BT.601, `9` = BT.2020 NCL.
+///
+/// Offset derivado do layout x86-64 de FFmpeg 8.0 (avutil-60):
+/// `color_range`(280, 4) + `color_primaries`(284, 4) + `color_trc`(288, 4)
+/// → `colorspace` em 292.
+///
+/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn frame_colorspace(frame: *mut c_void) -> i32 {
+    *((frame as *const u8).add(292) as *const i32)
+}
+
+/// Lê `flags` de um `AVFrame*` opaco (offset 276).
+///
+/// Contém flags como `AV_FRAME_FLAG_INTERLACED (1 << 0)` e
+/// `AV_FRAME_FLAG_TOP_FIELD_FIRST (1 << 1)`.
+///
+/// Offset derivado do layout x86-64 de FFmpeg 8.0 (avutil-60):
+/// `nb_side_data`(272, 4) + `flags`(276, 4).
+///
+/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn frame_flags(frame: *mut c_void) -> c_int {
+    *((frame as *const u8).add(276) as *const c_int)
+}
+
 // ─── Tipos de ponteiro de função ──────────────────────────────────────────────
 
 type FnAvcodecFindDecoder = unsafe extern "C" fn(id: u32) -> *mut AvCodec;
@@ -321,31 +370,14 @@ type FnSwrConvert = unsafe extern "C" fn(
 ) -> c_int;
 type FnSwrFree = unsafe extern "C" fn(swr_ctx: *mut *mut SwrContext);
 
-#[allow(non_snake_case)]
-type FnSwsGetContext = unsafe extern "C" fn(
-    srcW: c_int,
-    srcH: c_int,
-    srcFormat: c_int,
-    dstW: c_int,
-    dstH: c_int,
-    dstFormat: c_int,
+type FnAvDictSet = unsafe extern "C" fn(
+    pm: *mut *mut AvDictionary,
+    key: *const i8,
+    value: *const i8,
     flags: c_int,
-    srcFilter: *mut c_void,
-    dstFilter: *mut c_void,
-    param: *const f64,
-) -> *mut SwsContext;
-#[allow(non_snake_case)]
-type FnSwsScale = unsafe extern "C" fn(
-    ctx: *mut SwsContext,
-    srcSlice: *const *const u8,
-    srcStride: *const c_int,
-    srcSliceY: c_int,
-    srcSliceH: c_int,
-    dst: *const *mut u8,
-    dstStride: *const c_int,
 ) -> c_int;
-#[allow(non_snake_case)]
-type FnSwsFreeContext = unsafe extern "C" fn(swsContext: *mut SwsContext);
+
+type FnAvDictFree = unsafe extern "C" fn(m: *mut *mut AvDictionary);
 
 // ─── FfmpegLib ────────────────────────────────────────────────────────────────
 
@@ -361,7 +393,6 @@ pub struct FfmpegLib {
     _avutil: Library,
     _avcodec: Library,
     _swresample: Library,
-    _swscale: Library,
 
     // Funções avcodec
     pub(crate) avcodec_find_decoder: FnAvcodecFindDecoder,
@@ -389,10 +420,9 @@ pub struct FfmpegLib {
     pub(crate) swr_convert: FnSwrConvert,
     pub(crate) swr_free: FnSwrFree,
 
-    // Funções swscale
-    pub(crate) sws_get_context: FnSwsGetContext,
-    pub(crate) sws_scale: FnSwsScale,
-    pub(crate) sws_free_context: FnSwsFreeContext,
+    // Funções de dicionário avutil (usadas para opções de codec)
+    pub(crate) av_dict_set: FnAvDictSet,
+    pub(crate) av_dict_free: FnAvDictFree,
 }
 
 // SAFETY: Os ponteiros de função são obtidos de DLLs thread-safe do FFmpeg.
@@ -440,13 +470,6 @@ impl FfmpegLib {
         let swresample = unsafe { Library::new(dll_dir.join(DLL_SWRESAMPLE)) }.map_err(|e| {
             AvError::FfmpegUnavailable {
                 message: format!("falha ao carregar {DLL_SWRESAMPLE}: {e}"),
-            }
-        })?;
-
-        // Carrega swscale (depende de avutil)
-        let swscale = unsafe { Library::new(dll_dir.join(DLL_SWSCALE)) }.map_err(|e| {
-            AvError::FfmpegUnavailable {
-                message: format!("falha ao carregar {DLL_SWSCALE}: {e}"),
             }
         })?;
 
@@ -498,15 +521,13 @@ impl FfmpegLib {
         let swr_convert = sym!(swresample, b"swr_convert\0", FnSwrConvert);
         let swr_free = sym!(swresample, b"swr_free\0", FnSwrFree);
 
-        let sws_get_context = sym!(swscale, b"sws_getContext\0", FnSwsGetContext);
-        let sws_scale = sym!(swscale, b"sws_scale\0", FnSwsScale);
-        let sws_free_context = sym!(swscale, b"sws_freeContext\0", FnSwsFreeContext);
+        let av_dict_set = sym!(avutil, b"av_dict_set\0", FnAvDictSet);
+        let av_dict_free = sym!(avutil, b"av_dict_free\0", FnAvDictFree);
 
         Ok(Arc::new(Self {
             _avutil: avutil,
             _avcodec: avcodec,
             _swresample: swresample,
-            _swscale: swscale,
             avcodec_find_decoder,
             avcodec_alloc_context3,
             avcodec_free_context,
@@ -527,9 +548,8 @@ impl FfmpegLib {
             swr_get_out_samples,
             swr_convert,
             swr_free,
-            sws_get_context,
-            sws_scale,
-            sws_free_context,
+            av_dict_set,
+            av_dict_free,
         }))
     }
 
@@ -573,8 +593,12 @@ unsafe impl Send for FfmpegCodecContext {}
 impl FfmpegCodecContext {
     /// Abre um decodificador FFmpeg para o `codec_id` especificado.
     ///
+    /// Constrói um `AVDictionary` com as opções de `config` (threads,
+    /// thread_type, skip_loop_filter, flag2_fast) e o passa como terceiro
+    /// argumento de `avcodec_open2`. O dicionário é liberado após a abertura.
+    ///
     /// SPEC-AV-002b
-    pub fn open(lib: Arc<FfmpegLib>, codec_id: u32) -> Result<Self, AvError> {
+    pub fn open(lib: Arc<FfmpegLib>, codec_id: u32, config: &CodecConfig) -> Result<Self, AvError> {
         // SAFETY: avcodec_find_decoder é thread-safe e retorna um ponteiro
         // estático (não precisamos liberar).
         let codec = unsafe { (lib.avcodec_find_decoder)(codec_id) };
@@ -590,8 +614,67 @@ impl FfmpegCodecContext {
             return Err(AvError::FfmpegError { code: -12 }); // ENOMEM
         }
 
-        // SAFETY: avcodec_open2 configura o contexto com o codec encontrado.
-        let ret = unsafe { (lib.avcodec_open2)(ctx, codec, std::ptr::null_mut()) };
+        // Monta AVDictionary com as opções de codec.
+        // av_dict_set copia key e value internamente (flags=0), portanto as
+        // CStrings podem ser descartadas logo após a chamada.
+        //
+        // SAFETY: ctx é não-nulo; todas as CStrings são nul-terminadas e válidas
+        // durante a chamada; av_dict_set documenta que copia as strings.
+        let mut opts: *mut AvDictionary = std::ptr::null_mut();
+
+        if config.thread_count > 0 {
+            // SAFETY: thread_count é sempre um número ASCII válido.
+            let count_cstr =
+                CString::new(config.thread_count.to_string()).expect("thread_count ASCII válido");
+            unsafe {
+                (lib.av_dict_set)(&mut opts, c"threads".as_ptr(), count_cstr.as_ptr(), 0);
+            }
+        }
+
+        match config.thread_type {
+            ThreadType::Frame => unsafe {
+                (lib.av_dict_set)(&mut opts, c"thread_type".as_ptr(), c"frame".as_ptr(), 0);
+            },
+            ThreadType::Slice => unsafe {
+                (lib.av_dict_set)(&mut opts, c"thread_type".as_ptr(), c"slice".as_ptr(), 0);
+            },
+            // Auto: deixa o FFmpeg escolher a estratégia ideal para o codec.
+            ThreadType::Auto => {}
+        }
+
+        if config.skip_loop_filter {
+            unsafe {
+                (lib.av_dict_set)(
+                    &mut opts,
+                    c"skip_loop_filter".as_ptr(),
+                    c"noref".as_ptr(),
+                    0,
+                );
+            }
+        }
+
+        if config.flag2_fast {
+            unsafe {
+                (lib.av_dict_set)(&mut opts, c"flags2".as_ptr(), c"+fast".as_ptr(), 0);
+            }
+        }
+
+        // SAFETY: avcodec_open2 configura o contexto com o codec e as opções.
+        // O dicionário é sempre liberado após a chamada, independente do resultado.
+        let ret = unsafe {
+            (lib.avcodec_open2)(
+                ctx,
+                codec,
+                &mut opts as *mut *mut AvDictionary as *mut *mut c_void,
+            )
+        };
+
+        // Libera entradas restantes do dicionário (opções não consumidas pelo codec).
+        // SAFETY: opts pode ser nulo (av_dict_free aceita *mut NULL).
+        if !opts.is_null() {
+            unsafe { (lib.av_dict_free)(&mut opts) };
+        }
+
         if ret < 0 {
             // Libera o contexto antes de retornar erro.
             // SAFETY: ctx não-nulo, avcodec_free_context é o destrutor correto.
@@ -600,7 +683,13 @@ impl FfmpegCodecContext {
             return Err(AvError::FfmpegError { code: ret });
         }
 
-        tracing::debug!(codec_id, "decodificador FFmpeg aberto");
+        tracing::debug!(
+            codec_id,
+            threads = config.thread_count,
+            skip_loop_filter = config.skip_loop_filter,
+            flag2_fast = config.flag2_fast,
+            "decodificador FFmpeg aberto"
+        );
         Ok(Self { ctx, lib })
     }
 
@@ -739,18 +828,27 @@ impl FfmpegFrame {
         unsafe { (self.lib.av_frame_unref)(self.frame) };
     }
 
-    /// Converte o frame de vídeo para RGB24 via swscale.
+    /// Extrai os planos YUV de um frame de vídeo decodificado.
     ///
-    /// Retorna `(width, height, pts, rgb_bytes, (sar_num, sar_den))`.
-    /// `sar_num/sar_den` é o Sample Aspect Ratio do frame; use-o para calcular
-    /// o Display Aspect Ratio: `DAR = (sar_num * width) / (sar_den * height)`.
-    /// Quando `sar_num == sar_den` (incluindo ambos == 1), pixels são quadrados.
+    /// Suporta `YUV420P` (8-bit, `fmt == 0`) e `YUV420P10LE` (10-bit, `fmt == 63`).
+    ///
+    /// Retorna `(width, height, pts, [y_plane, u_plane, v_plane], (sar_num, sar_den),
+    ///           raw_colorspace, raw_color_range, ten_bit)`.
+    ///
+    /// Os planos são compactados (sem padding de linesize): cada linha do plano Y
+    /// tem exatamente `width * bytes_per_sample` bytes, e cada linha dos planos
+    /// U/V tem `(width/2) * bytes_per_sample` bytes.
+    ///
+    /// `raw_colorspace` e `raw_color_range` são valores inteiros brutos dos campos
+    /// `AVColorSpace` / `AVColorRange` do AVFrame (ver `YuvColorspace::from_avutil`).
     ///
     /// SPEC-AV-002b
     #[allow(clippy::type_complexity)]
-    pub(crate) fn to_rgb24(&self) -> Result<(u32, u32, i64, Vec<u8>, (u32, u32)), AvError> {
+    pub(crate) fn to_yuv_planes(
+        &self,
+    ) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {
         // SAFETY: offsets validados contra FFmpeg 8.x headers (ver comentário de layout).
-        let (width, height, pts, src_fmt, raw_sar) = unsafe {
+        let (width, height, pts, fmt, raw_sar) = unsafe {
             (
                 frame_width(self.frame),
                 frame_height(self.frame),
@@ -760,101 +858,79 @@ impl FfmpegFrame {
             )
         };
 
-        // Normaliza SAR: (0,*), (*,0) ou valores negativos → 1:1 (pixels quadrados).
+        if width <= 0 || height <= 0 {
+            return Err(AvError::FfmpegError { code: -22 }); // EINVAL
+        }
+
+        let ten_bit = fmt == AV_PIX_FMT_YUV420P10LE;
+        if fmt != AV_PIX_FMT_YUV420P && fmt != AV_PIX_FMT_YUV420P10LE {
+            tracing::warn!(fmt, "to_yuv_planes: formato de pixel inesperado");
+            return Err(AvError::FfmpegError { code: -22 });
+        }
+
+        let bytes_per_sample: usize = if ten_bit { 2 } else { 1 };
+        let w = width as usize;
+        let h = height as usize;
+        let w_uv = w / 2;
+        let h_uv = h / 2;
+
+        // ── Plano Y ──────────────────────────────────────────────────────────
+        let ls_y = unsafe { frame_linesize(self.frame, 0) } as usize;
+        let row_y = w * bytes_per_sample;
+        let mut y_plane = vec![0u8; row_y * h];
+        for row in 0..h {
+            // SAFETY: frame->data[0] aponta para plano Y válido após receive_frame.
+            unsafe {
+                let src = frame_data_ptr(self.frame, 0).add(row * ls_y);
+                std::ptr::copy_nonoverlapping(src, y_plane[row * row_y..].as_mut_ptr(), row_y);
+            }
+        }
+
+        // ── Plano U ──────────────────────────────────────────────────────────
+        let ls_u = unsafe { frame_linesize(self.frame, 1) } as usize;
+        let row_uv = w_uv * bytes_per_sample;
+        let mut u_plane = vec![0u8; row_uv * h_uv];
+        for row in 0..h_uv {
+            // SAFETY: frame->data[1] aponta para plano U válido após receive_frame.
+            unsafe {
+                let src = frame_data_ptr(self.frame, 1).add(row * ls_u);
+                std::ptr::copy_nonoverlapping(src, u_plane[row * row_uv..].as_mut_ptr(), row_uv);
+            }
+        }
+
+        // ── Plano V ──────────────────────────────────────────────────────────
+        let ls_v = unsafe { frame_linesize(self.frame, 2) } as usize;
+        let mut v_plane = vec![0u8; row_uv * h_uv];
+        for row in 0..h_uv {
+            // SAFETY: frame->data[2] aponta para plano V válido após receive_frame.
+            unsafe {
+                let src = frame_data_ptr(self.frame, 2).add(row * ls_v);
+                std::ptr::copy_nonoverlapping(src, v_plane[row * row_uv..].as_mut_ptr(), row_uv);
+            }
+        }
+
+        // ── Metadados ─────────────────────────────────────────────────────────
         let sar = if raw_sar.0 > 0 && raw_sar.1 > 0 {
             (raw_sar.0 as u32, raw_sar.1 as u32)
         } else {
             (1u32, 1u32)
         };
 
-        if width <= 0 || height <= 0 {
-            return Err(AvError::FfmpegError { code: -22 }); // EINVAL
-        }
+        // SAFETY: offsets de color_range (280) e colorspace (292) derivados do
+        // layout x86-64 de FFmpeg 8.0 (avutil-60). Ver comentário nos helpers.
+        let raw_colorspace = unsafe { frame_colorspace(self.frame) };
+        let raw_color_range = unsafe { frame_color_range(self.frame) };
 
-        let w = width as usize;
-        let h = height as usize;
-        let rgb_stride = w * 3;
-        let mut rgb_data: Vec<u8> = vec![0u8; rgb_stride * h];
-
-        // SAFETY: sws_getContext retorna nulo se os parâmetros forem inválidos.
-        let sws = unsafe {
-            (self.lib.sws_get_context)(
-                width,
-                height,
-                src_fmt,
-                width,
-                height,
-                AV_PIX_FMT_RGB24,
-                SWS_BILINEAR,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if sws.is_null() {
-            return Err(AvError::FfmpegError { code: -22 });
-        }
-
-        // SAFETY: frame->data e frame->linesize são válidos após receive_frame.
-        let src_data: [*const u8; 8] = unsafe {
-            [
-                frame_data_ptr(self.frame, 0),
-                frame_data_ptr(self.frame, 1),
-                frame_data_ptr(self.frame, 2),
-                frame_data_ptr(self.frame, 3),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-            ]
-        };
-        let src_stride: [c_int; 8] = unsafe {
-            [
-                frame_linesize(self.frame, 0),
-                frame_linesize(self.frame, 1),
-                frame_linesize(self.frame, 2),
-                frame_linesize(self.frame, 3),
-                0,
-                0,
-                0,
-                0,
-            ]
-        };
-
-        let dst_stride = [rgb_stride as c_int, 0, 0, 0, 0, 0, 0, 0];
-        let dst_ptr = rgb_data.as_mut_ptr();
-        let dst_data: [*mut u8; 8] = [
-            dst_ptr,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ];
-
-        // SAFETY: sws é válido, src_data/dst_data apontam para buffers corretos.
-        let ret = unsafe {
-            (self.lib.sws_scale)(
-                sws,
-                src_data.as_ptr(),
-                src_stride.as_ptr(),
-                0,
-                height,
-                dst_data.as_ptr(),
-                dst_stride.as_ptr(),
-            )
-        };
-
-        // SAFETY: sws é não-nulo e foi criado por sws_getContext.
-        unsafe { (self.lib.sws_free_context)(sws) };
-
-        if ret <= 0 {
-            return Err(AvError::FfmpegError { code: -22 });
-        }
-
-        Ok((width as u32, height as u32, pts, rgb_data, sar))
+        Ok((
+            width as u32,
+            height as u32,
+            pts,
+            [y_plane, u_plane, v_plane],
+            sar,
+            raw_colorspace,
+            raw_color_range,
+            ten_bit,
+        ))
     }
 
     /// Converte o frame de áudio para PCM f32 interleaved.
@@ -1058,6 +1134,18 @@ impl FfmpegFrame {
     }
 }
 
+impl FfmpegFrame {
+    /// Retorna o ponteiro bruto `*mut c_void` para o `AVFrame*` interno.
+    ///
+    /// Usado pelo deinterlacador para passar o frame ao grafo avfilter.
+    ///
+    /// SAFETY: o ponteiro é válido enquanto `self` existir e não tiver sido unref'd.
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        self.frame
+    }
+}
+
 impl Drop for FfmpegFrame {
     fn drop(&mut self) {
         // SAFETY: frame foi alocado por av_frame_alloc; é o único dono.
@@ -1100,6 +1188,377 @@ pub fn find_ffmpeg_dll_dir() -> Option<std::path::PathBuf> {
 
     None
 }
+
+// ─── avfilter: tipos opacos ───────────────────────────────────────────────────
+
+/// Tipo opaco para `AVFilterGraph*`.
+#[repr(C)]
+pub(crate) struct AvFilterGraph {
+    _opaque: [u8; 0],
+}
+
+/// Tipo opaco para `AVFilterContext*`.
+#[repr(C)]
+pub(crate) struct AvFilterContext {
+    _opaque: [u8; 0],
+}
+
+/// Tipo opaco para `AVFilter*`.
+#[repr(C)]
+pub(crate) struct AvFilter {
+    _opaque: [u8; 0],
+}
+
+// ─── avfilter: tipos de ponteiro de função ────────────────────────────────────
+
+type FnAvfilterGraphAlloc = unsafe extern "C" fn() -> *mut AvFilterGraph;
+type FnAvfilterGraphFree = unsafe extern "C" fn(graph: *mut *mut AvFilterGraph);
+type FnAvfilterGetByName = unsafe extern "C" fn(name: *const i8) -> *const AvFilter;
+type FnAvfilterGraphCreateFilter = unsafe extern "C" fn(
+    filt_ctx: *mut *mut AvFilterContext,
+    filt: *const AvFilter,
+    name: *const i8,
+    args: *const i8,
+    opaque: *mut c_void,
+    graph_ctx: *mut AvFilterGraph,
+) -> c_int;
+type FnAvfilterLink = unsafe extern "C" fn(
+    src: *mut AvFilterContext,
+    srcpad: u32,
+    dst: *mut AvFilterContext,
+    dstpad: u32,
+) -> c_int;
+type FnAvfilterGraphConfig =
+    unsafe extern "C" fn(graphctx: *mut AvFilterGraph, log_ctx: *mut c_void) -> c_int;
+type FnAvBuffersrcAddFrameFlags =
+    unsafe extern "C" fn(ctx: *mut AvFilterContext, frame: *mut c_void, flags: c_int) -> c_int;
+type FnAvBuffersinkGetFrame =
+    unsafe extern "C" fn(ctx: *mut AvFilterContext, frame: *mut c_void) -> c_int;
+
+// ─── FilterLib ────────────────────────────────────────────────────────────────
+
+/// Biblioteca `avfilter` carregada dinamicamente.
+///
+/// Separada de `FfmpegLib` para manter o carregamento opcional —
+/// se `avfilter-11.dll` não estiver disponível, o deinterlacing é simplesmente
+/// ignorado sem degradar o restante do pipeline.
+///
+/// SPEC-AV-004
+#[allow(dead_code)]
+pub(crate) struct FilterLib {
+    _avfilter: Library,
+
+    pub(crate) avfilter_graph_alloc: FnAvfilterGraphAlloc,
+    pub(crate) avfilter_graph_free: FnAvfilterGraphFree,
+    pub(crate) avfilter_get_by_name: FnAvfilterGetByName,
+    pub(crate) avfilter_graph_create_filter: FnAvfilterGraphCreateFilter,
+    pub(crate) avfilter_link: FnAvfilterLink,
+    pub(crate) avfilter_graph_config: FnAvfilterGraphConfig,
+    pub(crate) av_buffersrc_add_frame_flags: FnAvBuffersrcAddFrameFlags,
+    pub(crate) av_buffersink_get_frame: FnAvBuffersinkGetFrame,
+}
+
+// SAFETY: Os ponteiros de função são obtidos de DLLs thread-safe do FFmpeg.
+unsafe impl Send for FilterLib {}
+unsafe impl Sync for FilterLib {}
+
+impl FilterLib {
+    /// Carrega `avfilter-11.dll` e resolve os símbolos necessários para bwdif.
+    ///
+    /// Retorna `Err` se a DLL não existir ou os símbolos não forem encontrados.
+    ///
+    /// SPEC-AV-004
+    pub(crate) fn load(dll_dir: &Path) -> Result<Arc<Self>, AvError> {
+        #[cfg(windows)]
+        set_dll_search_dir(Some(dll_dir));
+
+        let result = Self::load_inner(dll_dir);
+
+        #[cfg(windows)]
+        set_dll_search_dir(None);
+
+        result
+    }
+
+    fn load_inner(dll_dir: &Path) -> Result<Arc<Self>, AvError> {
+        let avfilter = unsafe { Library::new(dll_dir.join(DLL_AVFILTER)) }.map_err(|e| {
+            AvError::FfmpegUnavailable {
+                message: format!("falha ao carregar {DLL_AVFILTER}: {e}"),
+            }
+        })?;
+
+        macro_rules! sym {
+            ($lib:expr, $name:literal, $ty:ty) => {{
+                let s: libloading::Symbol<$ty> =
+                    unsafe { $lib.get($name) }.map_err(|e| AvError::FfmpegUnavailable {
+                        message: format!(
+                            "símbolo '{}' não encontrado: {e}",
+                            std::str::from_utf8(&$name[..$name.len() - 1]).unwrap_or("<invalid>")
+                        ),
+                    })?;
+                *s
+            }};
+        }
+
+        let avfilter_graph_alloc = sym!(avfilter, b"avfilter_graph_alloc\0", FnAvfilterGraphAlloc);
+        let avfilter_graph_free = sym!(avfilter, b"avfilter_graph_free\0", FnAvfilterGraphFree);
+        let avfilter_get_by_name = sym!(avfilter, b"avfilter_get_by_name\0", FnAvfilterGetByName);
+        let avfilter_graph_create_filter = sym!(
+            avfilter,
+            b"avfilter_graph_create_filter\0",
+            FnAvfilterGraphCreateFilter
+        );
+        let avfilter_link = sym!(avfilter, b"avfilter_link\0", FnAvfilterLink);
+        let avfilter_graph_config =
+            sym!(avfilter, b"avfilter_graph_config\0", FnAvfilterGraphConfig);
+        let av_buffersrc_add_frame_flags = sym!(
+            avfilter,
+            b"av_buffersrc_add_frame_flags\0",
+            FnAvBuffersrcAddFrameFlags
+        );
+        let av_buffersink_get_frame = sym!(
+            avfilter,
+            b"av_buffersink_get_frame\0",
+            FnAvBuffersinkGetFrame
+        );
+
+        Ok(Arc::new(Self {
+            _avfilter: avfilter,
+            avfilter_graph_alloc,
+            avfilter_graph_free,
+            avfilter_get_by_name,
+            avfilter_graph_create_filter,
+            avfilter_link,
+            avfilter_graph_config,
+            av_buffersrc_add_frame_flags,
+            av_buffersink_get_frame,
+        }))
+    }
+}
+
+// ─── FfmpegFilterGraph ────────────────────────────────────────────────────────
+
+/// Wrapper RAII para um grafo de filtros avfilter com topologia:
+/// `buffer → bwdif → buffersink`.
+///
+/// Usado para deinterlacing de frames 1080i em tempo real.
+///
+/// SPEC-AV-004
+pub(crate) struct FfmpegFilterGraph {
+    graph: *mut AvFilterGraph,
+    src_ctx: *mut AvFilterContext,
+    sink_ctx: *mut AvFilterContext,
+    filter_lib: Arc<FilterLib>,
+    ffmpeg_lib: Arc<FfmpegLib>,
+}
+
+// SAFETY: `AVFilterGraph` e `AVFilterContext` são usados exclusivamente na
+// thread av-decode; nunca compartilhados entre threads simultaneamente.
+unsafe impl Send for FfmpegFilterGraph {}
+
+impl FfmpegFilterGraph {
+    /// Cria um grafo bwdif para deinterlacing de frames YUV planar.
+    ///
+    /// `pix_fmt`: formato de pixel AVPixelFormat
+    /// (`AV_PIX_FMT_YUV420P = 0`, `AV_PIX_FMT_YUV420P10LE = 63`).
+    ///
+    /// SPEC-AV-004
+    pub(crate) fn new_bwdif(
+        filter_lib: Arc<FilterLib>,
+        ffmpeg_lib: Arc<FfmpegLib>,
+        width: u32,
+        height: u32,
+        pix_fmt: c_int,
+    ) -> Result<Self, AvError> {
+        // SAFETY: avfilter_graph_alloc usa av_malloc internamente.
+        let graph = unsafe { (filter_lib.avfilter_graph_alloc)() };
+        if graph.is_null() {
+            return Err(AvError::FfmpegError { code: -12 });
+        }
+
+        // ── Filtro buffer (source) ─────────────────────────────────────────
+        let src_filt = unsafe { (filter_lib.avfilter_get_by_name)(c"buffer".as_ptr()) };
+        if src_filt.is_null() {
+            unsafe {
+                let mut g = graph;
+                (filter_lib.avfilter_graph_free)(&mut g);
+            }
+            return Err(AvError::FfmpegUnavailable {
+                message: "filtro 'buffer' não encontrado em avfilter".to_string(),
+            });
+        }
+
+        // Formato: "video_size=WxH:pix_fmt=N:time_base=1/90000:pixel_aspect=0/1"
+        let src_args = CString::new(format!(
+            "video_size={}x{}:pix_fmt={}:time_base=1/90000:pixel_aspect=0/1",
+            width, height, pix_fmt
+        ))
+        .map_err(|_| AvError::Other(anyhow::anyhow!("CString inválida para buffer args")))?;
+
+        let mut src_ctx: *mut AvFilterContext = std::ptr::null_mut();
+        // SAFETY: todos os ponteiros são válidos e nul-terminados.
+        let ret = unsafe {
+            (filter_lib.avfilter_graph_create_filter)(
+                &mut src_ctx,
+                src_filt,
+                c"in".as_ptr(),
+                src_args.as_ptr(),
+                std::ptr::null_mut(),
+                graph,
+            )
+        };
+        if ret < 0 {
+            unsafe {
+                let mut g = graph;
+                (filter_lib.avfilter_graph_free)(&mut g);
+            }
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        // ── Filtro bwdif ──────────────────────────────────────────────────
+        let bwdif_filt = unsafe { (filter_lib.avfilter_get_by_name)(c"bwdif".as_ptr()) };
+        if bwdif_filt.is_null() {
+            unsafe {
+                let mut g = graph;
+                (filter_lib.avfilter_graph_free)(&mut g);
+            }
+            return Err(AvError::FfmpegUnavailable {
+                message: "filtro 'bwdif' não encontrado em avfilter".to_string(),
+            });
+        }
+
+        let mut bwdif_ctx: *mut AvFilterContext = std::ptr::null_mut();
+        let ret = unsafe {
+            (filter_lib.avfilter_graph_create_filter)(
+                &mut bwdif_ctx,
+                bwdif_filt,
+                c"bwdif".as_ptr(),
+                c"mode=send_frame:parity=auto:deint=interlaced".as_ptr(),
+                std::ptr::null_mut(),
+                graph,
+            )
+        };
+        if ret < 0 {
+            unsafe {
+                let mut g = graph;
+                (filter_lib.avfilter_graph_free)(&mut g);
+            }
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        // ── Filtro buffersink ─────────────────────────────────────────────
+        let sink_filt = unsafe { (filter_lib.avfilter_get_by_name)(c"buffersink".as_ptr()) };
+        if sink_filt.is_null() {
+            unsafe {
+                let mut g = graph;
+                (filter_lib.avfilter_graph_free)(&mut g);
+            }
+            return Err(AvError::FfmpegUnavailable {
+                message: "filtro 'buffersink' não encontrado em avfilter".to_string(),
+            });
+        }
+
+        let mut sink_ctx: *mut AvFilterContext = std::ptr::null_mut();
+        let ret = unsafe {
+            (filter_lib.avfilter_graph_create_filter)(
+                &mut sink_ctx,
+                sink_filt,
+                c"out".as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                graph,
+            )
+        };
+        if ret < 0 {
+            unsafe {
+                let mut g = graph;
+                (filter_lib.avfilter_graph_free)(&mut g);
+            }
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        // ── Liga: buffer → bwdif → buffersink ─────────────────────────────
+        let ret = unsafe { (filter_lib.avfilter_link)(src_ctx, 0, bwdif_ctx, 0) };
+        if ret < 0 {
+            unsafe {
+                let mut g = graph;
+                (filter_lib.avfilter_graph_free)(&mut g);
+            }
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        let ret = unsafe { (filter_lib.avfilter_link)(bwdif_ctx, 0, sink_ctx, 0) };
+        if ret < 0 {
+            unsafe {
+                let mut g = graph;
+                (filter_lib.avfilter_graph_free)(&mut g);
+            }
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        // ── Configura o grafo ─────────────────────────────────────────────
+        let ret = unsafe { (filter_lib.avfilter_graph_config)(graph, std::ptr::null_mut()) };
+        if ret < 0 {
+            unsafe {
+                let mut g = graph;
+                (filter_lib.avfilter_graph_free)(&mut g);
+            }
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        tracing::debug!(width, height, pix_fmt, "grafo bwdif criado com sucesso");
+
+        Ok(Self {
+            graph,
+            src_ctx,
+            sink_ctx,
+            filter_lib,
+            ffmpeg_lib,
+        })
+    }
+
+    /// Empurra `input` para o buffer source e lê o frame deinterlaced do sink.
+    ///
+    /// Retorna `Some(frame)` com o frame deinterlaced, ou `None` se o bwdif
+    /// ainda estiver acumulando contexto temporal (AVERROR_EAGAIN).
+    ///
+    /// SPEC-AV-004
+    pub(crate) fn process(&mut self, input: &FfmpegFrame) -> Result<Option<FfmpegFrame>, AvError> {
+        // AV_BUFFERSRC_FLAG_KEEP_REF = 8 — mantém a referência original no caller.
+        // SAFETY: src_ctx é válido; input.as_ptr() aponta para um AVFrame válido.
+        let ret = unsafe {
+            (self.filter_lib.av_buffersrc_add_frame_flags)(self.src_ctx, input.as_ptr(), 8)
+        };
+        if ret < 0 {
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        // Aloca frame de saída e lê do buffersink.
+        let output = FfmpegFrame::alloc(Arc::clone(&self.ffmpeg_lib))?;
+        // SAFETY: sink_ctx é válido; output.frame aponta para AVFrame alocado.
+        let ret =
+            unsafe { (self.filter_lib.av_buffersink_get_frame)(self.sink_ctx, output.as_ptr()) };
+
+        if ret == 0 {
+            Ok(Some(output))
+        } else if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
+            // bwdif precisa de mais contexto temporal; frame de entrada ignorado.
+            Ok(None)
+        } else {
+            Err(AvError::FfmpegError { code: ret })
+        }
+    }
+}
+
+impl Drop for FfmpegFilterGraph {
+    fn drop(&mut self) {
+        // SAFETY: graph foi alocado por avfilter_graph_alloc; é o único dono.
+        // avfilter_graph_free libera o grafo e todos os AVFilterContexts.
+        unsafe { (self.filter_lib.avfilter_graph_free)(&mut self.graph) };
+    }
+}
+
+// ─── Utilitários de busca e carregamento ──────────────────────────────────────
 
 /// Configura (ou limpa) o diretório adicional de busca de DLLs no Windows.
 ///

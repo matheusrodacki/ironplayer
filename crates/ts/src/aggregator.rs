@@ -16,7 +16,7 @@ use crossbeam_channel::Receiver;
 use crate::error::{PcrEvent, TsEvent};
 use crate::metrics::{
     BitrateMonitor, ErrorSnapshot, ErrorTracker, MetricsSnapshot, PcrDiscontinuityRecord,
-    PcrJitterRecord, PidEntry, PidType,
+    PcrJitterRecord, PidEntry, PidType, PipelineMetrics,
 };
 use crate::Pid;
 
@@ -111,6 +111,7 @@ impl SnapshotReceiver {
                 early_frames_held: 0,
                 pts_discontinuities: 0,
                 video_queue_depth: 0,
+                pipeline: crate::metrics::PipelineMetrics::default(),
             })
     }
 }
@@ -209,6 +210,7 @@ impl MetricsAggregator {
             early_frames_held: 0,
             pts_discontinuities: 0,
             video_queue_depth: 0,
+            pipeline: PipelineMetrics::default(),
         };
         let shared = std::sync::Arc::new(std::sync::RwLock::new(initial));
         let snapshot_tx = SnapshotSender(std::sync::Arc::clone(&shared));
@@ -381,6 +383,7 @@ impl MetricsAggregator {
             early_frames_held: 0,
             pts_discontinuities: 0,
             video_queue_depth: 0,
+            pipeline: PipelineMetrics::default(),
         }
     }
 }

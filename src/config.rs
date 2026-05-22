@@ -84,6 +84,70 @@ impl Default for AnalyzerConfig {
     }
 }
 
+/// Tipo de threading do decoder FFmpeg ([decoder] no ironstream.toml).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecoderThreadType {
+    /// FFmpeg escolhe automaticamente a estratégia ideal.
+    #[default]
+    Auto,
+    /// Frame threading — decodifica múltiplos frames em paralelo.
+    Frame,
+    /// Slice threading — decodifica fatias de um frame em paralelo.
+    Slice,
+}
+
+/// Perfil de qualidade/velocidade do decodificador FFmpeg.
+///
+/// Sobrescreve `skip_loop_filter` e `flag2_fast` quando diferente de `default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecoderProfile {
+    /// Configuração individual via `skip_loop_filter` e `flag2_fast` (padrão).
+    #[default]
+    Default,
+    /// Perfil rápido: habilita `skip_loop_filter = NonRef` + `flag2_fast`.
+    ///
+    /// Reduz uso de CPU em ~20–30% em H.264 com leve impacto na qualidade de imagem.
+    Fast,
+    /// Perfil preciso: desabilita todos os atalhos de velocidade.
+    ///
+    /// Máxima qualidade de decodificação; ignora `skip_loop_filter` e `flag2_fast`.
+    Accurate,
+}
+
+/// Configurações do decodificador FFmpeg (bloco `[decoder]` no ironstream.toml).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct DecoderConfig {
+    /// Número de threads de decodificação. 0 = detectar automaticamente (num_cpus).
+    pub thread_count: u32,
+    /// Estratégia de threading.
+    pub thread_type: DecoderThreadType,
+    /// Habilita `skip_loop_filter=noref` (reduz CPU ~10–25 % em H.264).
+    pub skip_loop_filter: bool,
+    /// Habilita `CODEC_FLAG2_FAST` (desativa sub-ME, reduz CPU).
+    pub flag2_fast: bool,
+    /// Perfil de otimização (`fast` / `accurate` / `default`).
+    ///
+    /// `fast` sobrescreve `skip_loop_filter = true` e `flag2_fast = true`.
+    /// `accurate` sobrescreve ambos para `false`.
+    /// `default` usa os valores individuais acima.
+    pub profile: DecoderProfile,
+}
+
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self {
+            thread_count: 0, // 0 = detectar em runtime via available_parallelism
+            thread_type: DecoderThreadType::Auto,
+            skip_loop_filter: false,
+            flag2_fast: false,
+            profile: DecoderProfile::Default,
+        }
+    }
+}
+
 /// Configurações de interface gráfica.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -119,6 +183,7 @@ pub struct AppConfig {
     pub player: PlayerConfig,
     pub analyzer: AnalyzerConfig,
     pub ui: UiConfig,
+    pub decoder: DecoderConfig,
 }
 
 impl AppConfig {
@@ -357,5 +422,45 @@ window_height = 1080
         assert!(cfg.ui.dark_theme);
         assert_eq!(cfg.ui.window_width, 1400);
         assert_eq!(cfg.ui.window_height, 900);
+    }
+
+    /// SPEC-CFG-001 — bloco [decoder] padrão: conservador (flags desabilitadas)
+    #[test]
+    fn spec_cfg_001_decoder_defaults_conservative() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.decoder.thread_count, 0);
+        assert_eq!(cfg.decoder.thread_type, DecoderThreadType::Auto);
+        assert!(!cfg.decoder.skip_loop_filter);
+        assert!(!cfg.decoder.flag2_fast);
+    }
+
+    /// SPEC-CFG-001 — bloco [decoder] é desserializado corretamente do TOML
+    #[test]
+    fn spec_cfg_001_decoder_block_from_toml() {
+        let toml_str = r#"
+[decoder]
+thread_count = 8
+thread_type = "frame"
+skip_loop_filter = true
+flag2_fast = false
+"#;
+        let (_dir, path) = temp_toml(toml_str);
+        let cfg = AppConfig::load_from_path_or_default(&path);
+        assert_eq!(cfg.decoder.thread_count, 8);
+        assert_eq!(cfg.decoder.thread_type, DecoderThreadType::Frame);
+        assert!(cfg.decoder.skip_loop_filter);
+        assert!(!cfg.decoder.flag2_fast);
+    }
+
+    /// SPEC-CFG-001 — bloco [decoder] ausente usa defaults conservadores
+    #[test]
+    fn spec_cfg_001_decoder_block_absent_uses_defaults() {
+        let toml_str = r#"
+[network]
+timeout_ms = 5000
+"#;
+        let (_dir, path) = temp_toml(toml_str);
+        let cfg = AppConfig::load_from_path_or_default(&path);
+        assert_eq!(cfg.decoder, DecoderConfig::default());
     }
 }

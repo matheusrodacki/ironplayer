@@ -255,6 +255,57 @@ pub struct MetricsSnapshot {
     ///
     /// SPEC-METRICS-SYNC-001
     pub video_queue_depth: u16,
+    /// Métricas do pipeline de decodificação e renderização GPU.
+    ///
+    /// SPEC-METRICS-PIPELINE-001
+    pub pipeline: PipelineMetrics,
+}
+
+// ---------------------------------------------------------------------------
+// PipelineMetrics — métricas do pipeline de decode e renderização GPU
+// ---------------------------------------------------------------------------
+
+/// Métricas do pipeline de decodificação FFmpeg e renderização GPU.
+///
+/// Preenchidas pela camada `av`/`ui`:
+/// - Campos do decoder (`decoder_threads_used`, `deinterlacer_active`,
+///   `decode_time_ms_p50/p99`) são escritos pela thread `av-decode` via
+///   `Arc<RwLock<PipelineMetrics>>` e copiados no ciclo de poll da UI.
+/// - Campos do renderer (`gpu_upload_bytes_per_sec`, `colorspace`,
+///   `color_range`) são atualizados inline em `poll_video_frames` a partir
+///   do `VideoRenderer`.
+///
+/// SPEC-METRICS-PIPELINE-001
+#[derive(Debug, Clone, Default)]
+pub struct PipelineMetrics {
+    /// Número de threads de decodificação em uso.
+    ///
+    /// Igual a `CodecConfig::thread_count` resolvido; 0 antes da primeira
+    /// decodificação.
+    pub decoder_threads_used: u32,
+    /// `true` quando o deinterlacador bwdif está ativo em pelo menos um PID.
+    pub deinterlacer_active: bool,
+    /// Latência de decode P50 (mediana) por PID de vídeo, em milissegundos.
+    ///
+    /// Calculado sobre janela deslizante dos últimos 100 frames por PID.
+    pub decode_time_ms_p50: HashMap<Pid, f64>,
+    /// Latência de decode P99 por PID de vídeo, em milissegundos.
+    ///
+    /// Calculado sobre janela deslizante dos últimos 100 frames por PID.
+    pub decode_time_ms_p99: HashMap<Pid, f64>,
+    /// Taxa de bytes de planos YUV enviados à GPU por segundo.
+    ///
+    /// Atualizado a cada frame; valor médio no intervalo de 1 s.
+    pub gpu_upload_bytes_per_sec: u64,
+    /// Espaço de cor do frame de vídeo mais recente.
+    ///
+    /// Valores possíveis: `"BT.709"`, `"BT.601"`, `"BT.2020"`, `"Unspecified"`.
+    /// `None` antes do primeiro frame.
+    pub colorspace: Option<String>,
+    /// Faixa de cor (range) do frame de vídeo mais recente.
+    ///
+    /// Valores possíveis: `"Limited"`, `"Full"`. `None` antes do primeiro frame.
+    pub color_range: Option<String>,
 }
 
 impl Default for MetricsSnapshot {
@@ -271,6 +322,7 @@ impl Default for MetricsSnapshot {
             early_frames_held: 0,
             pts_discontinuities: 0,
             video_queue_depth: 0,
+            pipeline: PipelineMetrics::default(),
         }
     }
 }

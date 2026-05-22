@@ -186,6 +186,73 @@ fn has_descriptor_tag(descriptors: &[Descriptor], tag: u8) -> bool {
     descriptors.iter().any(|descriptor| descriptor.tag == tag)
 }
 
+// ── CodecConfig ───────────────────────────────────────────────────────────────
+
+/// Estratégia de threading do decodificador FFmpeg.
+///
+/// SPEC-AV-002b
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThreadType {
+    /// FFmpeg escolhe automaticamente (FF_THREAD_FRAME | FF_THREAD_SLICE).
+    #[default]
+    Auto,
+    /// Frame threading — decodifica múltiplos frames em paralelo (FF_THREAD_FRAME).
+    ///
+    /// Adiciona latência de ~`thread_count` frames; aceitável para monitoramento
+    /// broadcast onde decodificação atemporal é mais importante que latência mínima.
+    Frame,
+    /// Slice threading — decodifica fatias de um frame em paralelo (FF_THREAD_SLICE).
+    ///
+    /// Menor latência que frame threading; suportado apenas em alguns codecs
+    /// (ex.: MPEG-2, alguns perfis H.264).
+    Slice,
+}
+
+/// Configuração do decodificador FFmpeg.
+///
+/// Controla threading, skip de loop filter e flags de qualidade/velocidade.
+/// O default conservador ativa apenas multithreading com `num_cpus` threads;
+/// as demais opções estão desabilitadas para preservar qualidade de imagem.
+///
+/// SPEC-AV-002b
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodecConfig {
+    /// Número de threads de decodificação.
+    ///
+    /// Padrão: `std::thread::available_parallelism()` (detectado em runtime).
+    /// Valor `0` deixa o FFmpeg escolher internamente.
+    pub thread_count: u32,
+    /// Estratégia de threading.
+    ///
+    /// Padrão: `ThreadType::Auto` (FFmpeg decide).
+    pub thread_type: ThreadType,
+    /// Habilita `skip_loop_filter=noref` — pula o loop filter de deblocking
+    /// em frames não-referência.
+    ///
+    /// Reduz CPU ~10–25 % em H.264; pode introduzir artefatos leves em cenas
+    /// com muito movimento. Desabilitado por padrão (conservador).
+    pub skip_loop_filter: bool,
+    /// Habilita `CODEC_FLAG2_FAST` — desativa sub-pixel ME e parte do filtro
+    /// in-loop para maior velocidade.
+    ///
+    /// Desabilitado por padrão (conservador).
+    pub flag2_fast: bool,
+}
+
+impl Default for CodecConfig {
+    fn default() -> Self {
+        let thread_count = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        Self {
+            thread_count,
+            thread_type: ThreadType::Auto,
+            skip_loop_filter: false,
+            flag2_fast: false,
+        }
+    }
+}
+
 fn has_registration(descriptors: &[Descriptor], format_identifier: &[u8; 4]) -> bool {
     descriptors
         .iter()
@@ -308,5 +375,51 @@ mod tests {
             MediaCodec::from_pmt_stream(&stream),
             Some(MediaCodec::Audio(AudioCodec::Ac3))
         );
+    }
+
+    // ── CodecConfig tests ─────────────────────────────────────────────────────
+
+    /// SPEC-AV-002b: default conservador — demais flags desabilitadas.
+    #[test]
+    fn spec_av_002b_codec_config_default_flags_disabled() {
+        let cfg = CodecConfig::default();
+        assert!(
+            !cfg.skip_loop_filter,
+            "skip_loop_filter deve ser false por padrão"
+        );
+        assert!(!cfg.flag2_fast, "flag2_fast deve ser false por padrão");
+        assert_eq!(
+            cfg.thread_type,
+            ThreadType::Auto,
+            "thread_type deve ser Auto por padrão"
+        );
+    }
+
+    /// SPEC-AV-002b: thread_count default deve ser >= 1.
+    #[test]
+    fn spec_av_002b_codec_config_default_thread_count_positive() {
+        let cfg = CodecConfig::default();
+        assert!(cfg.thread_count >= 1, "thread_count deve ser pelo menos 1");
+    }
+
+    /// SPEC-AV-002b: CodecConfig pode ser construído manualmente com valores arbitrários.
+    #[test]
+    fn spec_av_002b_codec_config_manual_construction() {
+        let cfg = CodecConfig {
+            thread_count: 4,
+            thread_type: ThreadType::Frame,
+            skip_loop_filter: true,
+            flag2_fast: false,
+        };
+        assert_eq!(cfg.thread_count, 4);
+        assert_eq!(cfg.thread_type, ThreadType::Frame);
+        assert!(cfg.skip_loop_filter);
+        assert!(!cfg.flag2_fast);
+    }
+
+    /// SPEC-AV-002b: ThreadType::Auto é o variant padrão via Default derive.
+    #[test]
+    fn spec_av_002b_thread_type_default_is_auto() {
+        assert_eq!(ThreadType::default(), ThreadType::Auto);
     }
 }

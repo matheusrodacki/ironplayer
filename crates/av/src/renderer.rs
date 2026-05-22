@@ -1,166 +1,386 @@
-//! Frame de vídeo decodificado e renderizador wgpu (D3D11) + CPU fallback.
+//! Pipeline de renderização GPU: upload YUV planar → shader WGSL YUV→RGB.
+//!
+//! Arquitetura:
+//! - Modo GPU: 3 texturas R8Unorm/R16Unorm (Y, U, V) + render pipeline WGSL +
+//!   `egui::PaintCallback` via `egui_wgpu::CallbackTrait`.
+//! - Modo CPU: fallback `egui::ColorImage` sem wgpu.
 //!
 //! SPEC-AV-003 · SPEC-AV-003c
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
-use egui::mutex::RwLock;
+use egui::epaint::PaintCallbackInfo;
 use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
+use egui_wgpu::CallbackTrait;
 
 use crate::error::AvError;
+use crate::video_queue::{YuvColorRange, YuvColorspace, YuvFrame};
 
-// ─── VideoFrame ───────────────────────────────────────────────────────────────
+// ─── Constante: shader WGSL embutido ─────────────────────────────────────────
 
-/// Frame de vídeo decodificado em formato RGB24.
+const YUV_SHADER_SRC: &str = include_str!("yuv_to_rgb.wgsl");
+
+// ─── Uniform GPU struct ───────────────────────────────────────────────────────
+
+/// Layout do uniform buffer `YuvParams` no shader WGSL.
 ///
-/// Cada pixel ocupa 3 bytes (`R`, `G`, `B`). O tamanho esperado do `data` é
-/// `width * height * 3` bytes, linha a linha, top-down.
+/// Mapeamento WGSL std140:
+/// - `mat3x3f` → 3 colunas × `vec4f` (16 bytes/coluna) = 48 bytes
+/// - `vec3f offset` → 12 bytes, + `range_scale f32` na quarta slot = 16 bytes
+/// - Total: 64 bytes (múltiplo de 16 ✓)
 ///
 /// SPEC-AV-003
-#[derive(Debug, Clone)]
-pub struct VideoFrame {
-    /// Largura do frame em pixels.
-    pub width: u32,
-    /// Altura do frame em pixels.
-    pub height: u32,
-    /// Presentation Timestamp em unidades de 90 kHz.
-    pub pts: Option<u64>,
-    /// Dados RGB24: `width * height * 3` bytes, linha a linha, top-down.
-    pub data: Bytes,
-    /// Sample Aspect Ratio numerador. Combinado com `sar_den`, define o DAR:
-    /// `DAR = (sar_num * width) / (sar_den * height)`.
-    /// Valor `1` com `sar_den == 1` indica pixels quadrados (1:1).
-    ///
-    /// SPEC-AV-003
-    pub sar_num: u32,
-    /// Sample Aspect Ratio denominador. Ver `sar_num`.
-    ///
-    /// SPEC-AV-003
-    pub sar_den: u32,
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct YuvParamsGpu {
+    /// Coluna 0 da mat3x3f (coeficientes Y → R,G,B) + padding.
+    col0: [f32; 4],
+    /// Coluna 1 da mat3x3f (coeficientes U/Cb → R,G,B) + padding.
+    col1: [f32; 4],
+    /// Coluna 2 da mat3x3f (coeficientes V/Cr → R,G,B) + padding.
+    col2: [f32; 4],
+    /// Offset RGB constante + range_scale na quarta posição.
+    offset_and_range: [f32; 4],
 }
 
-impl VideoFrame {
-    /// Cria um `VideoFrame` a partir de dados RGB24 brutos.
+impl YuvParamsGpu {
+    /// Serializa o struct para 64 bytes little-endian para upload no UBO.
+    fn to_bytes(self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        let write_f32 = |buf: &mut [u8], off: usize, v: f32| {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        for (i, &v) in self.col0.iter().enumerate() {
+            write_f32(&mut out, i * 4, v);
+        }
+        for (i, &v) in self.col1.iter().enumerate() {
+            write_f32(&mut out, 16 + i * 4, v);
+        }
+        for (i, &v) in self.col2.iter().enumerate() {
+            write_f32(&mut out, 32 + i * 4, v);
+        }
+        for (i, &v) in self.offset_and_range.iter().enumerate() {
+            write_f32(&mut out, 48 + i * 4, v);
+        }
+        out
+    }
+
+    /// Computa os parâmetros YUV → RGB a partir de `colorspace` e `color_range`.
     ///
-    /// `sar_num` e `sar_den` definem o Sample Aspect Ratio.
-    /// Passe `(1, 1)` para pixels quadrados.
+    /// O shader usa:
+    ///   `yuv = vec3((y - offset.x) * range_scale, u, v)`
+    ///   `rgb = matrix * yuv + offset`
+    ///
+    /// onde `u = U_tex - 0.5` e `v = V_tex - 0.5` (centragem de croma).
+    ///
+    /// Os coeficientes UV das colunas 1 e 2 já embutem a escala de range
+    /// (255/224 = 1,1384 para TV-range 8-bit; 1,0 para full-range).
     ///
     /// SPEC-AV-003
-    pub fn new(
-        width: u32,
-        height: u32,
-        pts: Option<u64>,
-        data: Bytes,
-        sar_num: u32,
-        sar_den: u32,
-    ) -> Self {
-        Self {
-            width,
-            height,
-            pts,
-            data,
-            sar_num: sar_num.max(1),
-            sar_den: sar_den.max(1),
+    fn for_frame(colorspace: YuvColorspace, color_range: YuvColorRange) -> Self {
+        // Coeficientes BT.xxx para Y normalizado (0..1), U/V centrados (-0.5..0.5).
+        // Formato colunas: col0=Y, col1=U/Cb, col2=V/Cr (cada coluna produz [R,G,B]).
+        let (cy, cu, cv): ([f32; 3], [f32; 3], [f32; 3]) = match colorspace {
+            YuvColorspace::Bt601 => (
+                [1.0, 1.0, 1.0],
+                [0.0, -0.344_136, 1.772],
+                [1.402, -0.714_136, 0.0],
+            ),
+            // Unspecified → tratar como BT.709 (padrão HD).
+            YuvColorspace::Bt709 | YuvColorspace::Unspecified => (
+                [1.0, 1.0, 1.0],
+                [0.0, -0.187_324, 1.855_6],
+                [1.574_8, -0.468_124, 0.0],
+            ),
+            YuvColorspace::Bt2020 => (
+                [1.0, 1.0, 1.0],
+                [0.0, -0.164_553, 1.881_4],
+                [1.474_6, -0.571_353, 0.0],
+            ),
+        };
+
+        match color_range {
+            // ─ TV-range (limited): Y ∈ [16,235], U/V ∈ [16,240] (8-bit).
+            // range_scale(Y) = 255/219 ≈ 1.1644; scale(UV) = 255/224 ≈ 1.1384
+            YuvColorRange::Limited => {
+                let uv_scale = 255.0_f32 / 224.0;
+                let range_scale = 255.0_f32 / 219.0;
+                let col0 = [cy[0], cy[1], cy[2], 0.0];
+                let col1 = [cu[0] * uv_scale, cu[1] * uv_scale, cu[2] * uv_scale, 0.0];
+                let col2 = [cv[0] * uv_scale, cv[1] * uv_scale, cv[2] * uv_scale, 0.0];
+                Self {
+                    col0,
+                    col1,
+                    col2,
+                    offset_and_range: [0.0, 0.0, 0.0, range_scale],
+                }
+            }
+
+            // ─ Full-range: Y, U, V ∈ [0,255]; sem escala adicional.
+            YuvColorRange::Full => Self {
+                col0: [cy[0], cy[1], cy[2], 0.0],
+                col1: [cu[0], cu[1], cu[2], 0.0],
+                col2: [cv[0], cv[1], cv[2], 0.0],
+                offset_and_range: [0.0, 0.0, 0.0, 1.0],
+            },
         }
     }
+}
 
-    /// Verifica se o tamanho de `data` é consistente com `width × height × 3`.
+// ─── Estado interno do pipeline GPU ──────────────────────────────────────────
+
+/// Estado mutável do pipeline GPU YUV.
+///
+/// Protegido por `Mutex` para satisfazer `CallbackTrait: Send + Sync`
+/// (o `prepare()` toma `&self`).
+///
+/// SPEC-AV-003
+struct YuvPipelineInner {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    uniform_buf: wgpu::Buffer,
+    tex_y: Option<wgpu::Texture>,
+    tex_u: Option<wgpu::Texture>,
+    tex_v: Option<wgpu::Texture>,
+    bind_group: Option<wgpu::BindGroup>,
+    dims: Option<(u32, u32)>,
+    ten_bit: bool,
+    pending: Option<YuvFrame>,
+}
+
+impl YuvPipelineInner {
+    /// Cria o pipeline wgpu, bind group layout, sampler e UBO.
     ///
     /// SPEC-AV-003
-    pub fn is_valid_size(&self) -> bool {
-        self.data.len() == (self.width as usize) * (self.height as usize) * 3
-    }
-}
+    fn create(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Result<Self, AvError> {
+        let mut constants: HashMap<String, f64> = HashMap::new();
+        if target_format.is_srgb() {
+            constants.insert("DECODE_SRGB".to_string(), 1.0_f64);
+        }
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("yuv_to_rgb"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(YUV_SHADER_SRC)),
+        });
 
-/// Converte RGB24 → RGBA8 (alpha fixo = 255).
-///
-/// Necessário porque wgpu/egui usam RGBA8, enquanto `VideoFrame` usa RGB24.
-fn rgb24_to_rgba8_into(rgb: &[u8], rgba: &mut Vec<u8>) {
-    rgba.clear();
-    rgba.reserve(rgb.len() / 3 * 4);
-    for pixel in rgb.chunks_exact(3) {
-        rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
-    }
-}
-
-#[cfg(test)]
-fn rgb24_to_rgba8(rgb: &[u8]) -> Vec<u8> {
-    let mut rgba = Vec::new();
-    rgb24_to_rgba8_into(rgb, &mut rgba);
-    rgba
-}
-
-// ─── GPU renderer ─────────────────────────────────────────────────────────────
-
-struct GpuRenderer {
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
-    egui_renderer: Arc<RwLock<egui_wgpu::Renderer>>,
-    texture: Option<wgpu::Texture>,
-    texture_id: Option<TextureId>,
-    dims: Option<(u32, u32)>,
-    rgba_scratch: Vec<u8>,
-}
-
-impl GpuRenderer {
-    fn upload(&mut self, frame: &VideoFrame) -> Result<(), AvError> {
-        let new_dims = (frame.width, frame.height);
-
-        // Recria a textura wgpu quando as dimensões mudam.
-        if self.dims != Some(new_dims) {
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("video_frame"),
-                size: wgpu::Extent3d {
-                    width: frame.width,
-                    height: frame.height,
-                    depth_or_array_layers: 1,
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yuv_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                // egui_wgpu::Renderer requer Rgba8UnormSrgb para texturas nativas.
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(64),
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("yuv_pipeline_layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+
+        let compilation_options = wgpu::PipelineCompilationOptions {
+            constants: &constants,
+            ..Default::default()
+        };
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("yuv_to_rgb_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+                compilation_options: compilation_options.clone(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options,
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("yuv_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("yuv_params_ubo"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Ok(Self {
+            pipeline,
+            bind_group_layout: bgl,
+            sampler,
+            uniform_buf,
+            tex_y: None,
+            tex_u: None,
+            tex_v: None,
+            bind_group: None,
+            dims: None,
+            ten_bit: false,
+            pending: None,
+        })
+    }
+
+    /// Faz upload das texturas YUV e atualiza o UBO a partir do frame pendente.
+    ///
+    /// SPEC-AV-003
+    fn upload_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let frame = match self.pending.take() {
+            Some(f) => f,
+            None => return,
+        };
+        if frame.width == 0 || frame.height == 0 {
+            return;
+        }
+
+        let new_dims = (frame.width, frame.height);
+        if self.dims != Some(new_dims) || self.ten_bit != frame.ten_bit {
+            let fmt = if frame.ten_bit {
+                wgpu::TextureFormat::R16Unorm
+            } else {
+                wgpu::TextureFormat::R8Unorm
+            };
+            let uv_w = frame.width.div_ceil(2);
+            let uv_h = frame.height.div_ceil(2);
+
+            let make_tex = |w: u32, h: u32, label: &str| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: fmt,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                })
+            };
+
+            let ty = make_tex(frame.width, frame.height, "yuv_y");
+            let tu = make_tex(uv_w, uv_h, "yuv_u");
+            let tv = make_tex(uv_w, uv_h, "yuv_v");
+
+            let view_y = ty.create_view(&wgpu::TextureViewDescriptor::default());
+            let view_u = tu.create_view(&wgpu::TextureViewDescriptor::default());
+            let view_v = tv.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yuv_bind_group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view_y),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view_u),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&view_v),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                ],
             });
 
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            let mut rend = self.egui_renderer.write();
-            if let Some(id) = self.texture_id {
-                rend.update_egui_texture_from_wgpu_texture(
-                    &self.device,
-                    &view,
-                    wgpu::FilterMode::Linear,
-                    id,
-                );
-            } else {
-                let id =
-                    rend.register_native_texture(&self.device, &view, wgpu::FilterMode::Linear);
-                self.texture_id = Some(id);
-            }
-            // `view` pode ser dropped; o recurso GPU é mantido pelo bind group interno do egui.
-            self.texture = Some(texture);
+            self.tex_y = Some(ty);
+            self.tex_u = Some(tu);
+            self.tex_v = Some(tv);
+            self.bind_group = Some(bg);
             self.dims = Some(new_dims);
+            self.ten_bit = frame.ten_bit;
         }
 
-        // Faz upload dos pixels RGB24 → RGBA8 para a textura wgpu.
-        if let Some(texture) = &self.texture {
-            rgb24_to_rgba8_into(frame.data.as_ref(), &mut self.rgba_scratch);
-            self.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &self.rgba_scratch,
+        let uv_w = frame.width.div_ceil(2);
+        let uv_h = frame.height.div_ceil(2);
+        let bps: u32 = if frame.ten_bit { 2 } else { 1 };
+
+        if let Some(tex) = &self.tex_y {
+            let data = prepare_plane_data(&frame.planes[0], frame.ten_bit);
+            queue.write_texture(
+                tex.as_image_copy(),
+                &data,
                 wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(4 * frame.width),
+                    bytes_per_row: Some(frame.width * bps),
                     rows_per_image: Some(frame.height),
                 },
                 wgpu::Extent3d {
@@ -170,16 +390,170 @@ impl GpuRenderer {
                 },
             );
         }
+        if let Some(tex) = &self.tex_u {
+            let data = prepare_plane_data(&frame.planes[1], frame.ten_bit);
+            queue.write_texture(
+                tex.as_image_copy(),
+                &data,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(uv_w * bps),
+                    rows_per_image: Some(uv_h),
+                },
+                wgpu::Extent3d {
+                    width: uv_w,
+                    height: uv_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        if let Some(tex) = &self.tex_v {
+            let data = prepare_plane_data(&frame.planes[2], frame.ten_bit);
+            queue.write_texture(
+                tex.as_image_copy(),
+                &data,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(uv_w * bps),
+                    rows_per_image: Some(uv_h),
+                },
+                wgpu::Extent3d {
+                    width: uv_w,
+                    height: uv_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
 
-        Ok(())
+        let params = YuvParamsGpu::for_frame(frame.colorspace, frame.color_range);
+        queue.write_buffer(&self.uniform_buf, 0, &params.to_bytes());
+    }
+
+    /// Emite os draw calls no render pass do egui.
+    ///
+    /// SPEC-AV-003
+    fn paint(&self, info: &PaintCallbackInfo, render_pass: &mut wgpu::RenderPass<'_>) {
+        let Some(bg) = &self.bind_group else {
+            return;
+        };
+        let vp = info.viewport_in_pixels();
+        if vp.width_px <= 0 || vp.height_px <= 0 {
+            return;
+        }
+        render_pass.set_viewport(
+            vp.left_px as f32,
+            vp.top_px as f32,
+            vp.width_px as f32,
+            vp.height_px as f32,
+            0.0,
+            1.0,
+        );
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, bg, &[]);
+        render_pass.draw(0..3, 0..1);
     }
 }
 
-impl Drop for GpuRenderer {
-    fn drop(&mut self) {
-        if let Some(id) = self.texture_id {
-            self.egui_renderer.write().free_texture(&id);
+// ─── Helper: escala plano 10-bit para R16Unorm ───────────────────────────────
+
+/// Prepara os dados de um plano para upload: retorna slice original (8-bit) ou
+/// vetor escalado (10-bit → R16Unorm).
+///
+/// SPEC-AV-003
+fn prepare_plane_data(plane: &[u8], ten_bit: bool) -> std::borrow::Cow<'_, [u8]> {
+    if ten_bit {
+        std::borrow::Cow::Owned(scale_10bit_plane(plane))
+    } else {
+        std::borrow::Cow::Borrowed(plane)
+    }
+}
+
+/// Escala cada amostra de 10-bit (armazenada em u16 LE com valor em bits [9:0],
+/// i.e. `raw = value << 2`) para o range completo R16Unorm (×16 → ≈ 0..65472).
+///
+/// SPEC-AV-003
+fn scale_10bit_plane(plane: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; plane.len()];
+    for (i, chunk) in plane.chunks_exact(2).enumerate() {
+        let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let scaled = raw.saturating_mul(16);
+        let bytes = scaled.to_le_bytes();
+        out[i * 2] = bytes[0];
+        out[i * 2 + 1] = bytes[1];
+    }
+    out
+}
+
+// ─── YuvPaintCallback ─────────────────────────────────────────────────────────
+
+/// `egui_wgpu::CallbackTrait` que gerencia o pipeline YUV→RGB.
+///
+/// SPEC-AV-003
+struct YuvPaintCallback {
+    state: Arc<Mutex<YuvPipelineInner>>,
+}
+
+impl CallbackTrait for YuvPaintCallback {
+    fn prepare(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        _callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        if let Ok(mut inner) = self.state.lock() {
+            inner.upload_pending(device, queue);
         }
+        Vec::new()
+    }
+
+    fn paint<'a>(
+        &'a self,
+        info: PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        _callback_resources: &'a egui_wgpu::CallbackResources,
+    ) {
+        if let Ok(inner) = self.state.lock() {
+            inner.paint(&info, render_pass);
+        }
+    }
+}
+
+// ─── GpuRenderer ─────────────────────────────────────────────────────────────
+
+struct GpuRenderer {
+    state: Arc<Mutex<YuvPipelineInner>>,
+}
+
+impl GpuRenderer {
+    fn new(device: Arc<wgpu::Device>, target_format: wgpu::TextureFormat) -> Result<Self, AvError> {
+        let inner = YuvPipelineInner::create(&device, target_format)?;
+        Ok(Self {
+            state: Arc::new(Mutex::new(inner)),
+        })
+    }
+
+    fn upload(&self, frame: &YuvFrame) {
+        if let Ok(mut inner) = self.state.lock() {
+            inner.pending = Some(frame.clone());
+        }
+    }
+
+    fn paint_callback(&self, rect: egui::Rect) -> egui::PaintCallback {
+        egui_wgpu::Callback::new_paint_callback(
+            rect,
+            YuvPaintCallback {
+                state: Arc::clone(&self.state),
+            },
+        )
+    }
+
+    fn has_frame(&self) -> bool {
+        self.state
+            .lock()
+            .map(|inner| inner.bind_group.is_some() || inner.pending.is_some())
+            .unwrap_or(false)
     }
 }
 
@@ -191,11 +565,11 @@ struct CpuRenderer {
 }
 
 impl CpuRenderer {
-    fn upload(&mut self, frame: &VideoFrame) -> Result<(), AvError> {
-        let pixels: Vec<egui::Color32> = frame
-            .data
-            .chunks_exact(3)
-            .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+    fn upload(&mut self, frame: &YuvFrame) -> Result<(), AvError> {
+        let rgba = yuv420p_to_rgba8(frame);
+        let pixels: Vec<egui::Color32> = rgba
+            .chunks_exact(4)
+            .map(|c| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
             .collect();
 
         let color_image = ColorImage {
@@ -215,7 +589,77 @@ impl CpuRenderer {
 
         Ok(())
     }
+
+    fn texture_id(&self) -> Option<TextureId> {
+        self.handle.as_ref().map(|h| h.id())
+    }
 }
+
+// ─── Helpers YUV (CPU) ────────────────────────────────────────────────────────
+
+/// Converte YUV420P (8-bit ou 10-bit) para RGBA8 na CPU usando BT.709.
+///
+/// Ponte software para o modo CPU (fallback).
+///
+/// SPEC-AV-002b
+fn yuv420p_to_rgba8(frame: &YuvFrame) -> Vec<u8> {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let uv_w = w.div_ceil(2);
+    let full_range = matches!(frame.color_range, YuvColorRange::Full);
+    let mut rgba = vec![0u8; w * h * 4];
+
+    for row in 0..h {
+        let uv_row = row / 2;
+        for col in 0..w {
+            let uv_col = col / 2;
+            let y_idx = row * w + col;
+            let uv_idx = uv_row * uv_w + uv_col;
+
+            let y_s = read_yuv_sample(&frame.planes[0], y_idx, frame.ten_bit);
+            let u_s = read_yuv_sample(&frame.planes[1], uv_idx, frame.ten_bit);
+            let v_s = read_yuv_sample(&frame.planes[2], uv_idx, frame.ten_bit);
+
+            let c = if full_range { y_s } else { y_s - 16 };
+            let d = u_s - 128;
+            let e = v_s - 128;
+
+            let r = clamp_u8((298 * c + 409 * e + 128) >> 8);
+            let g = clamp_u8((298 * c - 100 * d - 208 * e + 128) >> 8);
+            let b = clamp_u8((298 * c + 516 * d + 128) >> 8);
+
+            let i = (row * w + col) * 4;
+            rgba[i] = r;
+            rgba[i + 1] = g;
+            rgba[i + 2] = b;
+            rgba[i + 3] = 255;
+        }
+    }
+
+    rgba
+}
+
+#[inline]
+fn read_yuv_sample(plane: &[u8], sample_idx: usize, ten_bit: bool) -> i32 {
+    if ten_bit {
+        let byte_idx = sample_idx * 2;
+        let lo = plane[byte_idx] as i32;
+        let hi = plane[byte_idx + 1] as i32;
+        (hi << 8 | lo) >> 2
+    } else {
+        plane[sample_idx] as i32
+    }
+}
+
+#[inline]
+fn clamp_u8(v: i32) -> u8 {
+    v.clamp(0, 255) as u8
+}
+
+// ─── VideoRenderer ────────────────────────────────────────────────────────────
 
 // ─── VideoRenderer ────────────────────────────────────────────────────────────
 
@@ -224,100 +668,194 @@ enum RendererInner {
     Cpu(CpuRenderer),
 }
 
-/// Renderizador de frames de vídeo: modo GPU (wgpu/D3D11) ou CPU (egui::ColorImage fallback).
+/// Renderizador de frames de vídeo: modo GPU (wgpu PaintCallback) ou CPU (fallback).
 ///
-/// Em modo GPU, faz upload do `VideoFrame` RGB24 diretamente para uma textura wgpu,
-/// recriando-a quando as dimensões mudam. Em modo CPU (fallback quando D3D11 está
-/// indisponível), converte o frame para `egui::ColorImage`.
+/// ## Modo GPU
+/// Upload dos planos YUV para 3 texturas (`R8Unorm` / `R16Unorm`), aplicação
+/// do shader WGSL YUV→RGB via `egui::PaintCallback`. Use [`VideoRenderer::paint_callback`]
+/// para obter o callback e adicione-o ao painter do egui.
 ///
-/// O `texture_id()` retornado é válido para uso em `egui::Image`.
+/// ## Modo CPU
+/// Converte para `egui::ColorImage` e retorna `TextureId` via
+/// [`VideoRenderer::texture_id`] para uso com `painter.image()`.
 ///
 /// SPEC-AV-003 · SPEC-AV-003c
 pub struct VideoRenderer {
     inner: RendererInner,
+    /// Bytes enviados à GPU desde `upload_window_start`.
+    upload_bytes_window: u64,
+    /// Início da janela de medição de bytes por segundo.
+    upload_window_start: std::time::Instant,
+    /// Valor estabilizado de bytes/s calculado ao fechar a janela de 1 s.
+    upload_bytes_per_sec: u64,
+    /// Colorspace do último frame recebido.
+    last_colorspace: Option<YuvColorspace>,
+    /// Color range do último frame recebido.
+    last_color_range: Option<YuvColorRange>,
 }
 
 impl VideoRenderer {
     /// Cria um `VideoRenderer` em modo GPU (wgpu/D3D11).
     ///
-    /// `device`, `queue` e `egui_renderer` devem ser obtidos de
-    /// `eframe::egui_wgpu::RenderState` (ou `egui_wgpu::RenderState`) na
-    /// inicialização do app.
+    /// `device`       : dispositivo wgpu do `eframe::CreationContext::wgpu_render_state`.
+    /// `_queue`       : fila wgpu (reservado; upload ocorre em `prepare()`).
+    /// `target_format`: formato do framebuffer de saída (ex.: `Bgra8Unorm`).
     ///
     /// SPEC-AV-003
     pub fn new_gpu(
         device: Arc<wgpu::Device>,
-        queue: Arc<wgpu::Queue>,
-        egui_renderer: Arc<RwLock<egui_wgpu::Renderer>>,
+        _queue: Arc<wgpu::Queue>,
+        target_format: wgpu::TextureFormat,
     ) -> Self {
-        Self {
-            inner: RendererInner::Gpu(GpuRenderer {
-                device,
-                queue,
-                egui_renderer,
-                texture: None,
-                texture_id: None,
-                dims: None,
-                rgba_scratch: Vec::new(),
-            }),
+        match GpuRenderer::new(device, target_format) {
+            Ok(gpu) => Self {
+                inner: RendererInner::Gpu(gpu),
+                upload_bytes_window: 0,
+                upload_window_start: std::time::Instant::now(),
+                upload_bytes_per_sec: 0,
+                last_colorspace: None,
+                last_color_range: None,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "VideoRenderer::new_gpu falhou — recaindo para modo CPU"
+                );
+                let ctx = egui::Context::default();
+                Self {
+                    inner: RendererInner::Cpu(CpuRenderer { ctx, handle: None }),
+                    upload_bytes_window: 0,
+                    upload_window_start: std::time::Instant::now(),
+                    upload_bytes_per_sec: 0,
+                    last_colorspace: None,
+                    last_color_range: None,
+                }
+            }
         }
     }
 
     /// Cria um `VideoRenderer` em modo CPU (fallback via `egui::ColorImage`).
     ///
-    /// Usado quando D3D11/wgpu está indisponível.
-    ///
     /// SPEC-AV-003c
     pub fn new_cpu(ctx: egui::Context) -> Self {
         Self {
             inner: RendererInner::Cpu(CpuRenderer { ctx, handle: None }),
+            upload_bytes_window: 0,
+            upload_window_start: std::time::Instant::now(),
+            upload_bytes_per_sec: 0,
+            last_colorspace: None,
+            last_color_range: None,
         }
     }
 
-    /// Envia um `VideoFrame` RGB24 para a textura (GPU ou CPU).
+    /// Envia um `YuvFrame` para upload.
     ///
-    /// - Modo GPU: converte RGB24 → RGBA8, executa `queue.write_texture()` e recria
-    ///   a textura wgpu se as dimensões mudaram desde o último upload.
-    /// - Modo CPU: atualiza `egui::TextureHandle` via `egui::ColorImage`.
-    ///
-    /// Retorna `Err` se o frame tiver tamanho inconsistente com `width × height × 3`.
+    /// - **GPU**: armazena o frame; upload ocorre em `prepare()` do PaintCallback.
+    /// - **CPU**: converte YUV→RGBA8 imediatamente e atualiza a `TextureHandle`.
     ///
     /// SPEC-AV-003
-    pub fn upload(&mut self, frame: &VideoFrame) -> Result<(), AvError> {
-        if !frame.is_valid_size() {
-            return Err(AvError::Other(anyhow::anyhow!(
-                "VideoFrame com tamanho inválido: esperado {}×{}×3={} bytes, obtido {}",
-                frame.width,
-                frame.height,
-                (frame.width as usize) * (frame.height as usize) * 3,
-                frame.data.len(),
-            )));
+    pub fn upload(&mut self, frame: &YuvFrame) -> Result<(), AvError> {
+        // Atualiza metadados do último frame.
+        self.last_colorspace = Some(frame.colorspace);
+        self.last_color_range = Some(frame.color_range);
+
+        // Contabiliza bytes enviados à GPU: Y + U + V planes.
+        // Para YUV420P 8-bit: Y = w*h, U = V = (w/2)*(h/2).
+        // Para 10-bit: cada amostra ocupa 2 bytes.
+        let bps: u64 = if frame.ten_bit { 2 } else { 1 };
+        let uv_w = (frame.width as u64).div_ceil(2);
+        let uv_h = (frame.height as u64).div_ceil(2);
+        let frame_bytes = frame.width as u64 * frame.height as u64 * bps + 2 * uv_w * uv_h * bps;
+        self.upload_bytes_window = self.upload_bytes_window.saturating_add(frame_bytes);
+
+        // Fecha a janela de medição a cada segundo e atualiza o valor estabilizado.
+        let elapsed = self.upload_window_start.elapsed();
+        if elapsed >= std::time::Duration::from_secs(1) {
+            let secs = elapsed.as_secs_f64().max(0.001);
+            self.upload_bytes_per_sec = (self.upload_bytes_window as f64 / secs) as u64;
+            self.upload_bytes_window = 0;
+            self.upload_window_start = std::time::Instant::now();
         }
+
         match &mut self.inner {
-            RendererInner::Gpu(gpu) => gpu.upload(frame),
+            RendererInner::Gpu(gpu) => {
+                gpu.upload(frame);
+                Ok(())
+            }
             RendererInner::Cpu(cpu) => cpu.upload(frame),
         }
     }
 
-    /// Retorna o `egui::TextureId` atual para uso em `egui::Image`.
+    /// Retorna a taxa de bytes enviados à GPU nos últimos ~1 s.
     ///
-    /// Retorna `None` até o primeiro `upload()` bem-sucedido.
+    /// SPEC-METRICS-PIPELINE-001
+    pub fn gpu_upload_bytes_per_sec(&self) -> u64 {
+        self.upload_bytes_per_sec
+    }
+
+    /// Retorna o label do colorspace do último frame recebido.
+    ///
+    /// SPEC-METRICS-PIPELINE-001
+    pub fn current_colorspace_label(&self) -> Option<&'static str> {
+        self.last_colorspace.map(|cs| match cs {
+            YuvColorspace::Bt709 => "BT.709",
+            YuvColorspace::Bt601 => "BT.601",
+            YuvColorspace::Bt2020 => "BT.2020",
+            YuvColorspace::Unspecified => "Unspecified",
+        })
+    }
+
+    /// Retorna o label do color range do último frame recebido.
+    ///
+    /// SPEC-METRICS-PIPELINE-001
+    pub fn current_color_range_label(&self) -> Option<&'static str> {
+        self.last_color_range.map(|cr| match cr {
+            YuvColorRange::Limited => "Limited",
+            YuvColorRange::Full => "Full",
+        })
+    }
+
+    /// Retorna um `egui::PaintCallback` para o rect dado (somente modo GPU).
+    ///
+    /// O caller deve adicionar o callback ao painter via `painter.add(cb)`.
+    /// Retorna `None` em modo CPU.
     ///
     /// SPEC-AV-003
-    pub fn texture_id(&self) -> Option<TextureId> {
+    pub fn paint_callback(&self, rect: egui::Rect) -> Option<egui::PaintCallback> {
         match &self.inner {
-            RendererInner::Gpu(gpu) => gpu.texture_id,
-            RendererInner::Cpu(cpu) => cpu.handle.as_ref().map(|h| h.id()),
+            RendererInner::Gpu(gpu) => Some(gpu.paint_callback(rect)),
+            RendererInner::Cpu(_) => None,
         }
     }
 
-    /// Retorna `true` se o renderer está em modo GPU (wgpu/D3D11).
+    /// Retorna o `egui::TextureId` atual (somente modo CPU).
     ///
-    /// Retorna `false` quando operando em modo CPU (fallback `egui::ColorImage`).
+    /// Usado como fallback com `painter.image()` quando `paint_callback()` é `None`.
+    /// Em modo GPU retorna sempre `None`.
+    ///
+    /// SPEC-AV-003c
+    pub fn texture_id(&self) -> Option<TextureId> {
+        match &self.inner {
+            RendererInner::Gpu(_) => None,
+            RendererInner::Cpu(cpu) => cpu.texture_id(),
+        }
+    }
+
+    /// Retorna `true` se o renderer está em modo GPU.
     ///
     /// SPEC-AV-003c
     pub fn is_gpu_mode(&self) -> bool {
         matches!(&self.inner, RendererInner::Gpu(_))
+    }
+
+    /// Retorna `true` se um frame já foi recebido.
+    ///
+    /// SPEC-AV-003
+    pub fn has_frame(&self) -> bool {
+        match &self.inner {
+            RendererInner::Gpu(gpu) => gpu.has_frame(),
+            RendererInner::Cpu(cpu) => cpu.texture_id().is_some(),
+        }
     }
 }
 
@@ -326,15 +864,24 @@ impl VideoRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video_queue::{YuvColorRange, YuvColorspace};
 
-    /// Cria um `VideoFrame` RGB24 sólido (todos os pixels com a mesma cor).
-    fn solid_frame(width: u32, height: u32, r: u8, g: u8, b: u8) -> VideoFrame {
-        let count = (width * height) as usize;
-        let mut data = Vec::with_capacity(count * 3);
-        for _ in 0..count {
-            data.extend_from_slice(&[r, g, b]);
+    fn make_yuv_frame(width: u32, height: u32, pts: Option<u64>) -> YuvFrame {
+        let w = width as usize;
+        let h = height as usize;
+        let y = vec![16u8; w * h];
+        let uv = vec![128u8; (w / 2).max(1) * (h / 2).max(1)];
+        YuvFrame {
+            planes: [y, uv.clone(), uv],
+            width,
+            height,
+            pts,
+            sar_num: 1,
+            sar_den: 1,
+            colorspace: YuvColorspace::Bt709,
+            color_range: YuvColorRange::Limited,
+            ten_bit: false,
         }
-        VideoFrame::new(width, height, None, Bytes::from(data), 1, 1)
     }
 
     // ── SPEC-AV-003c: fallback CPU ──────────────────────────────────────────
@@ -366,7 +913,7 @@ mod tests {
     fn spec_av_003_cpu_upload_creates_texture_id() {
         let ctx = egui::Context::default();
         let mut renderer = VideoRenderer::new_cpu(ctx);
-        let frame = solid_frame(4, 4, 255, 0, 0);
+        let frame = make_yuv_frame(4, 4, None);
         renderer.upload(&frame).expect("upload não deve falhar");
         assert!(
             renderer.texture_id().is_some(),
@@ -380,11 +927,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut renderer = VideoRenderer::new_cpu(ctx);
 
-        let frame1 = solid_frame(8, 8, 255, 0, 0);
+        let frame1 = make_yuv_frame(8, 8, Some(1000));
         renderer.upload(&frame1).expect("primeiro upload");
         let id1 = renderer.texture_id();
 
-        let frame2 = solid_frame(8, 8, 0, 255, 0);
+        let frame2 = make_yuv_frame(8, 8, Some(2000));
         renderer.upload(&frame2).expect("segundo upload");
         let id2 = renderer.texture_id();
 
@@ -394,73 +941,12 @@ mod tests {
         );
     }
 
-    // ── Conversão RGB24 → RGBA8 ─────────────────────────────────────────────
-
-    /// Conversão de RGB24 para RGBA8 preserva R, G, B e injeta alpha=255.
-    #[test]
-    fn spec_av_003_rgb24_to_rgba8_preserves_channels() {
-        let rgb = [255u8, 128, 0, 0, 64, 255];
-        let rgba = rgb24_to_rgba8(&rgb);
-        assert_eq!(rgba, [255, 128, 0, 255, 0, 64, 255, 255]);
-    }
-
-    /// Todos os alphas gerados por `rgb24_to_rgba8` devem ser 255.
-    #[test]
-    fn spec_av_003_rgb24_to_rgba8_alpha_is_255() {
-        let rgb = [10u8, 20, 30, 40, 50, 60, 70, 80, 90];
-        let rgba = rgb24_to_rgba8(&rgb);
-        for (i, chunk) in rgba.chunks_exact(4).enumerate() {
-            assert_eq!(chunk[3], 255, "Alpha do pixel {i} deve ser 255");
-        }
-    }
-
-    // ── VideoFrame ──────────────────────────────────────────────────────────
-
-    /// `is_valid_size()` deve retornar `true` para frame com tamanho correto.
-    #[test]
-    fn spec_av_003_video_frame_valid_size_check() {
-        let frame = solid_frame(16, 9, 0, 0, 0);
-        assert!(
-            frame.is_valid_size(),
-            "Frame 16×9 RGB24 deve ter tamanho válido"
-        );
-    }
-
-    /// `is_valid_size()` deve retornar `false` para frame com tamanho incorreto.
-    #[test]
-    fn spec_av_003_video_frame_invalid_size_detected() {
-        let frame = VideoFrame::new(16, 9, None, Bytes::from(vec![0u8; 10]), 1, 1);
-        assert!(
-            !frame.is_valid_size(),
-            "Frame com 10 bytes deve ser inválido para 16×9"
-        );
-    }
-
-    /// `upload()` deve retornar `Err` para frame com tamanho inválido.
-    #[test]
-    fn spec_av_003_upload_rejects_invalid_frame() {
-        let ctx = egui::Context::default();
-        let mut renderer = VideoRenderer::new_cpu(ctx);
-        let bad_frame = VideoFrame::new(4, 4, None, Bytes::from(vec![0u8; 5]), 1, 1);
-        assert!(
-            renderer.upload(&bad_frame).is_err(),
-            "upload() deve retornar Err para frame com tamanho inválido"
-        );
-    }
-
-    /// Frame 0×0 tem tamanho zero, que é consistente com `0*0*3 = 0` bytes.
-    #[test]
-    fn spec_av_003_zero_dimension_frame_is_valid_size() {
-        let frame = VideoFrame::new(0, 0, None, Bytes::new(), 1, 1);
-        assert!(frame.is_valid_size());
-    }
-
     /// Upload de frame 0×0 não deve falhar no modo CPU.
     #[test]
     fn spec_av_003_cpu_zero_dim_upload() {
         let ctx = egui::Context::default();
         let mut renderer = VideoRenderer::new_cpu(ctx);
-        let frame = VideoFrame::new(0, 0, None, Bytes::new(), 1, 1);
+        let frame = make_yuv_frame(0, 0, None);
         renderer
             .upload(&frame)
             .expect("upload de frame 0×0 não deve falhar");
@@ -472,12 +958,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut renderer = VideoRenderer::new_cpu(ctx);
 
-        let frame_small = solid_frame(4, 4, 128, 128, 128);
+        let frame_small = make_yuv_frame(4, 4, None);
         renderer.upload(&frame_small).expect("upload 4×4");
         let id_before = renderer.texture_id();
 
-        // CpuRenderer chama `handle.set()` ao mudar dimensão, mantendo o mesmo TextureId.
-        let frame_large = solid_frame(8, 8, 64, 64, 64);
+        let frame_large = make_yuv_frame(8, 8, None);
         renderer.upload(&frame_large).expect("upload 8×8");
         let id_after = renderer.texture_id();
 
@@ -485,5 +970,95 @@ mod tests {
             id_before, id_after,
             "CpuRenderer reutiliza o mesmo TextureHandle (mesmo ID) ao mudar dimensão"
         );
+    }
+
+    /// Em modo CPU, `paint_callback()` deve retornar `None`.
+    #[test]
+    fn spec_av_003_paint_callback_none_in_cpu_mode() {
+        let ctx = egui::Context::default();
+        let renderer = VideoRenderer::new_cpu(ctx);
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        assert!(
+            renderer.paint_callback(rect).is_none(),
+            "paint_callback() deve ser None em modo CPU"
+        );
+    }
+
+    // ── yuv420p_to_rgba8 ────────────────────────────────────────────────────
+
+    /// Frame YUV420P preto (Y=16, U=V=128) deve produzir pixels RGBA8 próximos de preto.
+    #[test]
+    fn spec_av_003_yuv420p_black_frame_is_near_black_rgba() {
+        let frame = make_yuv_frame(4, 4, None);
+        let rgba = yuv420p_to_rgba8(&frame);
+        assert_eq!(rgba.len(), 4 * 4 * 4);
+        for chunk in rgba.chunks_exact(4) {
+            assert!(chunk[0] <= 4, "R deve ser próximo de 0");
+            assert!(chunk[1] <= 4, "G deve ser próximo de 0");
+            assert!(chunk[2] <= 4, "B deve ser próximo de 0");
+            assert_eq!(chunk[3], 255, "Alpha deve ser 255");
+        }
+    }
+
+    /// Frame 0×0 deve retornar buffer vazio sem panic.
+    #[test]
+    fn spec_av_003_yuv420p_zero_dim_returns_empty() {
+        let frame = make_yuv_frame(0, 0, None);
+        let rgba = yuv420p_to_rgba8(&frame);
+        assert!(rgba.is_empty());
+    }
+
+    // ── YuvParamsGpu ────────────────────────────────────────────────────────
+
+    /// Serialização de `YuvParamsGpu` deve produzir exatamente 64 bytes.
+    #[test]
+    fn spec_av_003_yuv_params_size() {
+        let p = YuvParamsGpu::for_frame(YuvColorspace::Bt709, YuvColorRange::Limited);
+        assert_eq!(p.to_bytes().len(), 64);
+    }
+
+    /// `range_scale` para limited range (BT.709) deve ser ≈ 255/219 ≈ 1.1644.
+    #[test]
+    fn spec_av_003_yuv_params_range_scale_limited() {
+        let p = YuvParamsGpu::for_frame(YuvColorspace::Bt709, YuvColorRange::Limited);
+        let range_scale = p.offset_and_range[3];
+        let expected = 255.0_f32 / 219.0;
+        assert!(
+            (range_scale - expected).abs() < 1e-4,
+            "range_scale BT.709 limited deve ser ≈ {expected}, got {range_scale}"
+        );
+    }
+
+    /// `range_scale` para full range deve ser 1.0.
+    #[test]
+    fn spec_av_003_yuv_params_range_scale_full() {
+        let p = YuvParamsGpu::for_frame(YuvColorspace::Bt709, YuvColorRange::Full);
+        let range_scale = p.offset_and_range[3];
+        assert!(
+            (range_scale - 1.0_f32).abs() < 1e-6,
+            "range_scale full deve ser 1.0, got {range_scale}"
+        );
+    }
+
+    // ── scale_10bit_plane ───────────────────────────────────────────────────
+
+    /// Máximo 10-bit (raw = 1023 << 2 = 4092) deve escalar para 65472 (= 4092 × 16).
+    #[test]
+    fn spec_av_003_scale_10bit_max() {
+        let max_10bit: u16 = 1023;
+        let raw: u16 = max_10bit << 2; // = 4092 (decoder armazena value<<2)
+        let input = raw.to_le_bytes();
+        let out = scale_10bit_plane(&input);
+        let result = u16::from_le_bytes([out[0], out[1]]);
+        assert_eq!(result, 65472, "10-bit max deve escalar para 65472");
+    }
+
+    /// Zero deve permanecer zero.
+    #[test]
+    fn spec_av_003_scale_10bit_zero() {
+        let input = 0u16.to_le_bytes();
+        let out = scale_10bit_plane(&input);
+        let result = u16::from_le_bytes([out[0], out[1]]);
+        assert_eq!(result, 0);
     }
 }

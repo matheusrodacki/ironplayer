@@ -16,5 +16,6 @@ cpal              = { workspace = true }
 egui              = "0.29"
 wgpu              = "22"
 egui-wgpu         = "0.29"
+bytemuck          = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

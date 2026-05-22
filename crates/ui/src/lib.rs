@@ -22,7 +22,7 @@ use crate::panels::tables::TablesPanel;
 use crate::panels::video::VideoPanel;
 use crate::status_bar::StatusBar;
 use av::video_queue::{PopResult, VideoQueue};
-use av::{Clock, MasterClock, VideoFrame, VideoRenderer};
+use av::{Clock, MasterClock, VideoRenderer, YuvFrame};
 
 // ---------------------------------------------------------------------------
 // IronPlayerApp
@@ -64,7 +64,7 @@ pub struct IronPlayerApp {
     /// Receptor de frames de vídeo decodificados (FfmpegDecoder → UI).
     ///
     /// SPEC-AV-003
-    video_frames_rx: Option<Receiver<VideoFrame>>,
+    video_frames_rx: Option<Receiver<YuvFrame>>,
     /// Fila de frames de vídeo ordenada por PTS com políticas drop/hold/resync.
     ///
     /// Substitui o pipeline best-effort de drenagem simples.
@@ -94,6 +94,13 @@ pub struct IronPlayerApp {
     last_metrics_snapshot_timestamp: Option<Instant>,
     /// Número de eventos de jitter PCR já incorporados ao histórico da UI.
     seen_pcr_jitter_records: usize,
+    /// Métricas do pipeline de decodificação (decoder threads, deinterlacer,
+    /// decode time p50/p99) compartilhadas com a thread `av-decode`.
+    ///
+    /// Preenchido via `set_pipeline_metrics_rx` após `new()`.
+    ///
+    /// SPEC-METRICS-PIPELINE-001
+    pipeline_metrics_rx: Option<Arc<std::sync::RwLock<ts::metrics::PipelineMetrics>>>,
 }
 
 impl IronPlayerApp {
@@ -102,7 +109,7 @@ impl IronPlayerApp {
     /// `snapshot_rx`: receptor de métricas do pipeline; `None` quando o
     /// pipeline ainda não foi iniciado (modo stand-alone / testes).
     ///
-    /// `video_frames_rx`: receptor de `VideoFrame` decodificados; `None` em
+    /// `video_frames_rx`: receptor de `YuvFrame` decodificados; `None` em
     /// modo stand-alone. Quando `Some`, o renderer é inicializado em modo GPU
     /// (D3D11 via wgpu) se disponível, ou modo CPU como fallback.
     ///
@@ -116,7 +123,7 @@ impl IronPlayerApp {
         audio_status_rx: Option<Arc<RwLock<AudioStatusSnapshot>>>,
         selected_service_rx: Option<Arc<RwLock<Option<u16>>>>,
         table_events_rx: Option<Receiver<TableEvent>>,
-        video_frames_rx: Option<Receiver<VideoFrame>>,
+        video_frames_rx: Option<Receiver<YuvFrame>>,
     ) -> Self {
         // Inicializa VideoRenderer em modo GPU (D3D11) quando wgpu disponível,
         // ou em modo CPU como fallback. SPEC-AV-003 · SPEC-AV-003c
@@ -125,7 +132,7 @@ impl IronPlayerApp {
                 VideoRenderer::new_gpu(
                     wgpu_state.device.clone(),
                     wgpu_state.queue.clone(),
-                    wgpu_state.renderer.clone(),
+                    wgpu_state.target_format,
                 )
             } else {
                 VideoRenderer::new_cpu(cc.egui_ctx.clone())
@@ -152,7 +159,20 @@ impl IronPlayerApp {
             aspect_ratio_mode: AspectRatioMode::default(),
             last_metrics_snapshot_timestamp: None,
             seen_pcr_jitter_records: 0,
+            pipeline_metrics_rx: None,
         }
+    }
+
+    /// Associa o Arc compartilhado de métricas do pipeline ao app.
+    ///
+    /// Deve ser chamado logo após `new()`, antes do primeiro `update()`.
+    ///
+    /// SPEC-METRICS-PIPELINE-001
+    pub fn set_pipeline_metrics_rx(
+        &mut self,
+        rx: Arc<std::sync::RwLock<ts::metrics::PipelineMetrics>>,
+    ) {
+        self.pipeline_metrics_rx = Some(rx);
     }
 
     /// Retorna uma referência imutável ao estado atual da UI.
@@ -292,6 +312,16 @@ impl IronPlayerApp {
             if let Some(renderer) = &mut self.video_renderer {
                 match renderer.upload(&frame) {
                     Ok(()) => {
+                        // Atualiza métricas de GPU upload, colorspace e color_range.
+                        // SPEC-METRICS-PIPELINE-001
+                        self.state.metrics.pipeline.gpu_upload_bytes_per_sec =
+                            renderer.gpu_upload_bytes_per_sec();
+                        if let Some(cs) = renderer.current_colorspace_label() {
+                            self.state.metrics.pipeline.colorspace = Some(cs.to_string());
+                        }
+                        if let Some(cr) = renderer.current_color_range_label() {
+                            self.state.metrics.pipeline.color_range = Some(cr.to_string());
+                        }
                         // Aplica o SAR para calcular as dimensões de exibição corretas.
                         // DAR = SAR * (w/h); mantemos w fixo e ajustamos h:
                         //   display_h = pixel_h * sar_den / sar_num
@@ -347,6 +377,23 @@ impl IronPlayerApp {
                 .is_some_and(|(t, _)| *t < cutoff)
             {
                 self.state.av_sync_history.pop_front();
+            }
+        }
+    }
+
+    /// Copia as métricas de pipeline da thread `av-decode` para o snapshot local.
+    ///
+    /// Lê o `Arc<RwLock<PipelineMetrics>>` sem bloqueio (try_read); se a lock
+    /// estiver ocupada, o frame é pulado sem afetar a UI.
+    ///
+    /// SPEC-METRICS-PIPELINE-001
+    fn poll_pipeline_metrics(&mut self) {
+        if let Some(rx) = &self.pipeline_metrics_rx {
+            if let Ok(m) = rx.read() {
+                self.state.metrics.pipeline.decoder_threads_used = m.decoder_threads_used;
+                self.state.metrics.pipeline.deinterlacer_active = m.deinterlacer_active;
+                self.state.metrics.pipeline.decode_time_ms_p50 = m.decode_time_ms_p50.clone();
+                self.state.metrics.pipeline.decode_time_ms_p99 = m.decode_time_ms_p99.clone();
             }
         }
     }
@@ -412,13 +459,14 @@ impl eframe::App for IronPlayerApp {
         self.poll_snapshot();
         self.poll_table_events();
         self.poll_video_frames();
+        self.poll_pipeline_metrics();
 
-        // eframe e' reactive por padrao -- so' repinta com interacao do
-        // usuario. Para vídeo em tempo real precisamos de redraw contínuo:
-        // pedimos repaint a ~60 Hz enquanto houver fluxo de video. Sem isso o
-        // canal `video_frames` lota e o decoder fica gerando frames descartados.
+        // eframe é reactive por padrão. Para vídeo em tempo real, pedimos
+        // repaint reativo na chegada de cada frame (via ctx.request_repaint()
+        // chamado no pipeline) em vez de polling fixo a 16 ms. O PresentMode::Fifo
+        // garante sincronismo com vblank e evita tearing.
         if self.video_frames_rx.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            ctx.request_repaint();
         }
 
         // ── Header: URL + botões Conectar / Desconectar ──────────────────────
@@ -465,11 +513,6 @@ impl eframe::App for IronPlayerApp {
         });
 
         // ── Painel esquerdo: VideoPanel (≈40%) ───────────────────────────────
-        let video_texture = self
-            .video_renderer
-            .as_ref()
-            .and_then(|r| r.texture_id())
-            .zip(self.video_dims);
         egui::SidePanel::left("video_panel")
             .resizable(true)
             .default_width(400.0)
@@ -477,7 +520,8 @@ impl eframe::App for IronPlayerApp {
                 VideoPanel::show(
                     ui,
                     &self.state,
-                    video_texture,
+                    self.video_renderer.as_ref(),
+                    self.video_dims,
                     &self.cmd_tx,
                     &mut self.aspect_ratio_mode,
                 );
@@ -515,6 +559,10 @@ pub fn run(title: &str) -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size([1280.0, 720.0]),
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            present_mode: eframe::wgpu::PresentMode::Fifo,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

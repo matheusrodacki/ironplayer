@@ -2,6 +2,7 @@
 //!
 //! SPEC-UI-001
 
+use av::VideoRenderer;
 use crossbeam_channel::Sender;
 use eframe::egui;
 use ts::tables::PmtStream;
@@ -61,11 +62,12 @@ pub struct VideoPanel;
 impl VideoPanel {
     /// Renderiza o painel de vídeo.
     ///
-    /// `video_texture`: par `(TextureId, (width, height))` do frame mais
-    /// recente produzido pelo `VideoRenderer`. Quando `Some`, exibe o frame
-    /// escalado para preencher a área disponível mantendo o aspect-ratio.
-    /// Quando `None` e conectado sem serviço selecionado, exibe fundo preto.
-    /// Caso contrário, mostra o placeholder `"[ sem stream ]"`.
+    /// `video_renderer`: referência ao `VideoRenderer` atual, ou `None` quando
+    /// ainda não há frame. Em modo GPU emite um `PaintCallback`; em modo CPU
+    /// usa `painter.image()` via `texture_id()`.
+    ///
+    /// `video_dims`: dimensões `(width, height)` do frame corrente em pixels
+    /// de display (SAR-corrigidas).
     ///
     /// `aspect_ratio`: modo de proporção selecionado pelo usuário; mutado
     /// pelo submenu de contexto.
@@ -77,7 +79,8 @@ impl VideoPanel {
     pub fn show(
         ui: &mut egui::Ui,
         state: &AppState,
-        video_texture: Option<(egui::TextureId, (u32, u32))>,
+        video_renderer: Option<&VideoRenderer>,
+        video_dims: Option<(u32, u32)>,
         cmd_tx: &Sender<AppCommand>,
         aspect_ratio: &mut AspectRatioMode,
     ) {
@@ -89,10 +92,8 @@ impl VideoPanel {
         // ── Aloca toda a área e captura a resposta para o menu de contexto. ──
         let (rect, response) = ui.allocate_exact_size(available, egui::Sense::hover());
 
-        if let Some((tex_id, (w, h))) = video_texture {
+        if let (Some(renderer), Some((w, h))) = (video_renderer, video_dims) {
             // Exibe o frame decodificado escalado com aspect-ratio correto.
-            // `video_dims` já carrega as dimensões SAR-corrigidas (DAR);
-            // o mode pode sobrescrever com um valor fixo.
             let stream_aspect = w as f32 / h.max(1) as f32;
             let aspect = aspect_ratio.effective_aspect(stream_aspect);
             let (draw_w, draw_h) = if available.x / available.y > aspect {
@@ -106,12 +107,19 @@ impl VideoPanel {
 
             ui.painter()
                 .rect_filled(rect, egui::Rounding::ZERO, egui::Color32::BLACK);
-            ui.painter().image(
-                tex_id,
-                draw_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+
+            if let Some(callback) = renderer.paint_callback(draw_rect) {
+                // Modo GPU: emite PaintCallback para o pipeline WGSL.
+                ui.painter().add(callback);
+            } else if let Some(tex_id) = renderer.texture_id() {
+                // Modo CPU: fallback via egui::TextureId.
+                ui.painter().image(
+                    tex_id,
+                    draw_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
         } else if has_stream {
             // Conectado mas ainda sem frame: fundo preto.
             ui.painter()

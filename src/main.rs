@@ -453,17 +453,53 @@ fn main() -> eframe::Result<()> {
 
     // Thread: av-decode — SPEC-AV-002b
     // Recebe PesPackets, decodifica via FFmpeg e roteia VideoFrame/AudioFrame.
+
+    // Arc compartilhado para expor métricas do pipeline de decode à UI.
+    let pipeline_metrics_shared: std::sync::Arc<std::sync::RwLock<ts::metrics::PipelineMetrics>> =
+        std::sync::Arc::new(std::sync::RwLock::new(
+            ts::metrics::PipelineMetrics::default(),
+        ));
+    let pipeline_metrics_ui = std::sync::Arc::clone(&pipeline_metrics_shared);
+
     {
         let pes_packets_rx = ch.pes_packets_rx;
         let video_frames_tx = ch.video_frames_tx;
         let video_frames_rx_for_drop = ch.video_frames_rx.clone();
         let audio_frames_tx = ch.audio_frames_tx;
         let audio_status = audio_status.clone();
+        // Constrói CodecConfig a partir do DecoderConfig lido do ironstream.toml.
+        let codec_cfg = av::CodecConfig {
+            thread_count: if cfg.decoder.thread_count == 0 {
+                std::thread::available_parallelism()
+                    .map(|n| n.get() as u32)
+                    .unwrap_or(1)
+            } else {
+                cfg.decoder.thread_count
+            },
+            thread_type: match cfg.decoder.thread_type {
+                config::DecoderThreadType::Auto => av::ThreadType::Auto,
+                config::DecoderThreadType::Frame => av::ThreadType::Frame,
+                config::DecoderThreadType::Slice => av::ThreadType::Slice,
+            },
+            // Aplica overrides de perfil: fast → ativa skip_loop_filter + flag2_fast;
+            // accurate → desativa ambos; default → usa valores individuais do TOML.
+            skip_loop_filter: match cfg.decoder.profile {
+                config::DecoderProfile::Fast => true,
+                config::DecoderProfile::Accurate => false,
+                config::DecoderProfile::Default => cfg.decoder.skip_loop_filter,
+            },
+            flag2_fast: match cfg.decoder.profile {
+                config::DecoderProfile::Fast => true,
+                config::DecoderProfile::Accurate => false,
+                config::DecoderProfile::Default => cfg.decoder.flag2_fast,
+            },
+        };
+        let pipeline_metrics_decode = std::sync::Arc::clone(&pipeline_metrics_shared);
         handles.push(
             std::thread::Builder::new()
                 .name("av-decode".into())
                 .spawn(move || {
-                    let mut decoder = match av::FfmpegDecoder::new() {
+                    let mut decoder = match av::FfmpegDecoder::new_with_config(codec_cfg) {
                         Ok(d) => d,
                         Err(e) => {
                             tracing::error!(
@@ -483,12 +519,21 @@ fn main() -> eframe::Result<()> {
                     let mut decode_err_count: std::collections::HashMap<u16, u64> =
                         std::collections::HashMap::new();
 
+                    // Rastreamento de latência de decode por PID de vídeo (janela deslizante).
+                    let mut decode_times: std::collections::HashMap<
+                        u16,
+                        std::collections::VecDeque<f64>,
+                    > = std::collections::HashMap::new();
+                    const TIMING_WINDOW: usize = 100;
+                    let mut pipeline_update_timer = std::time::Instant::now();
+
                     loop {
                         // Drena comandos de controle (ex.: Reset ao trocar serviço).
                         while let Ok(command) = decode_cmd_rx.try_recv() {
                             match command {
                                 DecodeCommand::Reset => {
                                     decoder.reset();
+                                    decode_times.clear();
                                     tracing::info!(
                                         "av-decode: contextos resetados (troca de serviço)"
                                     );
@@ -497,42 +542,87 @@ fn main() -> eframe::Result<()> {
                         }
 
                         match pes_packets_rx.recv_timeout(Duration::from_millis(20)) {
-                            Ok(packet) => match decoder.decode(&packet) {
-                                Ok(frames) => {
-                                    for frame in frames {
-                                        match frame {
-                                            av::DecodedFrame::Video(vf) => {
-                                                video_frames_tx
-                                                    .try_send_latest(&video_frames_rx_for_drop, vf);
+                            Ok(packet) => {
+                                let is_video = matches!(packet.codec, av::MediaCodec::Video(_));
+                                let pid = packet.pid;
+                                let t0 = std::time::Instant::now();
+                                let decode_result = decoder.decode(&packet);
+                                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+                                if is_video {
+                                    let w = decode_times.entry(pid).or_default();
+                                    w.push_back(elapsed_ms);
+                                    if w.len() > TIMING_WINDOW {
+                                        w.pop_front();
+                                    }
+                                }
+
+                                // Atualiza o Arc de métricas de pipeline a cada ~1 s.
+                                if pipeline_update_timer.elapsed() >= Duration::from_secs(1) {
+                                    if let Ok(mut m) = pipeline_metrics_decode.write() {
+                                        m.decoder_threads_used = decoder.threads_used();
+                                        m.deinterlacer_active = decoder.has_deinterlacer_active();
+                                        m.decode_time_ms_p50.clear();
+                                        m.decode_time_ms_p99.clear();
+                                        for (&vpid, times) in &decode_times {
+                                            if times.is_empty() {
+                                                continue;
                                             }
-                                            av::DecodedFrame::Audio(af) => {
-                                                audio_frames_tx.try_send(af);
+                                            let mut sorted: Vec<f64> =
+                                                times.iter().copied().collect();
+                                            sorted.sort_by(|a, b| {
+                                                a.partial_cmp(b)
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                            });
+                                            let mid = sorted.len() / 2;
+                                            m.decode_time_ms_p50.insert(vpid, sorted[mid]);
+                                            let p99_idx = ((sorted.len() * 99) / 100)
+                                                .min(sorted.len().saturating_sub(1));
+                                            m.decode_time_ms_p99.insert(vpid, sorted[p99_idx]);
+                                        }
+                                    }
+                                    pipeline_update_timer = std::time::Instant::now();
+                                }
+
+                                match decode_result {
+                                    Ok(frames) => {
+                                        for frame in frames {
+                                            match frame {
+                                                av::DecodedFrame::Video(vf) => {
+                                                    video_frames_tx.try_send_latest(
+                                                        &video_frames_rx_for_drop,
+                                                        vf,
+                                                    );
+                                                }
+                                                av::DecodedFrame::Audio(af) => {
+                                                    audio_frames_tx.try_send(af);
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    if matches!(packet.codec, av::MediaCodec::Audio(_)) {
-                                        if let Ok(mut status) = audio_status.write() {
-                                            status.errors.decode_errors += 1;
-                                            status.errors.last_error = Some(e.to_string());
-                                            status.state = ui::AudioOperationalState::Error;
+                                    Err(e) => {
+                                        if matches!(packet.codec, av::MediaCodec::Audio(_)) {
+                                            if let Ok(mut status) = audio_status.write() {
+                                                status.errors.decode_errors += 1;
+                                                status.errors.last_error = Some(e.to_string());
+                                                status.state = ui::AudioOperationalState::Error;
+                                            }
+                                        }
+                                        let n = decode_err_count.entry(packet.pid).or_insert(0);
+                                        *n += 1;
+                                        // Loga o primeiro erro e depois a cada 200 ocorrencias
+                                        // do mesmo PID, evitando saturar o terminal.
+                                        if *n == 1 || (*n).is_multiple_of(200) {
+                                            tracing::warn!(
+                                                %e,
+                                                pid = packet.pid,
+                                                count = *n,
+                                                "av-decode: erro ao decodificar PES"
+                                            );
                                         }
                                     }
-                                    let n = decode_err_count.entry(packet.pid).or_insert(0);
-                                    *n += 1;
-                                    // Loga o primeiro erro e depois a cada 200 ocorrencias
-                                    // do mesmo PID, evitando saturar o terminal.
-                                    if *n == 1 || (*n).is_multiple_of(200) {
-                                        tracing::warn!(
-                                            %e,
-                                            pid = packet.pid,
-                                            count = *n,
-                                            "av-decode: erro ao decodificar PES"
-                                        );
-                                    }
                                 }
-                            },
+                            }
                             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         }
@@ -855,6 +945,10 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("IronPlayer")
             .with_inner_size([1280.0, 720.0]),
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            present_mode: eframe::wgpu::PresentMode::Fifo,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -862,19 +956,18 @@ fn main() -> eframe::Result<()> {
         "IronPlayer",
         native_options,
         Box::new(move |cc| {
-            Ok(Box::new(IronPlayerAppWithPipeline {
-                inner: IronPlayerApp::new(
-                    cc,
-                    cmd_tx,
-                    Some(snapshot_rx),
-                    Some(conn_state),
-                    Some(audio_status),
-                    Some(selected_service),
-                    Some(table_events_rx.clone()),
-                    Some(video_frames_rx),
-                ),
-                guard,
-            }))
+            let mut inner = IronPlayerApp::new(
+                cc,
+                cmd_tx,
+                Some(snapshot_rx),
+                Some(conn_state),
+                Some(audio_status),
+                Some(selected_service),
+                Some(table_events_rx.clone()),
+                Some(video_frames_rx),
+            );
+            inner.set_pipeline_metrics_rx(pipeline_metrics_ui);
+            Ok(Box::new(IronPlayerAppWithPipeline { inner, guard }))
         }),
     )
 }

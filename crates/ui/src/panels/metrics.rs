@@ -80,8 +80,71 @@ impl MetricsPanel {
         self.show_jitter_plot(ui, state);
         ui.add_space(6.0);
 
+        // ── Pipeline de decodificação ──────────────────────────────────────
+        self.show_pipeline_panel(ui, state);
+        ui.add_space(6.0);
+
         // ── Log de erros ───────────────────────────────────────────────────
         self.show_error_log(ui, cmd_tx);
+    }
+
+    // -----------------------------------------------------------------------
+    // Painel de pipeline de decodificação — SPEC-METRICS-PIPELINE-001
+    // -----------------------------------------------------------------------
+
+    /// Exibe o painel com métricas do pipeline de decodificação e renderização.
+    ///
+    /// SPEC-METRICS-PIPELINE-001
+    fn show_pipeline_panel(&self, ui: &mut egui::Ui, state: &AppState) {
+        let p = &state.metrics.pipeline;
+        ui.label("Pipeline");
+        egui::Grid::new("pipeline_grid")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Threads decoder");
+                ui.label(p.decoder_threads_used.to_string());
+                ui.end_row();
+
+                ui.label("Deinterlace (bwdif)");
+                ui.label(if p.deinterlacer_active {
+                    "Ativo"
+                } else {
+                    "Inativo"
+                });
+                ui.end_row();
+
+                ui.label("Colorspace");
+                ui.label(p.colorspace.as_deref().unwrap_or("-"));
+                ui.end_row();
+
+                ui.label("Color range");
+                ui.label(p.color_range.as_deref().unwrap_or("-"));
+                ui.end_row();
+
+                ui.label("Upload GPU");
+                let upload = p.gpu_upload_bytes_per_sec;
+                if upload >= 1_000_000 {
+                    ui.label(format!("{:.1} MB/s", upload as f64 / 1_000_000.0));
+                } else if upload >= 1_000 {
+                    ui.label(format!("{:.1} KB/s", upload as f64 / 1_000.0));
+                } else {
+                    ui.label(format!("{upload} B/s"));
+                }
+                ui.end_row();
+
+                // Latência de decode p50/p99 por PID de vídeo.
+                let mut pids: Vec<u16> = p.decode_time_ms_p50.keys().copied().collect();
+                pids.sort();
+                for vpid in pids {
+                    let p50 = p.decode_time_ms_p50.get(&vpid).copied().unwrap_or(0.0);
+                    let p99 = p.decode_time_ms_p99.get(&vpid).copied().unwrap_or(0.0);
+                    ui.label(format!("Decode PID 0x{vpid:04X}"));
+                    ui.label(format!("p50={p50:.1}ms  p99={p99:.1}ms"));
+                    ui.end_row();
+                }
+            });
     }
 
     // -----------------------------------------------------------------------

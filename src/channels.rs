@@ -1,4 +1,4 @@
-use av::{AudioFrame, PesPacket, VideoFrame};
+use av::{AudioFrame, PesPacket, YuvFrame};
 /// SPEC-CHAN-001
 /// Helper de canais bounded com monitoramento de backpressure.
 ///
@@ -213,8 +213,8 @@ pub struct AppChannels {
     pub table_events_rx: Receiver<TableEvent>,
 
     /// `video_frames`: FfmpegDecoder → VideoRenderer
-    pub video_frames_tx: BoundedSender<VideoFrame>,
-    pub video_frames_rx: Receiver<VideoFrame>,
+    pub video_frames_tx: BoundedSender<YuvFrame>,
+    pub video_frames_rx: Receiver<YuvFrame>,
 
     /// `audio_frames`: FfmpegDecoder → AudioOutput
     pub audio_frames_tx: BoundedSender<AudioFrame>,

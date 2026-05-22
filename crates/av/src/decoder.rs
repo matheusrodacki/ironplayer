@@ -8,22 +8,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bytes::Bytes;
-
 use crate::audio::AudioFrame;
-use crate::codec::{AudioCodec, MediaCodec};
+use crate::codec::{AudioCodec, CodecConfig, MediaCodec};
+use crate::deinterlace::Deinterlacer;
 use crate::error::AvError;
 use crate::ffi::{
-    find_ffmpeg_dll_dir, FfmpegCodecContext, FfmpegFrame, FfmpegLib, FfmpegPacket, AV_CODEC_ID_AAC,
-    AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC,
-    AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
+    find_ffmpeg_dll_dir, frame_flags, FfmpegCodecContext, FfmpegFrame, FfmpegLib, FfmpegPacket,
+    FilterLib, AV_CODEC_ID_AAC, AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3,
+    AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
+    AV_FRAME_FLAG_INTERLACED,
 };
 use crate::pes::PesPacket;
-use crate::renderer::VideoFrame;
+use crate::video_queue::{YuvColorRange, YuvColorspace, YuvFrame};
 
 // ─── DecodedFrame ─────────────────────────────────────────────────────────────
 
-/// Frame decodificado: vídeo RGB24 ou áudio PCM f32.
+/// Frame decodificado: vídeo YUV ou áudio PCM f32.
 ///
 /// Produzido pelo `FfmpegDecoder` e consumido pelo pipeline de renderização
 /// e reprodução de áudio.
@@ -31,8 +31,8 @@ use crate::renderer::VideoFrame;
 /// SPEC-AV-002b
 #[derive(Debug, Clone)]
 pub enum DecodedFrame {
-    /// Frame de vídeo decodificado (RGB24).
-    Video(VideoFrame),
+    /// Frame de vídeo decodificado (YUV planar).
+    Video(YuvFrame),
     /// Frame de áudio decodificado (PCM f32 interleaved).
     Audio(AudioFrame),
 }
@@ -83,7 +83,13 @@ fn codec_to_avid(codec: MediaCodec) -> Result<u32, AvError> {
 /// Estado de decodificação para um único PID (stream elementar).
 struct CodecState {
     codec_ctx: FfmpegCodecContext,
+    /// Frame AVFrame reutilizado entre chamadas para evitar alloc/free por frame.
+    frame: FfmpegFrame,
     is_video: bool,
+    /// Deinterlacador bwdif, criado lazily na primeira aparição de frame
+    /// interlaced. `None` se o stream não for interlaced ou se `FilterLib`
+    /// não estiver disponível.
+    deinterlacer: Option<Deinterlacer>,
 }
 
 // ─── FfmpegDecoder ────────────────────────────────────────────────────────────
@@ -104,18 +110,37 @@ struct CodecState {
 /// SPEC-AV-002b
 pub struct FfmpegDecoder {
     lib: Arc<FfmpegLib>,
+    /// Biblioteca avfilter para deinterlacing bwdif. `None` se a DLL não
+    /// estiver disponível — nesse caso frames interlaced são entregues sem
+    /// deinterlacing mas o pipeline continua funcionando.
+    filter_lib: Option<Arc<FilterLib>>,
+    /// Configuração de threading e flags de qualidade/velocidade do decoder.
+    codec_config: CodecConfig,
     /// Mapa de PID → estado do decodificador para aquele stream.
     states: HashMap<u16, CodecState>,
 }
 
 impl FfmpegDecoder {
-    /// Cria um `FfmpegDecoder` carregando as DLLs FFmpeg.
+    /// Cria um `FfmpegDecoder` carregando as DLLs FFmpeg com configuração padrão.
+    ///
+    /// O default conservador usa `num_cpus` threads e mantém todas as outras
+    /// flags de otimização desabilitadas. Use `new_with_config` para personalizar.
     ///
     /// Retorna `Err(AvError::FfmpegUnavailable)` se as DLLs não forem
     /// encontradas ou estiverem com versão incompatível.
     ///
     /// SPEC-AV-002b
     pub fn new() -> Result<Self, AvError> {
+        Self::new_with_config(CodecConfig::default())
+    }
+
+    /// Cria um `FfmpegDecoder` carregando as DLLs FFmpeg com `config` explicitado.
+    ///
+    /// Retorna `Err(AvError::FfmpegUnavailable)` se as DLLs não forem
+    /// encontradas ou estiverem com versão incompatível.
+    ///
+    /// SPEC-AV-002b
+    pub fn new_with_config(config: CodecConfig) -> Result<Self, AvError> {
         let dll_dir = find_ffmpeg_dll_dir().ok_or_else(|| AvError::FfmpegUnavailable {
             message: "DLLs FFmpeg não encontradas. Defina FFMPEG_DLL_DIR ou coloque \
                  as DLLs em {exe_dir}/ffmpeg/"
@@ -125,20 +150,45 @@ impl FfmpegDecoder {
         let lib = FfmpegLib::load(&dll_dir)?;
         tracing::info!(dir = %dll_dir.display(), "FFmpeg carregado com sucesso");
 
+        // Tenta carregar avfilter para suporte a deinterlacing bwdif.
+        // Falha silenciosa: se a DLL não estiver disponível, frames interlaced
+        // são entregues sem processamento mas o pipeline continua funcional.
+        let filter_lib = FilterLib::load(&dll_dir)
+            .map_err(|e| {
+                tracing::debug!(%e, "avfilter não disponível — deinterlacing desabilitado");
+            })
+            .ok();
+        if filter_lib.is_some() {
+            tracing::debug!("avfilter carregado — deinterlacing bwdif habilitado");
+        }
+
         Ok(Self {
             lib,
+            filter_lib,
+            codec_config: config,
             states: HashMap::new(),
         })
     }
 
-    /// Cria um `FfmpegDecoder` a partir de um `Arc<FfmpegLib>` já carregado.
+    /// Cria um `FfmpegDecoder` a partir de um `Arc<FfmpegLib>` já carregado,
+    /// usando a configuração padrão.
     ///
     /// Útil em testes para reutilizar uma lib já carregada.
     ///
     /// SPEC-AV-002b
     pub fn with_lib(lib: Arc<FfmpegLib>) -> Self {
+        Self::with_lib_and_config(lib, CodecConfig::default())
+    }
+
+    /// Cria um `FfmpegDecoder` a partir de um `Arc<FfmpegLib>` já carregado
+    /// com `config` explicitado.
+    ///
+    /// SPEC-AV-002b
+    pub fn with_lib_and_config(lib: Arc<FfmpegLib>, config: CodecConfig) -> Self {
         Self {
             lib,
+            filter_lib: None,
+            codec_config: config,
             states: HashMap::new(),
         }
     }
@@ -151,6 +201,22 @@ impl FfmpegDecoder {
     /// SPEC-AV-002b
     pub fn reset(&mut self) {
         self.states.clear();
+    }
+
+    /// Retorna `true` se pelo menos um PID de vídeo tem o deinterlacador bwdif ativo.
+    ///
+    /// SPEC-AV-004
+    pub fn has_deinterlacer_active(&self) -> bool {
+        self.states
+            .values()
+            .any(|s| s.is_video && s.deinterlacer.is_some())
+    }
+
+    /// Retorna o número de threads de decodificação configurado.
+    ///
+    /// SPEC-AV-002b
+    pub fn threads_used(&self) -> u32 {
+        self.codec_config.thread_count
     }
 
     /// Decodifica um `PesPacket` completo, retornando todos os frames prontos.
@@ -170,28 +236,33 @@ impl FfmpegDecoder {
         // Obtém ou cria o codec state para este PID.
         if !self.states.contains_key(&pid_raw) {
             let avid = codec_to_avid(pes.codec)?;
-            let codec_ctx = FfmpegCodecContext::open(Arc::clone(&self.lib), avid).map_err(|e| {
-                tracing::error!(%e, pid = pid_raw, "falha ao abrir decodificador");
-                e
-            })?;
+            let codec_ctx =
+                FfmpegCodecContext::open(Arc::clone(&self.lib), avid, &self.codec_config).map_err(
+                    |e| {
+                        tracing::error!(%e, pid = pid_raw, "falha ao abrir decodificador");
+                        e
+                    },
+                )?;
+            let frame = FfmpegFrame::alloc(Arc::clone(&self.lib))?;
             let is_video = matches!(pes.codec, MediaCodec::Video(_));
             self.states.insert(
                 pid_raw,
                 CodecState {
                     codec_ctx,
+                    frame,
                     is_video,
+                    deinterlacer: None,
                 },
             );
         }
 
-        let state = self.states.get(&pid_raw).ok_or_else(|| {
+        let state = self.states.get_mut(&pid_raw).ok_or_else(|| {
             AvError::Other(anyhow::anyhow!(
                 "codec state ausente após inserção — invariante violado"
             ))
         })?;
 
         let mut frames = Vec::new();
-        let mut av_frame = FfmpegFrame::alloc(Arc::clone(&self.lib))?;
 
         // AAC LATM: um PES pode conter múltiplos frames LOAS concatenados.
         // O decoder aac_latm do FFmpeg aceita apenas um frame LOAS por AVPacket;
@@ -223,9 +294,9 @@ impl FfmpegDecoder {
                     continue;
                 }
                 loop {
-                    match state.codec_ctx.receive_frame(&mut av_frame) {
+                    match state.codec_ctx.receive_frame(&mut state.frame) {
                         Ok(true) => {
-                            let (sr, ch) = av_frame.audio_params().map_err(|e| {
+                            let (sr, ch) = state.frame.audio_params().map_err(|e| {
                                 tracing::warn!(
                                     %e,
                                     pid = pid_raw,
@@ -233,14 +304,15 @@ impl FfmpegDecoder {
                                 );
                                 e
                             })?;
-                            let (pts_raw, out_sr, out_ch, samples) = av_frame.to_pcm_f32(sr, ch)?;
+                            let (pts_raw, out_sr, out_ch, samples) =
+                                state.frame.to_pcm_f32(sr, ch)?;
                             frames.push(DecodedFrame::Audio(AudioFrame::new(
                                 out_sr,
                                 out_ch,
                                 pts_raw_to_option(pts_raw),
                                 samples,
                             )));
-                            av_frame.unref();
+                            state.frame.unref();
                         }
                         Ok(false) => break,
                         Err(e) => {
@@ -272,35 +344,78 @@ impl FfmpegDecoder {
         }
 
         loop {
-            match state.codec_ctx.receive_frame(&mut av_frame) {
+            match state.codec_ctx.receive_frame(&mut state.frame) {
                 Ok(true) => {
                     // Frame pronto — converte para tipo Rust.
                     let decoded = if state.is_video {
-                        let (w, h, pts_raw, rgb, sar) = av_frame.to_rgb24().map_err(|e| {
-                            tracing::warn!(%e, pid = pid_raw, "falha ao converter frame de vídeo");
-                            e
-                        })?;
+                        // Verifica se o frame é interlaced (FFmpeg 8.x: flags bit 0).
+                        // SAFETY: state.frame.as_ptr() aponta para AVFrame válido e preenchido.
+                        let is_interlaced = unsafe {
+                            frame_flags(state.frame.as_ptr()) & AV_FRAME_FLAG_INTERLACED != 0
+                        };
+
+                        // Aplica bwdif se interlaced e FilterLib disponível.
+                        let di_frame: Option<FfmpegFrame> = if is_interlaced
+                            && state.deinterlacer.is_none()
+                        {
+                            if let Some(fl) = &self.filter_lib {
+                                state.deinterlacer =
+                                    Some(Deinterlacer::new(Arc::clone(fl), Arc::clone(&self.lib)));
+                            }
+                            None
+                        } else {
+                            None
+                        };
+
+                        let di_frame = if is_interlaced {
+                            if let Some(di) = state.deinterlacer.as_mut() {
+                                match di.process(&state.frame) {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        tracing::warn!(%e, pid = pid_raw, "bwdif: erro; usando frame original");
+                                        None
+                                    }
+                                }
+                            } else {
+                                di_frame
+                            }
+                        } else {
+                            di_frame
+                        };
+
+                        // Se bwdif retornou EAGAIN (precisando de mais contexto),
+                        // descarta o frame e aguarda o próximo.
+                        let source = di_frame.as_ref().unwrap_or(&state.frame);
+
+                        let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, ten_bit) =
+                            source.to_yuv_planes().map_err(|e| {
+                                tracing::warn!(%e, pid = pid_raw, "falha ao extrair planos YUV");
+                                e
+                            })?;
                         let pts = pts_raw_to_option(pts_raw);
-                        DecodedFrame::Video(VideoFrame::new(
-                            w,
-                            h,
+                        DecodedFrame::Video(YuvFrame {
+                            planes,
+                            width: w,
+                            height: h,
                             pts,
-                            Bytes::from(rgb),
-                            sar.0,
-                            sar.1,
-                        ))
+                            sar_num: sar.0,
+                            sar_den: sar.1,
+                            colorspace: YuvColorspace::from_avutil(raw_cs),
+                            color_range: YuvColorRange::from_avutil(raw_cr),
+                            ten_bit,
+                        })
                     } else {
-                        let (sr, ch) = av_frame.audio_params().map_err(|e| {
+                        let (sr, ch) = state.frame.audio_params().map_err(|e| {
                             tracing::warn!(%e, pid = pid_raw, "falha ao ler metadata de áudio do frame");
                             e
                         })?;
-                        let (pts_raw, out_sr, out_ch, samples) = av_frame.to_pcm_f32(sr, ch)?;
+                        let (pts_raw, out_sr, out_ch, samples) = state.frame.to_pcm_f32(sr, ch)?;
                         let pts = pts_raw_to_option(pts_raw);
                         DecodedFrame::Audio(AudioFrame::new(out_sr, out_ch, pts, samples))
                     };
                     frames.push(decoded);
                     // Limpa o frame para reutilização.
-                    av_frame.unref();
+                    state.frame.unref();
                 }
                 Ok(false) => {
                     // EAGAIN ou EOF — sem mais frames por agora.
@@ -382,6 +497,7 @@ fn pts_raw_to_option(pts_raw: i64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::ffi::find_ffmpeg_dll_dir;
+    use bytes::Bytes;
 
     /// SPEC-AV-002b: `FfmpegDecoder::new` retorna erro quando DLLs ausentes.
     ///
@@ -589,7 +705,8 @@ mod tests {
                         // Dimensões devem ser positivas se frame for decodificado.
                         assert!(vf.width > 0, "width deve ser > 0");
                         assert!(vf.height > 0, "height deve ser > 0");
-                        assert!(vf.is_valid_size(), "tamanho dos dados RGB24 inconsistente");
+                        let y_expected = vf.width as usize * vf.height as usize;
+                        assert_eq!(vf.planes[0].len(), y_expected, "plano Y deve ter w*h bytes");
                     }
                 }
             }

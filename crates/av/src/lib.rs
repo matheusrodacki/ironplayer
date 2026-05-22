@@ -20,6 +20,7 @@ pub mod audio;
 pub mod clock;
 pub mod codec;
 pub mod decoder;
+pub(crate) mod deinterlace;
 pub mod error;
 pub mod ffi;
 pub mod pes;
@@ -30,12 +31,12 @@ pub mod video_queue;
 
 pub use audio::{AudioFrame, AudioOutput, AudioRingBuffer};
 pub use clock::{AudioClockHandle, Clock, MasterClock, Pts90, WallClockHandle};
-pub use codec::{AudioCodec, MediaCodec, VideoCodec};
+pub use codec::{AudioCodec, CodecConfig, MediaCodec, ThreadType, VideoCodec};
 pub use decoder::{DecodedFrame, FfmpegDecoder};
 pub use error::AvError;
 pub use pes::{PesAssembler, PesPacket};
-pub use renderer::{VideoFrame, VideoRenderer};
+pub use renderer::VideoRenderer;
 pub use video_queue::{
-    PopResult, PushResult, VideoQueue, DEFAULT_CAPACITY as VIDEO_QUEUE_CAPACITY, DROP_PTS,
-    HOLD_PTS, RESYNC_PTS,
+    PopResult, PushResult, VideoQueue, YuvColorRange, YuvColorspace, YuvFrame,
+    DEFAULT_CAPACITY as VIDEO_QUEUE_CAPACITY, DROP_PTS, HOLD_PTS, RESYNC_PTS,
 };

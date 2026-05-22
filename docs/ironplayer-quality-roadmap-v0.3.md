@@ -1,6 +1,6 @@
 # IronPlayer — Roadmap de Qualidade
 
-> **Versão:** 0.1 (rascunho para revisão tópico-a-tópico)
+> **Versão:** 0.3 (rascunho para revisão tópico-a-tópico)
 > **Data:** 2026-05-21
 > **Status:** Análise pré-execução — nenhum item abaixo foi implementado ainda.
 > **Escopo:** consolidar lacunas técnicas identificadas em duas sessões de validação com TS reais SD/HD H.264 LATM via FFmpeg e 4K HEVC + E-AC-3 via TSDuck, e propor caminhos concretos de resolução, priorizados para chegar à Qualidade Profissional.

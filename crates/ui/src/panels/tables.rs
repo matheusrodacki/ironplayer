@@ -340,11 +340,14 @@ impl TablesPanel {
                         if let Some(pat) = &tables.pat {
                             for prog in &pat.programs {
                                 if prog.program_number == 0 {
-                                    ui.label(format!("  NIT PID: 0x{:04X}", prog.pid));
+                                    ui.label(format!(
+                                        "  NIT PID: {} (0x{:04X})",
+                                        prog.pid, prog.pid
+                                    ));
                                 } else {
                                     ui.label(format!(
-                                        "  Prog {:4}  \u{2192}  PMT PID 0x{:04X}",
-                                        prog.program_number, prog.pid
+                                        "  Prog {:4}  ->  PMT PID {} (0x{:04X})",
+                                        prog.program_number, prog.pid, prog.pid
                                     ));
                                 }
                             }
@@ -365,14 +368,15 @@ impl TablesPanel {
                             for prog_id in prog_ids {
                                 let pmt = &tables.pmts[&prog_id];
                                 egui::CollapsingHeader::new(format!(
-                                    "Programa {:4}  v{}  (PCR PID 0x{:04X})",
-                                    prog_id, pmt.version, pmt.pcr_pid
+                                    "Programa {:4}  v{}  (PCR PID {} (0x{:04X}))",
+                                    prog_id, pmt.version, pmt.pcr_pid, pmt.pcr_pid
                                 ))
                                 .id_salt(format!("pmt_{prog_id}"))
                                 .show(ui, |ui| {
                                     for stream in &pmt.streams {
                                         ui.label(format!(
-                                            "  0x{:04X}  {}",
+                                            "  {} (0x{:04X})  {}",
+                                            stream.elementary_pid,
                                             stream.elementary_pid,
                                             stream_type_label(stream.stream_type),
                                         ));

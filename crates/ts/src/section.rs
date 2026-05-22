@@ -92,12 +92,6 @@ impl SectionAssembler {
         let payload = &data.payload;
 
         if data.pusi {
-            // ── PUSI=true: início (ou reinício) de seção ──────────────────
-            //
-            // SPEC-TS-003a: "PUSI=true com buffer pendente → Descarta anterior,
-            // inicia nova."
-            self.buffers.remove(&pid);
-
             // Precisamos de pelo menos 1 byte para o pointer_field.
             if payload.is_empty() {
                 warn!("PUSI=true mas payload vazio; PID=0x{:04X}", pid);
@@ -107,28 +101,80 @@ impl SectionAssembler {
             let pointer_field = payload[0] as usize;
             let section_start = 1 + pointer_field;
 
-            // Precisamos de pelo menos 3 bytes após pointer_field para ler
-            // table_id e section_length.
-            if section_start + 3 > payload.len() {
+            if section_start > payload.len() {
                 warn!(
-                    "payload insuficiente após pointer_field={}; PID=0x{:04X}",
+                    "payload insuficiente para pointer_field={}; PID=0x{:04X}",
                     pointer_field, pid
                 );
                 return Ok(());
             }
 
-            let table_id = payload[section_start];
-            // Bits de section_length: (byte1 & 0x0F) << 8 | byte2
-            let section_length = ((payload[section_start + 1] as u16 & 0x0F) << 8)
-                | payload[section_start + 2] as u16;
+            if pointer_field > 0 {
+                self.append_pending(pid, &payload[1..section_start]);
+            }
 
-            // SPEC-TS-003a: section_length > 4093 → Err(TsError::SectionTooLarge)
+            if self.buffers.contains_key(&pid) {
+                // PUSI indica uma nova seção neste payload; se o buffer anterior
+                // não fechou com os bytes apontados pelo pointer_field, ele está
+                // obsoleto para este PID.
+                self.buffers.remove(&pid);
+            }
+
+            if section_start < payload.len() {
+                self.push_section_starts(pid, &payload[section_start..])?;
+            }
+        } else {
+            // ── PUSI=false: continuação de seção pendente ─────────────────
+            self.append_pending(pid, payload);
+        }
+
+        Ok(())
+    }
+
+    fn append_pending(&mut self, pid: Pid, bytes: &[u8]) {
+        let Some(buf) = self.buffers.get_mut(&pid) else {
+            return;
+        };
+
+        let total_needed = 3 + buf.section_length as usize;
+        let remaining = total_needed.saturating_sub(buf.data.len());
+        let to_append = bytes.len().min(remaining);
+
+        buf.data.extend_from_slice(&bytes[..to_append]);
+
+        if buf.is_complete() {
+            let buf = self.buffers.remove(&pid).unwrap();
+            self.try_emit(buf);
+        }
+    }
+
+    fn push_section_starts(&mut self, pid: Pid, bytes: &[u8]) -> Result<(), TsError> {
+        let mut pos = 0usize;
+
+        while pos < bytes.len() {
+            // 0xFF é stuffing PSI/SI após a última seção no payload.
+            if bytes[pos] == 0xFF {
+                break;
+            }
+
+            // Precisamos de pelo menos 3 bytes para ler table_id e section_length.
+            if pos + 3 > bytes.len() {
+                warn!(
+                    "payload insuficiente para header de seção; PID=0x{:04X}",
+                    pid
+                );
+                break;
+            }
+
+            let table_id = bytes[pos];
+            let section_length = ((bytes[pos + 1] as u16 & 0x0F) << 8) | bytes[pos + 2] as u16;
+
             if section_length > 4093 {
                 return Err(TsError::SectionTooLarge(section_length));
             }
 
             let total_needed = 3 + section_length as usize;
-            let available = payload.len() - section_start;
+            let available = bytes.len() - pos;
             let to_copy = available.min(total_needed);
 
             let mut buf = SectionBuffer {
@@ -137,31 +183,14 @@ impl SectionAssembler {
                 section_length,
                 data: Vec::with_capacity(total_needed),
             };
-            buf.data
-                .extend_from_slice(&payload[section_start..section_start + to_copy]);
+            buf.data.extend_from_slice(&bytes[pos..pos + to_copy]);
 
             if buf.is_complete() {
                 self.try_emit(buf);
+                pos += total_needed;
             } else {
                 self.buffers.insert(pid, buf);
-            }
-        } else {
-            // ── PUSI=false: continuação de seção pendente ─────────────────
-            let Some(buf) = self.buffers.get_mut(&pid) else {
-                // Sem buffer pendente — não há seção iniciada para este PID.
-                return Ok(());
-            };
-
-            let total_needed = 3 + buf.section_length as usize;
-            let remaining = total_needed.saturating_sub(buf.data.len());
-            let to_append = payload.len().min(remaining);
-
-            buf.data.extend_from_slice(&payload[..to_append]);
-
-            if buf.is_complete() {
-                // Remover do mapa antes de chamar try_emit (que consome o buffer).
-                let buf = self.buffers.remove(&pid).unwrap();
-                self.try_emit(buf);
+                break;
             }
         }
 
@@ -294,6 +323,33 @@ mod tests {
         assert!(evt_rx.try_recv().is_err(), "nenhum evento esperado");
     }
 
+    /// Se um payload PSI/SI contém mais de uma seção completa, todas devem ser
+    /// emitidas. SDT multi-section pode empacotar serviços diferentes assim.
+    ///
+    /// SPEC-TS-003
+    #[test]
+    fn spec_ts_003_multiple_sections_in_single_payload() {
+        let (tx, rx) = bounded::<CompleteSection>(16);
+        let (evt_tx, evt_rx) = bounded::<TsEvent>(16);
+        let mut asm = SectionAssembler::new(tx, evt_tx);
+
+        let section_a = make_section(0x42, &[0x00, 0x01]);
+        let section_b = make_section(0x42, &[0x00, 0x10]);
+        let mut payload = vec![0x00u8];
+        payload.extend_from_slice(&section_a);
+        payload.extend_from_slice(&section_b);
+        payload.extend_from_slice(&[0xFF; 8]);
+
+        let result = asm.push(section_data_pusi(0x0011, Bytes::from(payload)));
+
+        assert!(result.is_ok());
+        let sections: Vec<CompleteSection> = rx.try_iter().collect();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].data.as_ref(), &section_a[..section_a.len() - 4]);
+        assert_eq!(sections[1].data.as_ref(), &section_b[..section_b.len() - 4]);
+        assert!(evt_rx.try_recv().is_err(), "nenhum evento esperado");
+    }
+
     // ── SPEC-TS-003 — Cenário 2: seção fragmentada em 3 pacotes ──────────────
 
     /// Seção fragmentada em 3 pacotes: emitida apenas após o 3º pacote.
@@ -381,6 +437,40 @@ mod tests {
             rx.try_recv().is_err(),
             "apenas uma seção deve ter sido emitida"
         );
+    }
+
+    /// Quando PUSI=true chega com pointer_field > 0, os bytes apontados
+    /// completam a seção pendente antes de iniciar a próxima seção no payload.
+    ///
+    /// SPEC-TS-003
+    #[test]
+    fn spec_ts_003_pointer_field_completes_pending_section() {
+        let (tx, rx) = bounded::<CompleteSection>(16);
+        let (evt_tx, evt_rx) = bounded::<TsEvent>(16);
+        let mut asm = SectionAssembler::new(tx, evt_tx);
+
+        let section_a = make_section(0x42, &[0x00, 0x01, 0xAA, 0xBB]);
+        let section_b = make_section(0x42, &[0x00, 0x10]);
+        let split = section_a.len() - 3;
+
+        let mut first_payload = vec![0x00u8];
+        first_payload.extend_from_slice(&section_a[..split]);
+        asm.push(section_data_pusi(0x0011, Bytes::from(first_payload)))
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "seção ainda incompleta");
+
+        let mut second_payload = vec![3u8];
+        second_payload.extend_from_slice(&section_a[split..]);
+        second_payload.extend_from_slice(&section_b);
+        second_payload.extend_from_slice(&[0xFF; 8]);
+        asm.push(section_data_pusi(0x0011, Bytes::from(second_payload)))
+            .unwrap();
+
+        let sections: Vec<CompleteSection> = rx.try_iter().collect();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].data.as_ref(), &section_a[..section_a.len() - 4]);
+        assert_eq!(sections[1].data.as_ref(), &section_b[..section_b.len() - 4]);
+        assert!(evt_rx.try_recv().is_err(), "nenhum evento esperado");
     }
 
     // ── SPEC-TS-003 — Cenário 4: CRC inválido ────────────────────────────────

@@ -171,7 +171,7 @@ impl VideoPanel {
                     let name = service_name(state, svc_id);
                     let is_active = state.selected_service == Some(svc_id);
                     let label = if is_active {
-                        format!("✓  {name}")
+                        format!("[x]  {name}")
                     } else {
                         format!("    {name}")
                     };
@@ -201,15 +201,14 @@ impl VideoPanel {
                                 .active_track
                                 .as_ref()
                                 .is_some_and(|track| track.pid == stream.elementary_pid);
-                            let marker = if active { "✓" } else { " " };
+                            let marker = if active { "[x]" } else { "   " };
                             let language = audio_language(stream)
                                 .map(|language| format!(" [{language}]"))
                                 .unwrap_or_default();
                             (
                                 stream.elementary_pid,
                                 format!(
-                                    "{marker} {} / 0x{:04X}  {}{}",
-                                    stream.elementary_pid,
+                                    "{marker} {}  {}{}",
                                     stream.elementary_pid,
                                     stream.label(),
                                     language,
@@ -272,7 +271,7 @@ impl VideoPanel {
             for (mode, label) in options {
                 let active = *aspect_ratio == mode;
                 let display = if active {
-                    format!("✓  {label}")
+                    format!("[x]  {label}")
                 } else {
                     format!("    {label}")
                 };
@@ -495,15 +494,15 @@ mod tests {
 
         let is_active = state.selected_service == Some(0x0101);
         let label = if is_active {
-            format!("✓  {}", "Canal HD")
+            format!("[x]  {}", "Canal HD")
         } else {
             format!("    {}", "Canal HD")
         };
-        assert!(label.starts_with('✓'));
+        assert!(label.starts_with("[x]"));
 
         let is_active2 = state.selected_service == Some(0x0102);
         let label2 = if is_active2 {
-            format!("✓  {}", "Canal 2")
+            format!("[x]  {}", "Canal 2")
         } else {
             format!("    {}", "Canal 2")
         };

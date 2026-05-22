@@ -271,7 +271,25 @@ impl AppState {
                 self.tables.pmts.insert(pmt.program_number, pmt);
             }
             TableEvent::Nit(nit) => self.tables.nit = Some(nit),
-            TableEvent::Sdt(sdt) => self.tables.sdt = Some(sdt),
+            // Aceita apenas SDT actual (table_id 0x42); SDT other (0x46) descreve
+            // serviços de outros transport streams e não deve sobrescrever os dados locais.
+            // O SDT pode ter múltiplas seções (last_section_number > 0); seções da mesma
+            // versão são mescladas para acumular todos os serviços do multiplex.
+            TableEvent::Sdt(sdt) if sdt.actual => match &mut self.tables.sdt {
+                Some(existing) if existing.version == sdt.version => {
+                    for svc in sdt.services {
+                        if !existing
+                            .services
+                            .iter()
+                            .any(|s| s.service_id == svc.service_id)
+                        {
+                            existing.services.push(svc);
+                        }
+                    }
+                }
+                _ => self.tables.sdt = Some(sdt),
+            },
+            TableEvent::Sdt(_) => {}
             TableEvent::EitPf {
                 service_id,
                 current,
@@ -390,6 +408,66 @@ mod tests {
         state.apply_table_event(TableEvent::Pat(pat.clone()));
 
         assert_eq!(state.tables.pat, Some(pat));
+    }
+
+    /// SPEC-UI-002: seções SDT da mesma versão são mescladas; versão nova substitui.
+    #[test]
+    fn spec_ui_002_sdt_multi_section_merge() {
+        use ts::tables::{RunningStatus, SdtService};
+
+        let make_svc = |id: u16, name: &str| SdtService {
+            service_id: id,
+            eit_schedule_flag: false,
+            eit_present_following: false,
+            running_status: RunningStatus::Running,
+            free_ca_mode: false,
+            service_name: Some(name.to_owned()),
+            provider_name: None,
+            service_type: None,
+            descriptors: vec![],
+        };
+        let make_sdt = |version: u8, services: Vec<SdtService>| Sdt {
+            transport_stream_id: 1,
+            original_network_id: 1,
+            version,
+            actual: true,
+            services,
+        };
+
+        let mut state = AppState::default();
+
+        // Seção 0: service 0x0001 "Service01"
+        state.apply_table_event(TableEvent::Sdt(make_sdt(
+            3,
+            vec![make_svc(0x0001, "Service01")],
+        )));
+        assert_eq!(state.tables.sdt.as_ref().unwrap().services.len(), 1);
+
+        // Seção 1 (mesma versão): service 0x0010 "Globo" — deve mesclar
+        state.apply_table_event(TableEvent::Sdt(make_sdt(
+            3,
+            vec![make_svc(0x0010, "Globo")],
+        )));
+        let sdt = state.tables.sdt.as_ref().unwrap();
+        assert_eq!(sdt.services.len(), 2);
+        assert!(sdt.services.iter().any(|s| s.service_id == 0x0001));
+        assert!(sdt.services.iter().any(|s| s.service_id == 0x0010));
+
+        // Mesma seção repetida não duplica
+        state.apply_table_event(TableEvent::Sdt(make_sdt(
+            3,
+            vec![make_svc(0x0001, "Service01")],
+        )));
+        assert_eq!(state.tables.sdt.as_ref().unwrap().services.len(), 2);
+
+        // Nova versão substitui completamente
+        state.apply_table_event(TableEvent::Sdt(make_sdt(
+            4,
+            vec![make_svc(0x0010, "Globo v2")],
+        )));
+        let sdt = state.tables.sdt.as_ref().unwrap();
+        assert_eq!(sdt.services.len(), 1);
+        assert_eq!(sdt.services[0].service_id, 0x0010);
     }
 
     #[test]

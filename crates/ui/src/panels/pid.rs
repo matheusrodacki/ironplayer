@@ -172,8 +172,8 @@ impl PidPanel {
     fn header_cell(&mut self, ui: &mut egui::Ui, label: &str, col: SortColumn) {
         let indicator = if self.sort_col == col {
             match self.sort_dir {
-                SortDir::Asc => " ▲",
-                SortDir::Desc => " ▼",
+                SortDir::Asc => " [^]",
+                SortDir::Desc => " [v]",
             }
         } else {
             ""
@@ -200,11 +200,11 @@ impl PidPanel {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Formata um PID como string hexadecimal com 4 dígitos (ex.: "0x0100").
+/// Formata um PID como "dec (0xHEX)" (ex.: "256 (0x0100)").
 ///
 /// SPEC-UI-003
 pub fn format_pid_hex(pid: Pid) -> String {
-    format!("0x{:04X}", pid)
+    format!("{} (0x{:04X})", pid, pid)
 }
 
 /// Retorna uma descrição curta para o tipo de PID.
@@ -259,9 +259,9 @@ mod tests {
 
     #[test]
     fn spec_ui_003_pid_format_hex() {
-        assert_eq!(format_pid_hex(0x0000_u16), "0x0000");
-        assert_eq!(format_pid_hex(0x0100_u16), "0x0100");
-        assert_eq!(format_pid_hex(0x1FFF_u16), "0x1FFF");
-        assert_eq!(format_pid_hex(0x0010_u16), "0x0010");
+        assert_eq!(format_pid_hex(0x0000_u16), "0 (0x0000)");
+        assert_eq!(format_pid_hex(0x0100_u16), "256 (0x0100)");
+        assert_eq!(format_pid_hex(0x1FFF_u16), "8191 (0x1FFF)");
+        assert_eq!(format_pid_hex(0x0010_u16), "16 (0x0010)");
     }
 }

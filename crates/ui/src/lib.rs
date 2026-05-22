@@ -21,7 +21,8 @@ use crate::panels::metrics::MetricsPanel;
 use crate::panels::tables::TablesPanel;
 use crate::panels::video::VideoPanel;
 use crate::status_bar::StatusBar;
-use av::{VideoFrame, VideoRenderer};
+use av::{Clock, MasterClock, VideoFrame, VideoRenderer};
+use av::video_queue::{VideoQueue, PopResult};
 
 // ---------------------------------------------------------------------------
 // IronPlayerApp
@@ -64,6 +65,21 @@ pub struct IronPlayerApp {
     ///
     /// SPEC-AV-003
     video_frames_rx: Option<Receiver<VideoFrame>>,
+    /// Fila de frames de vídeo ordenada por PTS com políticas drop/hold/resync.
+    ///
+    /// Substitui o pipeline best-effort de drenagem simples.
+    ///
+    /// SPEC-AV-VQ-001
+    video_queue: VideoQueue,
+    /// Clock master usado para sincronizar a exibição de frames de vídeo.
+    ///
+    /// Inicia como `MasterClock::Wall(0)` e é ancorado no PTS do primeiro
+    /// frame recebido.
+    ///
+    /// SPEC-AV-VQ-001
+    video_clock: MasterClock,
+    /// Indica se o clock de vídeo já foi ancorado ao PTS do primeiro frame.
+    video_clock_initialized: bool,
     /// Renderizador de vídeo: mantém textura GPU/CPU entre frames.
     ///
     /// SPEC-AV-003
@@ -128,6 +144,9 @@ impl IronPlayerApp {
             selected_service_rx,
             table_events_rx,
             video_frames_rx,
+            video_queue: VideoQueue::default(),
+            video_clock: MasterClock::wall(0),
+            video_clock_initialized: false,
             video_renderer,
             video_dims: None,
             aspect_ratio_mode: AspectRatioMode::default(),
@@ -209,31 +228,64 @@ impl IronPlayerApp {
         self.last_metrics_snapshot_timestamp = None;
         self.seen_pcr_jitter_records = 0;
 
+        // Drena o canal de entrada e limpa a fila PTS-ordenada.
         if let Some(rx) = &self.video_frames_rx {
             while rx.try_recv().is_ok() {}
         }
+        self.video_queue.clear();
+        self.video_clock = MasterClock::wall(0);
+        self.video_clock_initialized = false;
     }
 
-    /// Drena frames de vídeo do canal e faz upload do mais recente ao renderer.
+    /// Drena frames do canal de vídeo, insere na `VideoQueue` PTS-ordenada e
+    /// faz upload do próximo frame pronto ao renderer.
     ///
-    /// Drena até 8 frames por frame de UI, retendo apenas o mais recente para
-    /// evitar acúmulo. Segue o comportamento de drop-oldest definido em
-    /// SPEC-CHAN-001 para o canal `video_frames`.
+    /// # Algoritmo
     ///
-    /// SPEC-AV-003
+    /// 1. Drena até 16 frames do canal `video_frames_rx` e os insere na
+    ///    `VideoQueue` com as políticas drop/hold/resync/wrap.
+    /// 2. Na primeira chegada de frame com PTS definido, ancora o
+    ///    `video_clock` no PTS do frame (`reset(anchor)`), garantindo que o
+    ///    clock esteja alinhado com o início do stream.
+    /// 3. Chama `pop_ready(clock.now_pts90())` para extrair o próximo frame
+    ///    na janela de exibição:
+    ///    - `Ready`: faz upload ao renderer.
+    ///    - `Resync`: reseta o clock para `new_anchor` e faz upload.
+    ///    - `TooEarly` / `Empty`: nenhuma ação.
+    ///
+    /// SPEC-AV-003 · SPEC-AV-VQ-001
     fn poll_video_frames(&mut self) {
         let rx = match &self.video_frames_rx {
             Some(r) => r.clone(),
             None => return,
         };
 
-        // Drena até 8 frames, mantendo apenas o mais recente.
-        let mut latest: Option<VideoFrame> = None;
-        for frame in rx.try_iter().take(8) {
-            latest = Some(frame);
+        // 1. Drena até 16 frames do canal e insere na fila PTS-ordenada.
+        for frame in rx.try_iter().take(16) {
+            // Ancora o clock no PTS do primeiro frame recebido.
+            if !self.video_clock_initialized {
+                if let Some(pts) = frame.pts {
+                    self.video_clock.reset(pts as i64);
+                    self.video_clock_initialized = true;
+                }
+            }
+            self.video_queue.push(frame);
         }
 
-        if let Some(frame) = latest {
+        // 2. Extrai o próximo frame pronto para exibição.
+        let clock_pts = self.video_clock.now_pts90();
+        let ready_frame = match self.video_queue.pop_ready(clock_pts) {
+            PopResult::Ready(f) => Some(f),
+            PopResult::Resync { frame, new_anchor } => {
+                // Resincroniza o clock ao novo âncora de PTS.
+                self.video_clock.reset(new_anchor);
+                Some(frame)
+            }
+            PopResult::TooEarly | PopResult::Empty => None,
+        };
+
+        // 3. Faz upload do frame ao renderer.
+        if let Some(frame) = ready_frame {
             if let Some(renderer) = &mut self.video_renderer {
                 match renderer.upload(&frame) {
                     Ok(()) => {

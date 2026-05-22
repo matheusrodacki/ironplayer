@@ -32,7 +32,10 @@ pub const CAP_PES_PACKETS: usize = 256;
 /// Capacidade do canal `table_events` (TableDispatcher → AppState).
 pub const CAP_TABLE_EVENTS: usize = 64;
 /// Capacidade do canal `video_frames` (FfmpegDecoder → VideoRenderer).
-pub const CAP_VIDEO_FRAMES: usize = 8;
+///
+/// Alinhado com `VideoQueue::DEFAULT_CAPACITY` (16 frames) para que o canal
+/// nunca bloqueie a fila ordenada por PTS.  SPEC-AV-VQ-001
+pub const CAP_VIDEO_FRAMES: usize = 16;
 /// Capacidade do canal `audio_frames` (FfmpegDecoder → AudioOutput).
 pub const CAP_AUDIO_FRAMES: usize = 32;
 /// Capacidade do canal `pcr_events` (PcrTracker → MetricsAggregator).

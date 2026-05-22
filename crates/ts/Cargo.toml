@@ -17,3 +17,7 @@ encoding_rs       = "0.8"
 rstest            = "0.23"
 proptest          = "1"
 pretty_assertions = "1"
+
+[[test]]
+name = "e2e_validation"
+path = "tests/e2e_validation.rs"

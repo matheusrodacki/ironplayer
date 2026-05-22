@@ -36,7 +36,6 @@ pub use error::AvError;
 pub use pes::{PesAssembler, PesPacket};
 pub use renderer::{VideoFrame, VideoRenderer};
 pub use video_queue::{
-    VideoQueue, PopResult, PushResult,
-    DEFAULT_CAPACITY as VIDEO_QUEUE_CAPACITY,
-    DROP_PTS, HOLD_PTS, RESYNC_PTS,
+    PopResult, PushResult, VideoQueue, DEFAULT_CAPACITY as VIDEO_QUEUE_CAPACITY, DROP_PTS,
+    HOLD_PTS, RESYNC_PTS,
 };

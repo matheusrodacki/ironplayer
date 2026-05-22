@@ -336,8 +336,10 @@ impl TsDemuxer {
     /// registradas dinamicamente.
     #[inline]
     fn is_section_pid(&self, pid: Pid) -> bool {
-        matches!(pid, PID_PAT | PID_CAT | PID_NIT | PID_SDT | PID_EIT | PID_TDT)
-            || self.pmt_pids.contains(&pid)
+        matches!(
+            pid,
+            PID_PAT | PID_CAT | PID_NIT | PID_SDT | PID_EIT | PID_TDT
+        ) || self.pmt_pids.contains(&pid)
             || self.dynamic_nit_pid == Some(pid)
     }
 

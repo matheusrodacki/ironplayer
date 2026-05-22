@@ -3,7 +3,7 @@
 # ------------------------------------------------------------------------------
 
 # Diretório onde o Cargo salva os artefatos de compilação (binários, dependências, etc.)
-/target/
+target
 
 # Arquivos de backup gerados pelo formatador oficial (rustfmt)
 **/*.rs.bk

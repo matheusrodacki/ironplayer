@@ -172,6 +172,18 @@ impl VideoQueue {
         self.frames.is_empty()
     }
 
+    /// Retorna o PTS ajustado do frame na frente da fila sem removê-lo.
+    ///
+    /// Usado pela UI para calcular o offset de sincronização A/V:
+    /// `offset_ms = (front_pts - clock_pts) / 90.0`.
+    ///
+    /// Retorna `None` quando a fila está vazia.
+    ///
+    /// SPEC-AV-VQ-001
+    pub fn front_pts(&self) -> Option<Pts90> {
+        self.frames.front().map(|(pts, _)| *pts)
+    }
+
     /// Limpa todos os frames e reseta o estado de wrap/PTS.
     ///
     /// Chamado em descontinuidades severas ou ao reiniciar o stream.
@@ -491,9 +503,9 @@ mod tests {
             q.push(make_frame(Some(pts)));
         }
         let clock = make_clock_pts(9_000 + DROP_PTS); // 18000
-        // 100, 200, 300 estão todos abaixo de clock - DROP_PTS = 9000
-        // 9500 também está abaixo de 18000 - 9000 = 9000 → 9500 > 9000 → dentro da janela
-        // 9500 - 18000 = -8500, |−8500| < DROP_PTS (9000) → Ready
+                                                      // 100, 200, 300 estão todos abaixo de clock - DROP_PTS = 9000
+                                                      // 9500 também está abaixo de 18000 - 9000 = 9000 → 9500 > 9000 → dentro da janela
+                                                      // 9500 - 18000 = -8500, |−8500| < DROP_PTS (9000) → Ready
         let result = q.pop_ready(clock);
         assert!(
             matches!(result, PopResult::Ready(_)),
@@ -515,7 +527,10 @@ mod tests {
         q.push(make_frame(Some(frame_pts)));
         // clock = 0 → diff = 500_000 > RESYNC_PTS (45_000)
         match q.pop_ready(0) {
-            PopResult::Resync { frame: _, new_anchor } => {
+            PopResult::Resync {
+                frame: _,
+                new_anchor,
+            } => {
                 assert_eq!(new_anchor, frame_pts as i64);
             }
             other => panic!("esperava Resync, obteve {:?}", other),
@@ -615,5 +630,42 @@ mod tests {
         // frame_pts = clock - DROP_PTS → diff = -DROP_PTS → NOT < -DROP_PTS → Ready
         q.push(make_frame(Some((clock_pts - DROP_PTS) as u64)));
         assert!(matches!(q.pop_ready(clock_pts), PopResult::Ready(_)));
+    }
+
+    // ── front_pts ─────────────────────────────────────────────────────────────
+
+    /// `front_pts()` retorna `None` quando a fila está vazia.
+    ///
+    /// SPEC-AV-VQ-001
+    #[test]
+    fn spec_av_vq_001_front_pts_empty() {
+        let q = VideoQueue::new(4);
+        assert_eq!(q.front_pts(), None);
+    }
+
+    /// `front_pts()` retorna o PTS ajustado do frame na frente da fila.
+    ///
+    /// SPEC-AV-VQ-001
+    #[test]
+    fn spec_av_vq_001_front_pts_returns_smallest() {
+        let mut q = VideoQueue::new(4);
+        q.push(make_frame(Some(3000)));
+        q.push(make_frame(Some(1000)));
+        q.push(make_frame(Some(2000)));
+        // Fila está ordenada por PTS; front deve ser o menor PTS (1000).
+        assert_eq!(q.front_pts(), Some(1000));
+    }
+
+    /// `front_pts()` não remove o frame da fila.
+    ///
+    /// SPEC-AV-VQ-001
+    #[test]
+    fn spec_av_vq_001_front_pts_does_not_consume() {
+        let mut q = VideoQueue::new(4);
+        q.push(make_frame(Some(500)));
+        let pts_before = q.front_pts();
+        let pts_after = q.front_pts();
+        assert_eq!(pts_before, pts_after);
+        assert_eq!(q.len(), 1);
     }
 }

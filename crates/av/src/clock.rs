@@ -331,9 +331,7 @@ mod tests {
     fn spec_av_clock_002_audio_clock_one_second_offset() {
         let clock = AudioClockHandle::new(48_000, 2, 0);
         // 1 segundo de áudio estéreo = 48 000 frames × 2 canais = 96 000 samples
-        clock
-            .samples_played
-            .store(48_000 * 2, Ordering::Relaxed);
+        clock.samples_played.store(48_000 * 2, Ordering::Relaxed);
         assert_eq!(clock.now_pts90(), 90_000);
     }
 
@@ -345,9 +343,7 @@ mod tests {
         let anchor: Pts90 = 270_000; // 3 segundos na âncora
         let clock = AudioClockHandle::new(48_000, 2, anchor);
         // Mais 1 segundo de áudio
-        clock
-            .samples_played
-            .store(48_000 * 2, Ordering::Relaxed);
+        clock.samples_played.store(48_000 * 2, Ordering::Relaxed);
         assert_eq!(clock.now_pts90(), anchor + 90_000);
     }
 

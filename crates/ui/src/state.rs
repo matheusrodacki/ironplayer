@@ -252,6 +252,12 @@ pub struct AppState {
     pub bitrate_history: VecDeque<(Instant, f64)>,
     /// Histórico de jitter de PCR por PID.
     pub pcr_history: HashMap<Pid, VecDeque<PcrJitterRecord>>,
+    /// Histórico de offset de sincronismo A/V dos últimos 60 s (em ms).
+    ///
+    /// Amostrado a ~1 Hz junto com o bitrate. Positivo = vídeo adiantado.
+    ///
+    /// SPEC-METRICS-SYNC-001
+    pub av_sync_history: VecDeque<(Instant, i32)>,
 }
 
 impl AppState {
@@ -263,6 +269,7 @@ impl AppState {
         self.selected_service = None;
         self.bitrate_history.clear();
         self.pcr_history.clear();
+        self.av_sync_history.clear();
         self.audio.reset_stream_runtime(AudioOperationalState::Idle);
     }
 

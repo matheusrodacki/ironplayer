@@ -49,8 +49,7 @@ impl LocalTimeOffset {
             let lto_mm = data[pos + 5];
             // Bytes 6-10: time_of_change (MJD 2B + BCD HH MM SS)
             let mjd = u16::from_be_bytes([data[pos + 6], data[pos + 7]]);
-            let time_of_change =
-                decode_mjd_bcd(mjd, data[pos + 8], data[pos + 9], data[pos + 10]);
+            let time_of_change = decode_mjd_bcd(mjd, data[pos + 8], data[pos + 9], data[pos + 10]);
             let next_hh = data[pos + 11];
             let next_mm = data[pos + 12];
             out.push(LocalTimeOffset {
@@ -145,8 +144,7 @@ impl Tot {
         )?;
 
         // Bytes 8-9: reserved(4) + descriptors_loop_length(12)
-        let desc_loop_len =
-            (u16::from_be_bytes([section[8], section[9]]) & 0x0FFF) as usize;
+        let desc_loop_len = (u16::from_be_bytes([section[8], section[9]]) & 0x0FFF) as usize;
         let desc_start = 10;
         let desc_end = desc_start + desc_loop_len;
         // CRC-32 occupies the last 4 bytes of total_len
@@ -195,8 +193,8 @@ mod tests {
             hh,
             mm,
             ss,
-            0xF0 | ((desc_len >> 8) as u8),       // reserved + desc_loop_len hi
-            (desc_len & 0xFF) as u8,              // desc_loop_len lo
+            0xF0 | ((desc_len >> 8) as u8), // reserved + desc_loop_len hi
+            (desc_len & 0xFF) as u8,        // desc_loop_len lo
         ];
         sec.extend_from_slice(descriptors);
         // CRC-32
@@ -229,13 +227,20 @@ mod tests {
     fn spec_table_tot_001_with_local_time_offset() {
         // Constrói um local_time_offset descriptor (tag 0x58) com uma entrada.
         let mut lto_data: Vec<u8> = vec![
-            b'B', b'R', b'A',   // country_code = "BRA"
-            0x01,               // country_region_id=0, lto_polarity=1 (behind UTC)
-            0x03, 0x00,         // local_time_offset = BCD 03:00
+            b'B',
+            b'R',
+            b'A', // country_code = "BRA"
+            0x01, // country_region_id=0, lto_polarity=1 (behind UTC)
+            0x03,
+            0x00, // local_time_offset = BCD 03:00
             // time_of_change: MJD_2024_01_15 + 00:00:00
-            (MJD_2024_01_15 >> 8) as u8, MJD_2024_01_15 as u8,
-            0x00, 0x00, 0x00,   // 00:00:00
-            0x03, 0x00,         // next_time_offset = BCD 03:00
+            (MJD_2024_01_15 >> 8) as u8,
+            MJD_2024_01_15 as u8,
+            0x00,
+            0x00,
+            0x00, // 00:00:00
+            0x03,
+            0x00, // next_time_offset = BCD 03:00
         ];
         let mut desc = vec![0x58u8, lto_data.len() as u8];
         desc.append(&mut lto_data);
@@ -247,7 +252,10 @@ mod tests {
         assert_eq!(tot.local_time_offsets.len(), 1);
         assert_eq!(&tot.local_time_offsets[0].country_code, b"BRA");
         assert!(tot.local_time_offsets[0].local_offset_polarity);
-        assert_eq!(tot.local_time_offsets[0].local_time_offset_hhmm, (0x03, 0x00));
+        assert_eq!(
+            tot.local_time_offsets[0].local_time_offset_hhmm,
+            (0x03, 0x00)
+        );
     }
 
     /// SPEC-TABLE-TOT-001: table_id errado retorna WrongTableId.

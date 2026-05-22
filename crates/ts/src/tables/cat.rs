@@ -154,13 +154,14 @@ mod tests {
         // section_length = 2 (reserved) + 3 (version+sec_nums) + desc_len + 4 (CRC)
         let section_length = 2 + 3 + desc_len + 4;
         let mut sec = vec![
-            0x01u8,                                    // table_id
-            0x80 | ((section_length >> 8) as u8),      // section_syntax_indicator=1 + hi
-            (section_length & 0xFF) as u8,             // lo
-            0xFF, 0xFF,                                // reserved (table_id_extension)
-            0xC0 | ((version & 0x1F) << 1) | 0x01,    // reserved + version + current_next
-            0x00,                                      // section_number
-            0x00,                                      // last_section_number
+            0x01u8,                               // table_id
+            0x80 | ((section_length >> 8) as u8), // section_syntax_indicator=1 + hi
+            (section_length & 0xFF) as u8,        // lo
+            0xFF,
+            0xFF,                                  // reserved (table_id_extension)
+            0xC0 | ((version & 0x1F) << 1) | 0x01, // reserved + version + current_next
+            0x00,                                  // section_number
+            0x00,                                  // last_section_number
         ];
         sec.extend_from_slice(descriptors);
         // CRC-32 placeholder
@@ -175,8 +176,8 @@ mod tests {
     fn build_ca_descriptor(ca_system_id: u16, ca_pid: u16, private: &[u8]) -> Vec<u8> {
         let data_len = 4 + private.len();
         let mut d = vec![
-            0x09,               // tag
-            data_len as u8,     // length
+            0x09,           // tag
+            data_len as u8, // length
             (ca_system_id >> 8) as u8,
             ca_system_id as u8,
             0xE0 | ((ca_pid >> 8) as u8 & 0x1F),

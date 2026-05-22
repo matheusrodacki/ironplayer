@@ -106,6 +106,11 @@ impl SnapshotReceiver {
                 },
                 tdt_offset_secs: None,
                 timestamp: std::time::Instant::now(),
+                av_sync_offset_ms: 0,
+                late_frames_dropped: 0,
+                early_frames_held: 0,
+                pts_discontinuities: 0,
+                video_queue_depth: 0,
             })
     }
 }
@@ -199,6 +204,11 @@ impl MetricsAggregator {
             },
             tdt_offset_secs: None,
             timestamp: Instant::now(),
+            av_sync_offset_ms: 0,
+            late_frames_dropped: 0,
+            early_frames_held: 0,
+            pts_discontinuities: 0,
+            video_queue_depth: 0,
         };
         let shared = std::sync::Arc::new(std::sync::RwLock::new(initial));
         let snapshot_tx = SnapshotSender(std::sync::Arc::clone(&shared));
@@ -366,6 +376,11 @@ impl MetricsAggregator {
             errors: error_snap,
             tdt_offset_secs: None,
             timestamp: Instant::now(),
+            av_sync_offset_ms: 0,
+            late_frames_dropped: 0,
+            early_frames_held: 0,
+            pts_discontinuities: 0,
+            video_queue_depth: 0,
         }
     }
 }

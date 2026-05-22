@@ -64,7 +64,7 @@ impl PcrTracker {
     /// Versão com injeção de tempo para testes determinísticos.
     ///
     /// SPEC-TS-004b
-    pub(crate) fn update_with_time(
+    pub fn update_with_time(
         &mut self,
         pid: Pid,
         pcr: u64,

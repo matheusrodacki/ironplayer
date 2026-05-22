@@ -104,8 +104,7 @@ fn load_pat(name: &str) -> Pat {
 
     // body = seção sem 3-byte header e sem 4-byte CRC
     let body = &section[3..section.len() - 4];
-    Pat::from_section_body(body)
-        .unwrap_or_else(|e| panic!("{name}: falha ao parsear PAT: {e:?}"))
+    Pat::from_section_body(body).unwrap_or_else(|e| panic!("{name}: falha ao parsear PAT: {e:?}"))
 }
 
 /// Lê uma fixture e extrai a primeira seção PMT para o PID especificado.
@@ -122,8 +121,7 @@ fn load_pmt(name: &str, pmt_pid: u16) -> Pmt {
     );
 
     let body = &section[3..section.len() - 4];
-    Pmt::from_section_body(body)
-        .unwrap_or_else(|e| panic!("{name}: falha ao parsear PMT: {e:?}"))
+    Pmt::from_section_body(body).unwrap_or_else(|e| panic!("{name}: falha ao parsear PMT: {e:?}"))
 }
 
 /// Lê uma fixture e extrai a primeira seção SDT (PID 0x0011).
@@ -173,7 +171,11 @@ fn snap_01_cable_sd_1svc_pat() {
     assert_eq!(pat.nit_pid(), Some(0x0010), "NIT PID deve ser 0x0010");
 
     let pmt_pids: Vec<u16> = pat.pmt_pids().collect();
-    assert_eq!(pmt_pids, vec![0x0100], "deve haver exatamente 1 PMT PID: 0x0100");
+    assert_eq!(
+        pmt_pids,
+        vec![0x0100],
+        "deve haver exatamente 1 PMT PID: 0x0100"
+    );
 }
 
 /// PMT snapshot — fixture 01: H.264 + AAC.
@@ -317,7 +319,11 @@ fn snap_03_cable_3svc_sdt() {
     assert_eq!(sdt.transport_stream_id, 1003);
     assert_eq!(sdt.services.len(), 3);
 
-    let names: Vec<Option<String>> = sdt.services.iter().map(|s| s.service_name.clone()).collect();
+    let names: Vec<Option<String>> = sdt
+        .services
+        .iter()
+        .map(|s| s.service_name.clone())
+        .collect();
     assert!(names.contains(&Some("Canal3".to_string())));
     assert!(names.contains(&Some("Canal4".to_string())));
     assert!(names.contains(&Some("Canal5".to_string())));
@@ -434,7 +440,10 @@ fn snap_06_multi_audio_pmt() {
 fn snap_06_multi_audio_sdt() {
     let sdt = load_sdt("06_multi_audio");
     assert_eq!(sdt.transport_stream_id, 1004);
-    assert_eq!(sdt.services[0].service_name.as_deref(), Some("IronTV Multi"));
+    assert_eq!(
+        sdt.services[0].service_name.as_deref(),
+        Some("IronTV Multi")
+    );
 }
 
 #[test]
@@ -468,7 +477,10 @@ fn snap_07_scrambled_sdt() {
     assert_eq!(sdt.transport_stream_id, 1005);
     assert_eq!(sdt.services.len(), 1);
     let svc = &sdt.services[0];
-    assert!(svc.free_ca_mode, "serviço deve ter free_ca_mode=true (scrambled)");
+    assert!(
+        svc.free_ca_mode,
+        "serviço deve ter free_ca_mode=true (scrambled)"
+    );
     assert_eq!(svc.service_name.as_deref(), Some("IronTV Premium"));
     assert_eq!(svc.provider_name.as_deref(), Some("IronNet Premium"));
 }
@@ -517,7 +529,11 @@ fn snap_08_fta_dual_sdt() {
     assert_eq!(sdt.services.len(), 2);
     assert!(sdt.services.iter().all(|s| !s.free_ca_mode), "ambos FTA");
 
-    let names: Vec<Option<String>> = sdt.services.iter().map(|s| s.service_name.clone()).collect();
+    let names: Vec<Option<String>> = sdt
+        .services
+        .iter()
+        .map(|s| s.service_name.clone())
+        .collect();
     assert!(names.contains(&Some("IronFTA1".to_string())));
     assert!(names.contains(&Some("IronFTA2".to_string())));
 }
@@ -562,7 +578,11 @@ fn snap_09_radio_only_sdt() {
         "todos os serviços devem ser do tipo 0x02 (rádio digital)"
     );
 
-    let names: Vec<Option<String>> = sdt.services.iter().map(|s| s.service_name.clone()).collect();
+    let names: Vec<Option<String>> = sdt
+        .services
+        .iter()
+        .map(|s| s.service_name.clone())
+        .collect();
     assert!(names.contains(&Some("Radio1".to_string())));
     assert!(names.contains(&Some("Radio2".to_string())));
     assert!(names.contains(&Some("Radio3".to_string())));
@@ -613,7 +633,11 @@ fn snap_10_mixed_nit_sdt() {
     assert_eq!(sdt.transport_stream_id, 1008);
     assert_eq!(sdt.services.len(), 2);
 
-    let names: Vec<Option<String>> = sdt.services.iter().map(|s| s.service_name.clone()).collect();
+    let names: Vec<Option<String>> = sdt
+        .services
+        .iter()
+        .map(|s| s.service_name.clone())
+        .collect();
     assert!(names.contains(&Some("IronMix1".to_string())));
     assert!(names.contains(&Some("IronMix2".to_string())));
 }

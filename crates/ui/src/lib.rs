@@ -21,8 +21,8 @@ use crate::panels::metrics::MetricsPanel;
 use crate::panels::tables::TablesPanel;
 use crate::panels::video::VideoPanel;
 use crate::status_bar::StatusBar;
+use av::video_queue::{PopResult, VideoQueue};
 use av::{Clock, MasterClock, VideoFrame, VideoRenderer};
-use av::video_queue::{VideoQueue, PopResult};
 
 // ---------------------------------------------------------------------------
 // IronPlayerApp
@@ -235,6 +235,7 @@ impl IronPlayerApp {
         self.video_queue.clear();
         self.video_clock = MasterClock::wall(0);
         self.video_clock_initialized = false;
+        // av_sync_history é limpo via state.reset_stream_data() acima.
     }
 
     /// Drena frames do canal de vídeo, insere na `VideoQueue` PTS-ordenada e
@@ -252,8 +253,10 @@ impl IronPlayerApp {
     ///    - `Ready`: faz upload ao renderer.
     ///    - `Resync`: reseta o clock para `new_anchor` e faz upload.
     ///    - `TooEarly` / `Empty`: nenhuma ação.
+    /// 4. Atualiza os campos de sincronização A/V em `state.metrics`
+    ///    e amostra o offset no histórico de 60 s a ~1 Hz.
     ///
-    /// SPEC-AV-003 · SPEC-AV-VQ-001
+    /// SPEC-AV-003 · SPEC-AV-VQ-001 · SPEC-METRICS-SYNC-001
     fn poll_video_frames(&mut self) {
         let rx = match &self.video_frames_rx {
             Some(r) => r.clone(),
@@ -305,6 +308,45 @@ impl IronPlayerApp {
                         tracing::warn!(error = %e, "poll_video_frames: falha no upload do frame");
                     }
                 }
+            }
+        }
+
+        // 4. Atualiza campos de sincronização A/V no MetricsSnapshot local.
+        // Relê o clock aqui pois pode ter sido resetado pelo Resync acima.
+        let current_clock_pts = self.video_clock.now_pts90();
+        let sync_offset_ms: i32 = self
+            .video_queue
+            .front_pts()
+            .map(|front_pts| {
+                let diff_90 = front_pts - current_clock_pts;
+                // Converte de 90 kHz para ms e clamp para i32.
+                (diff_90 / 90).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+            })
+            .unwrap_or(0);
+
+        self.state.metrics.av_sync_offset_ms = sync_offset_ms;
+        self.state.metrics.late_frames_dropped = self.video_queue.dropped_late;
+        self.state.metrics.early_frames_held = self.video_queue.held_early;
+        self.state.metrics.pts_discontinuities = self.video_queue.discontinuities;
+        self.state.metrics.video_queue_depth = self.video_queue.len().min(u16::MAX as usize) as u16;
+
+        // Amostra o offset no histórico a ~1 Hz (verifica se passou 1 s desde
+        // a última amostra para evitar acumulação de 60 entradas/s).
+        let now = Instant::now();
+        let should_sample = match self.state.av_sync_history.back() {
+            None => true,
+            Some((t, _)) => now.duration_since(*t) >= Duration::from_secs(1),
+        };
+        if should_sample {
+            self.state.av_sync_history.push_back((now, sync_offset_ms));
+            let cutoff = now - Duration::from_secs(60);
+            while self
+                .state
+                .av_sync_history
+                .front()
+                .is_some_and(|(t, _)| *t < cutoff)
+            {
+                self.state.av_sync_history.pop_front();
             }
         }
     }

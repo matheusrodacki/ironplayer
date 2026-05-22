@@ -1,0 +1,29 @@
+[package]
+name = "ts-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ts]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+
+[[bin]]
+name = "cat_parse"
+path = "fuzz_targets/cat_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "tot_parse"
+path = "fuzz_targets/tot_parse.rs"
+test = false
+doc = false

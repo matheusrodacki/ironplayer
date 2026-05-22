@@ -103,9 +103,9 @@ fn pcr_packet(pcr_pid: u16, pcr_90khz: u64, cc: u8) -> [u8; 188] {
     pkt[3] = 0x20 | (cc & 0x0F); // AFC=0b10 (adaptation only), CC
     pkt[4] = 183; // adaptation_field_length (preenche os 183 bytes restantes)
     pkt[5] = 0x10; // flags: PCR_flag=1, resto=0
-    // Codificação PCR (48 bits):
-    //   base[32:25] | base[24:17] | base[16:9] | base[8:1]
-    //   (base[0]<<7 | 0x7E | ext[8]) | ext[7:0]
+                   // Codificação PCR (48 bits):
+                   //   base[32:25] | base[24:17] | base[16:9] | base[8:1]
+                   //   (base[0]<<7 | 0x7E | ext[8]) | ext[7:0]
     let base = pcr_90khz & 0x1_FFFF_FFFF; // máscara 33 bits
     pkt[6] = (base >> 25) as u8;
     pkt[7] = (base >> 17) as u8;
@@ -113,7 +113,7 @@ fn pcr_packet(pcr_pid: u16, pcr_90khz: u64, cc: u8) -> [u8; 188] {
     pkt[9] = (base >> 1) as u8;
     pkt[10] = (((base & 0x01) << 7) | 0x7E) as u8; // ext=0
     pkt[11] = 0x00; // ext low byte
-    // bytes 12..188 = 0xFF (stuffing)
+                    // bytes 12..188 = 0xFF (stuffing)
     pkt
 }
 
@@ -325,8 +325,15 @@ fn generate_stream(cfg: &FixtureConfig) -> Vec<u8> {
         .programs
         .iter()
         .map(|prog| {
-            let streams: Vec<(u8, u16)> = prog.streams.iter().map(|es| (es.stream_type, es.pid)).collect();
-            build_section(0x02, &pmt_body(prog.program_number, 0, prog.pcr_pid, &streams))
+            let streams: Vec<(u8, u16)> = prog
+                .streams
+                .iter()
+                .map(|es| (es.stream_type, es.pid))
+                .collect();
+            build_section(
+                0x02,
+                &pmt_body(prog.program_number, 0, prog.pcr_pid, &streams),
+            )
         })
         .collect();
 
@@ -359,7 +366,10 @@ fn generate_stream(cfg: &FixtureConfig) -> Vec<u8> {
         .iter()
         .map(|e| (e.ts_id, e.orig_nid, e.descriptors.clone()))
         .collect();
-    let nit_sec = build_section(0x40, &nit_body(cfg.network_id, 0, &net_name_desc, &ts_entries));
+    let nit_sec = build_section(
+        0x40,
+        &nit_body(cfg.network_id, 0, &net_name_desc, &ts_entries),
+    );
 
     // ─ PCR PID (do primeiro programa) ─────────────────────────────────────────
     let pcr_pid = cfg.programs.first().map(|p| p.pcr_pid).unwrap_or(0x0100);
@@ -439,8 +449,14 @@ fn gen_real_01_cable_sd_1svc() {
             service_name: "IronTV SD",
             scrambled: false,
             streams: vec![
-                EsConfig { stream_type: 0x1B, pid: 0x0110 }, // H.264 video
-                EsConfig { stream_type: 0x0F, pid: 0x0111 }, // AAC audio
+                EsConfig {
+                    stream_type: 0x1B,
+                    pid: 0x0110,
+                }, // H.264 video
+                EsConfig {
+                    stream_type: 0x0F,
+                    pid: 0x0111,
+                }, // AAC audio
             ],
         }],
         nit_ts_entries: vec![NitTsEntry {
@@ -452,7 +468,10 @@ fn gen_real_01_cable_sd_1svc() {
     };
 
     let data = generate_stream(&cfg);
-    assert!(data.len() % 188 == 0, "stream deve ser múltiplo de 188 bytes");
+    assert!(
+        data.len() % 188 == 0,
+        "stream deve ser múltiplo de 188 bytes"
+    );
 
     let path = dir.join(format!("{}.ts", cfg.name));
     fs::write(&path, &data).expect("escrever 01_cable_sd_1svc.ts");
@@ -484,8 +503,14 @@ fn gen_real_02_cable_hd_1svc() {
             service_name: "IronTV HD",
             scrambled: false,
             streams: vec![
-                EsConfig { stream_type: 0x24, pid: 0x0210 }, // HEVC video
-                EsConfig { stream_type: 0x11, pid: 0x0211 }, // AAC-LATM audio
+                EsConfig {
+                    stream_type: 0x24,
+                    pid: 0x0210,
+                }, // HEVC video
+                EsConfig {
+                    stream_type: 0x11,
+                    pid: 0x0211,
+                }, // AAC-LATM audio
             ],
         }],
         nit_ts_entries: vec![NitTsEntry {
@@ -530,8 +555,14 @@ fn gen_real_03_cable_3svc() {
                 service_name: "Canal3",
                 scrambled: false,
                 streams: vec![
-                    EsConfig { stream_type: 0x1B, pid: 0x0310 },
-                    EsConfig { stream_type: 0x0F, pid: 0x0311 },
+                    EsConfig {
+                        stream_type: 0x1B,
+                        pid: 0x0310,
+                    },
+                    EsConfig {
+                        stream_type: 0x0F,
+                        pid: 0x0311,
+                    },
                 ],
             },
             ProgramConfig {
@@ -543,8 +574,14 @@ fn gen_real_03_cable_3svc() {
                 service_name: "Canal4",
                 scrambled: false,
                 streams: vec![
-                    EsConfig { stream_type: 0x1B, pid: 0x0410 },
-                    EsConfig { stream_type: 0x81, pid: 0x0411 }, // AC-3
+                    EsConfig {
+                        stream_type: 0x1B,
+                        pid: 0x0410,
+                    },
+                    EsConfig {
+                        stream_type: 0x81,
+                        pid: 0x0411,
+                    }, // AC-3
                 ],
             },
             ProgramConfig {
@@ -556,8 +593,14 @@ fn gen_real_03_cable_3svc() {
                 service_name: "Canal5",
                 scrambled: false,
                 streams: vec![
-                    EsConfig { stream_type: 0x24, pid: 0x0510 },
-                    EsConfig { stream_type: 0x0F, pid: 0x0511 },
+                    EsConfig {
+                        stream_type: 0x24,
+                        pid: 0x0510,
+                    },
+                    EsConfig {
+                        stream_type: 0x0F,
+                        pid: 0x0511,
+                    },
                 ],
             },
         ],
@@ -602,8 +645,14 @@ fn gen_real_04_dvbt_hd() {
             service_name: "IronDTT HD",
             scrambled: false,
             streams: vec![
-                EsConfig { stream_type: 0x1B, pid: 0x0110 }, // H.264 video
-                EsConfig { stream_type: 0x04, pid: 0x0111 }, // MPEG-2 Audio (MP2)
+                EsConfig {
+                    stream_type: 0x1B,
+                    pid: 0x0110,
+                }, // H.264 video
+                EsConfig {
+                    stream_type: 0x04,
+                    pid: 0x0111,
+                }, // MPEG-2 Audio (MP2)
             ],
         }],
         nit_ts_entries: vec![NitTsEntry {
@@ -647,8 +696,14 @@ fn gen_real_05_dvbs_sd() {
             service_name: "IronSat SD",
             scrambled: false,
             streams: vec![
-                EsConfig { stream_type: 0x02, pid: 0x0110 }, // MPEG-2 video
-                EsConfig { stream_type: 0x04, pid: 0x0111 }, // MPEG-2 audio
+                EsConfig {
+                    stream_type: 0x02,
+                    pid: 0x0110,
+                }, // MPEG-2 video
+                EsConfig {
+                    stream_type: 0x04,
+                    pid: 0x0111,
+                }, // MPEG-2 audio
             ],
         }],
         nit_ts_entries: vec![NitTsEntry {
@@ -692,10 +747,22 @@ fn gen_real_06_multi_audio() {
             service_name: "IronTV Multi",
             scrambled: false,
             streams: vec![
-                EsConfig { stream_type: 0x1B, pid: 0x0110 }, // H.264 video
-                EsConfig { stream_type: 0x0F, pid: 0x0111 }, // AAC POR
-                EsConfig { stream_type: 0x0F, pid: 0x0112 }, // AAC ENG
-                EsConfig { stream_type: 0x0F, pid: 0x0113 }, // AAC SPA
+                EsConfig {
+                    stream_type: 0x1B,
+                    pid: 0x0110,
+                }, // H.264 video
+                EsConfig {
+                    stream_type: 0x0F,
+                    pid: 0x0111,
+                }, // AAC POR
+                EsConfig {
+                    stream_type: 0x0F,
+                    pid: 0x0112,
+                }, // AAC ENG
+                EsConfig {
+                    stream_type: 0x0F,
+                    pid: 0x0113,
+                }, // AAC SPA
             ],
         }],
         nit_ts_entries: vec![NitTsEntry {
@@ -739,8 +806,14 @@ fn gen_real_07_scrambled() {
             service_name: "IronTV Premium",
             scrambled: true,
             streams: vec![
-                EsConfig { stream_type: 0x1B, pid: 0x0110 },
-                EsConfig { stream_type: 0x0F, pid: 0x0111 },
+                EsConfig {
+                    stream_type: 0x1B,
+                    pid: 0x0110,
+                },
+                EsConfig {
+                    stream_type: 0x0F,
+                    pid: 0x0111,
+                },
             ],
         }],
         nit_ts_entries: vec![NitTsEntry {
@@ -785,8 +858,14 @@ fn gen_real_08_fta_dual() {
                 service_name: "IronFTA1",
                 scrambled: false,
                 streams: vec![
-                    EsConfig { stream_type: 0x1B, pid: 0x0110 },
-                    EsConfig { stream_type: 0x0F, pid: 0x0111 },
+                    EsConfig {
+                        stream_type: 0x1B,
+                        pid: 0x0110,
+                    },
+                    EsConfig {
+                        stream_type: 0x0F,
+                        pid: 0x0111,
+                    },
                 ],
             },
             ProgramConfig {
@@ -798,8 +877,14 @@ fn gen_real_08_fta_dual() {
                 service_name: "IronFTA2",
                 scrambled: false,
                 streams: vec![
-                    EsConfig { stream_type: 0x1B, pid: 0x0210 },
-                    EsConfig { stream_type: 0x81, pid: 0x0211 }, // AC-3
+                    EsConfig {
+                        stream_type: 0x1B,
+                        pid: 0x0210,
+                    },
+                    EsConfig {
+                        stream_type: 0x81,
+                        pid: 0x0211,
+                    }, // AC-3
                 ],
             },
         ],
@@ -844,7 +929,10 @@ fn gen_real_09_radio_only() {
                 provider: "IronRadio",
                 service_name: "Radio1",
                 scrambled: false,
-                streams: vec![EsConfig { stream_type: 0x0F, pid: 0x0311 }],
+                streams: vec![EsConfig {
+                    stream_type: 0x0F,
+                    pid: 0x0311,
+                }],
             },
             ProgramConfig {
                 program_number: 31,
@@ -854,7 +942,10 @@ fn gen_real_09_radio_only() {
                 provider: "IronRadio",
                 service_name: "Radio2",
                 scrambled: false,
-                streams: vec![EsConfig { stream_type: 0x0F, pid: 0x0411 }],
+                streams: vec![EsConfig {
+                    stream_type: 0x0F,
+                    pid: 0x0411,
+                }],
             },
             ProgramConfig {
                 program_number: 32,
@@ -864,7 +955,10 @@ fn gen_real_09_radio_only() {
                 provider: "IronRadio",
                 service_name: "Radio3",
                 scrambled: false,
-                streams: vec![EsConfig { stream_type: 0x0F, pid: 0x0511 }],
+                streams: vec![EsConfig {
+                    stream_type: 0x0F,
+                    pid: 0x0511,
+                }],
             },
         ],
         nit_ts_entries: vec![NitTsEntry {
@@ -910,8 +1004,14 @@ fn gen_real_10_mixed_nit() {
                 service_name: "IronMix1",
                 scrambled: false,
                 streams: vec![
-                    EsConfig { stream_type: 0x1B, pid: 0x0110 },
-                    EsConfig { stream_type: 0x0F, pid: 0x0111 },
+                    EsConfig {
+                        stream_type: 0x1B,
+                        pid: 0x0110,
+                    },
+                    EsConfig {
+                        stream_type: 0x0F,
+                        pid: 0x0111,
+                    },
                 ],
             },
             ProgramConfig {
@@ -923,15 +1023,33 @@ fn gen_real_10_mixed_nit() {
                 service_name: "IronMix2",
                 scrambled: false,
                 streams: vec![
-                    EsConfig { stream_type: 0x24, pid: 0x0210 },
-                    EsConfig { stream_type: 0x11, pid: 0x0211 },
+                    EsConfig {
+                        stream_type: 0x24,
+                        pid: 0x0210,
+                    },
+                    EsConfig {
+                        stream_type: 0x11,
+                        pid: 0x0211,
+                    },
                 ],
             },
         ],
         nit_ts_entries: vec![
-            NitTsEntry { ts_id: 1001, orig_nid: 8442, descriptors: vec![] },
-            NitTsEntry { ts_id: 1002, orig_nid: 8442, descriptors: vec![] },
-            NitTsEntry { ts_id: 1003, orig_nid: 8442, descriptors: vec![] },
+            NitTsEntry {
+                ts_id: 1001,
+                orig_nid: 8442,
+                descriptors: vec![],
+            },
+            NitTsEntry {
+                ts_id: 1002,
+                orig_nid: 8442,
+                descriptors: vec![],
+            },
+            NitTsEntry {
+                ts_id: 1003,
+                orig_nid: 8442,
+                descriptors: vec![],
+            },
         ],
         duration_s: 60,
     };

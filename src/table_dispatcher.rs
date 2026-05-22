@@ -2064,7 +2064,8 @@ mod tests {
             0x01u8,
             0x80 | ((section_length >> 8) as u8),
             (section_length & 0xFF) as u8,
-            0xFF, 0xFF,
+            0xFF,
+            0xFF,
             0xC0 | ((version & 0x1F) << 1) | 0x01,
             0x00,
             0x00,
@@ -2092,8 +2093,11 @@ mod tests {
             (section_length & 0xFF) as u8,
             (mjd >> 8) as u8,
             mjd as u8,
-            0x12, 0x00, 0x00, // 12:00:00 BCD
-            0xF0, 0x00, // desc_loop_len = 0
+            0x12,
+            0x00,
+            0x00, // 12:00:00 BCD
+            0xF0,
+            0x00, // desc_loop_len = 0
         ];
         let crc_pos = data.len();
         data.extend_from_slice(&[0, 0, 0, 0]);
@@ -2121,7 +2125,8 @@ mod tests {
             0x00,
             0x00,
             // program_number = 0 → NIT PID
-            0x00, 0x00,
+            0x00,
+            0x00,
             0xE0 | ((nit_pid >> 8) as u8 & 0x1F),
             nit_pid as u8,
         ];
@@ -2200,7 +2205,9 @@ mod tests {
 
         let cmds: Vec<DemuxCommand> = std::iter::from_fn(|| demux_rx.try_recv().ok()).collect();
         assert!(
-            !cmds.iter().any(|c| matches!(c, DemuxCommand::RegisterNitPid(_))),
+            !cmds
+                .iter()
+                .any(|c| matches!(c, DemuxCommand::RegisterNitPid(_))),
             "PAT sem program_number=0 não deve emitir RegisterNitPid; comandos: {cmds:?}"
         );
     }

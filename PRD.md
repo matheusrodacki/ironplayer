@@ -12,8 +12,8 @@ Referência: [tdd-sprint-01-av-sync.md](tdd-sprint-01-av-sync.md)
 - [x] Task 2: Implementar CAT (PID 0x0001), NIT em PID dinâmico e TOT (PID 0x0014 / table_id 0x73) em `crates/ts` com dispatch em `src/table_dispatcher.rs`
 - [x] Task 3: Implementar `av::clock` (`MasterClock`, `AudioClockHandle`, `WallClockHandle`) com exposição do contador atômico de samples via callback cpal — Fases A e B do TDD
 - [x] Task 4: Implementar `av::video_queue` (`VideoQueue` ordenada por PTS, políticas drop-late / hold-early / resync / wrap 33-bit) e substituir o pipeline best-effort existente em `crates/ui` e `src/channels.rs` — Fases C e D do TDD
-- [ ] Task 5: Estender `MetricsSnapshot` com campos de sync (`av_sync_offset_ms`, `late_frames_dropped`, `early_frames_held`, `pts_discontinuities`, `video_queue_depth`) e adicionar painel "Sync A/V" na UI com gráfico de 60 s — Fase E do TDD
-- [ ] Task 6: Validação end-to-end: rodar fixtures E2E (drift < 40 ms / 5 min, descontinuidade, wrap simulado, stream FTA + scrambled) e adicionar fuzz targets `cargo-fuzz` para `Cat::parse` e `Tot::parse`
+- [x] Task 5: Estender `MetricsSnapshot` com campos de sync (`av_sync_offset_ms`, `late_frames_dropped`, `early_frames_held`, `pts_discontinuities`, `video_queue_depth`) e adicionar painel "Sync A/V" na UI com gráfico de 60 s — Fase E do TDD
+- [x] Task 6: Validação end-to-end: rodar fixtures E2E (drift < 40 ms / 5 min, descontinuidade, wrap simulado, stream FTA + scrambled) e adicionar fuzz targets `cargo-fuzz` para `Cat::parse` e `Tot::parse`
 
 ## Technical Details
 

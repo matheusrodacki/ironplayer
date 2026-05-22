@@ -73,7 +73,9 @@ impl MetricsPanel {
         // ── Gráfico de bitrate (60 s) ──────────────────────────────────────
         self.show_bitrate_plot(ui, state);
         ui.add_space(6.0);
-
+        // ── Painel Sync A/V ───────────────────────────────────────────────
+        self.show_av_sync_panel(ui, state);
+        ui.add_space(6.0);
         // ── Gráfico de PCR jitter ──────────────────────────────────────────
         self.show_jitter_plot(ui, state);
         ui.add_space(6.0);
@@ -279,6 +281,92 @@ impl MetricsPanel {
     }
 
     // -----------------------------------------------------------------------
+    // Painel Sync A/V
+    // -----------------------------------------------------------------------
+
+    /// Renderiza o painel de sincronização A/V com gráfico de offset (60 s)
+    /// e contadores de drop/hold/descontinuidade/profundidade de fila.
+    ///
+    /// SPEC-METRICS-SYNC-001
+    fn show_av_sync_panel(&self, ui: &mut egui::Ui, state: &AppState) {
+        let metrics = &state.metrics;
+
+        ui.label("Sync A/V");
+
+        egui::Grid::new("av_sync_grid")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Offset atual");
+                ui.label(format!("{:+} ms", metrics.av_sync_offset_ms));
+                ui.end_row();
+
+                ui.label("Frames tardios dropped");
+                ui.label(metrics.late_frames_dropped.to_string());
+                ui.end_row();
+
+                ui.label("Frames adiantados held");
+                ui.label(metrics.early_frames_held.to_string());
+                ui.end_row();
+
+                ui.label("Descontinuidades PTS");
+                ui.label(metrics.pts_discontinuities.to_string());
+                ui.end_row();
+
+                ui.label("Profundidade da fila");
+                ui.label(format!("{} frames", metrics.video_queue_depth));
+                ui.end_row();
+            });
+
+        // Gráfico de offset A/V (60 s).
+        ui.label("Offset A/V (60 s, ms)");
+
+        let now = std::time::Instant::now();
+        let sync_points: PlotPoints = state
+            .av_sync_history
+            .iter()
+            .map(|(t, ms)| {
+                let x = -(now.duration_since(*t).as_secs_f64());
+                [x, *ms as f64]
+            })
+            .filter(|[x, _]| *x >= -PLOT_WINDOW_SECS)
+            .collect();
+
+        // Linhas de threshold HOLD (+20 ms) e DROP (-100 ms).
+        let hold_line = PlotPoints::from(vec![[-PLOT_WINDOW_SECS, 20.0], [0.0, 20.0]]);
+        let drop_line = PlotPoints::from(vec![[-PLOT_WINDOW_SECS, -100.0], [0.0, -100.0]]);
+        let zero_line = PlotPoints::from(vec![[-PLOT_WINDOW_SECS, 0.0], [0.0, 0.0]]);
+
+        Plot::new("av_sync_plot")
+            .height(100.0)
+            .include_y(0.0)
+            .x_axis_label("s")
+            .y_axis_label("ms")
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    Line::new(zero_line)
+                        .name("0 ms")
+                        .color(egui::Color32::from_rgb(120, 120, 120)),
+                );
+                plot_ui.line(
+                    Line::new(hold_line)
+                        .name("+20 ms (hold)")
+                        .color(egui::Color32::from_rgb(230, 160, 50)),
+                );
+                plot_ui.line(
+                    Line::new(drop_line)
+                        .name("-100 ms (drop)")
+                        .color(egui::Color32::from_rgb(255, 80, 80)),
+                );
+                plot_ui.line(
+                    Line::new(sync_points)
+                        .name("Offset A/V")
+                        .color(egui::Color32::from_rgb(100, 200, 255)),
+                );
+            });
+    }
+
+    // -----------------------------------------------------------------------
     // Gráfico de PCR jitter
     // -----------------------------------------------------------------------
 
@@ -448,5 +536,41 @@ mod tests {
         assert!(panel.error_log.is_empty());
         assert_eq!(panel.seen_jitter, 0);
         assert_eq!(panel.seen_discontinuity, 0);
+    }
+
+    /// SPEC-METRICS-SYNC-001 — av_sync_history acumula amostras de offset i32.
+    #[test]
+    fn spec_metrics_sync_001_av_sync_history_accumulates_samples() {
+        use std::collections::VecDeque;
+        use std::time::Instant;
+
+        let now = Instant::now();
+        let mut history: VecDeque<(Instant, i32)> = VecDeque::new();
+
+        // Simula a lógica de amostragem a ~1 Hz do poll_video_frames.
+        let samples: &[(std::time::Duration, i32)] = &[
+            (std::time::Duration::from_secs(0), 0),
+            (std::time::Duration::from_millis(500), 5), // < 1 s — deve ser ignorada
+            (std::time::Duration::from_secs(1), -10),
+            (std::time::Duration::from_secs(2), 8),
+        ];
+
+        for (delta, offset_ms) in samples {
+            let t = now + *delta;
+            let should_sample = match history.back() {
+                None => true,
+                Some((last_t, _)) => t.duration_since(*last_t) >= std::time::Duration::from_secs(1),
+            };
+            if should_sample {
+                history.push_back((t, *offset_ms));
+            }
+        }
+
+        // Entradas esperadas: t+0s (0 ms), t+1s (-10 ms), t+2s (8 ms).
+        // A entrada t+0.5s (5 ms) deve ter sido descartada por < 1 s desde a última.
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].1, 0);
+        assert_eq!(history[1].1, -10);
+        assert_eq!(history[2].1, 8);
     }
 }

@@ -199,7 +199,12 @@ impl ErrorSnapshot {
 /// Distribuído pela UI via `tokio::sync::watch`. É `Clone` — a UI clona o valor
 /// ao ler o canal; mudanças posteriores no pipeline não afetam instâncias anteriores.
 ///
-/// SPEC-METRICS-003
+/// Os campos `av_sync_offset_ms`, `late_frames_dropped`, `early_frames_held`,
+/// `pts_discontinuities` e `video_queue_depth` são preenchidos pela camada de
+/// UI (crates/ui) a partir da `VideoQueue` e do clock master — o aggregator de
+/// métricas `ts` os inicializa em zero; a UI os sobrescreve após cada ciclo.
+///
+/// SPEC-METRICS-003 · SPEC-METRICS-SYNC-001
 #[derive(Debug, Clone)]
 pub struct MetricsSnapshot {
     /// Tabela de PIDs ativos, ordenada por bitrate decrescente.
@@ -223,6 +228,33 @@ pub struct MetricsSnapshot {
     pub tdt_offset_secs: Option<i64>,
     /// Instante de criação deste snapshot.
     pub timestamp: Instant,
+    // ── Campos de sincronização A/V ──────────────────────────────────────────
+    /// Offset atual de sincronização A/V em milissegundos.
+    ///
+    /// Positivo = vídeo adiantado em relação ao áudio (frame_pts > clock_pts).
+    /// Negativo = vídeo atrasado. Zero enquanto o pipeline de vídeo está inativo.
+    ///
+    /// SPEC-METRICS-SYNC-001
+    pub av_sync_offset_ms: i32,
+    /// Total acumulado de frames de vídeo descartados por chegada tardia
+    /// (PTS < clock − DROP_PTS).
+    ///
+    /// SPEC-METRICS-SYNC-001
+    pub late_frames_dropped: u64,
+    /// Total acumulado de chamadas `pop_ready` que retornaram `TooEarly`
+    /// (PTS > clock + HOLD_PTS).
+    ///
+    /// SPEC-METRICS-SYNC-001
+    pub early_frames_held: u64,
+    /// Total acumulado de descontinuidades de PTS detectadas pela `VideoQueue`
+    /// (salto de PTS > RESYNC_PTS).
+    ///
+    /// SPEC-METRICS-SYNC-001
+    pub pts_discontinuities: u64,
+    /// Número de frames atualmente na `VideoQueue` (profundidade instantânea).
+    ///
+    /// SPEC-METRICS-SYNC-001
+    pub video_queue_depth: u16,
 }
 
 impl Default for MetricsSnapshot {
@@ -234,6 +266,11 @@ impl Default for MetricsSnapshot {
             errors: ErrorSnapshot::default(),
             tdt_offset_secs: None,
             timestamp: Instant::now(),
+            av_sync_offset_ms: 0,
+            late_frames_dropped: 0,
+            early_frames_held: 0,
+            pts_discontinuities: 0,
+            video_queue_depth: 0,
         }
     }
 }
@@ -635,11 +672,41 @@ mod tests {
             },
             tdt_offset_secs: Some(1_716_000_000),
             timestamp: Instant::now(),
+            av_sync_offset_ms: 0,
+            late_frames_dropped: 0,
+            early_frames_held: 0,
+            pts_discontinuities: 0,
+            video_queue_depth: 0,
         };
         let cloned = snap.clone();
         assert_eq!(cloned.total_bitrate_kbps, snap.total_bitrate_kbps);
         assert_eq!(cloned.null_ratio, snap.null_ratio);
         assert_eq!(cloned.tdt_offset_secs, snap.tdt_offset_secs);
+    }
+
+    /// SPEC-METRICS-SYNC-001 — campos de sync A/V têm defaults corretos e são clonable.
+    #[test]
+    fn spec_metrics_sync_001_sync_fields_defaults_and_clone() {
+        let snap = MetricsSnapshot::default();
+        assert_eq!(snap.av_sync_offset_ms, 0);
+        assert_eq!(snap.late_frames_dropped, 0);
+        assert_eq!(snap.early_frames_held, 0);
+        assert_eq!(snap.pts_discontinuities, 0);
+        assert_eq!(snap.video_queue_depth, 0);
+
+        // Campos podem ser preenchidos e clonados corretamente.
+        let mut snap2 = MetricsSnapshot::default();
+        snap2.av_sync_offset_ms = -12;
+        snap2.late_frames_dropped = 3;
+        snap2.early_frames_held = 7;
+        snap2.pts_discontinuities = 1;
+        snap2.video_queue_depth = 4;
+        let cloned = snap2.clone();
+        assert_eq!(cloned.av_sync_offset_ms, -12);
+        assert_eq!(cloned.late_frames_dropped, 3);
+        assert_eq!(cloned.early_frames_held, 7);
+        assert_eq!(cloned.pts_discontinuities, 1);
+        assert_eq!(cloned.video_queue_depth, 4);
     }
 
     // -----------------------------------------------------------------------

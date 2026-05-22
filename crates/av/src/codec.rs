@@ -241,8 +241,13 @@ pub struct CodecConfig {
 
 impl Default for CodecConfig {
     fn default() -> Self {
+        // Cap em 8 threads: com frame threading o decoder FFmpeg buffera
+        // ~thread_count frames antes de emitir o primeiro, dessincronizando
+        // o áudio (que toca imediatamente). Acima de 8 threads o ganho em
+        // H.264/HEVC é marginal mas a latência cresce linearmente.
+        const AUTO_THREAD_CAP: u32 = 8;
         let thread_count = std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
+            .map(|n| (n.get() as u32).min(AUTO_THREAD_CAP))
             .unwrap_or(1);
         Self {
             thread_count,

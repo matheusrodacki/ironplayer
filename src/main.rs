@@ -468,10 +468,18 @@ fn main() -> eframe::Result<()> {
         let audio_frames_tx = ch.audio_frames_tx;
         let audio_status = audio_status.clone();
         // Constrói CodecConfig a partir do DecoderConfig lido do ironstream.toml.
+        //
+        // Cap em 8 threads quando em auto-detect: com frame threading o decoder
+        // FFmpeg buffera ~thread_count frames antes de emitir o primeiro, o que
+        // dessincroniza o áudio (que toca imediatamente). Em máquinas com muitos
+        // núcleos (16+) o ganho de throughput acima de 8 threads é marginal em
+        // H.264/HEVC, mas a latência de pipeline cresce linearmente. O usuário
+        // pode override via `[decoder] thread_count = N` no ironstream.toml.
+        const AUTO_THREAD_CAP: u32 = 8;
         let codec_cfg = av::CodecConfig {
             thread_count: if cfg.decoder.thread_count == 0 {
                 std::thread::available_parallelism()
-                    .map(|n| n.get() as u32)
+                    .map(|n| (n.get() as u32).min(AUTO_THREAD_CAP))
                     .unwrap_or(1)
             } else {
                 cfg.decoder.thread_count
@@ -638,6 +646,18 @@ fn main() -> eframe::Result<()> {
     // `video_frames_rx` é entregue diretamente a `IronPlayerApp`.
     let video_frames_rx = ch.video_frames_rx;
 
+    // Clock de áudio compartilhado entre audio-out e a UI.
+    //
+    // Quando `AudioOutput` é criado (lazy, na primeira frame de áudio),
+    // a thread `audio-out` grava um `AudioClockHandle` aqui.  A UI lê o
+    // handle em `poll_video_frames` e troca `video_clock` de `WallClock`
+    // para `AudioClock`, sincronizando o vídeo ao relógio real WASAPI e
+    // eliminando o drift causado pela latência do decoder multi-thread.
+    let audio_clock_shared: Arc<std::sync::RwLock<Option<av::AudioClockHandle>>> =
+        Arc::new(std::sync::RwLock::new(None));
+    let audio_clock_for_audio_out = Arc::clone(&audio_clock_shared);
+    let audio_clock_for_ui = Arc::clone(&audio_clock_shared);
+
     // Thread: audio-out — SPEC-AV-004
     // Recebe AudioFrames do decoder e os entrega ao AudioOutput (WASAPI via cpal).
     // Inicialização lazy: AudioOutput é criado na primeira frame recebida, pois
@@ -647,6 +667,7 @@ fn main() -> eframe::Result<()> {
         let jitter_buffer_ms = cfg.player.jitter_buffer_ms as u32;
         let initial_volume = cfg.player.volume;
         let audio_status = audio_status.clone();
+        let audio_clock_tx = audio_clock_for_audio_out;
         handles.push(
             std::thread::Builder::new()
                 .name("audio-out".into())
@@ -724,6 +745,18 @@ fn main() -> eframe::Result<()> {
                                         channels = frame.channels,
                                         "audio-out: AudioOutput inicializado"
                                     );
+                                    // Publica o AudioClockHandle para a UI usar como
+                                    // clock master do vídeo (A/V sync via AudioClock).
+                                    // anchor_pts = PTS do primeiro frame de áudio, que
+                                    // corresponde a samples_played = 0.
+                                    let anchor = frame.pts.map(|p| p as i64).unwrap_or(0);
+                                    if let Ok(mut guard) = audio_clock_tx.write() {
+                                        *guard = Some(out.clock_handle(anchor));
+                                        tracing::debug!(
+                                            anchor_pts = anchor,
+                                            "audio-out: AudioClockHandle publicado"
+                                        );
+                                    }
                                     audio_out = Some(out);
                                 }
                                 Err(e) => {
@@ -967,6 +1000,7 @@ fn main() -> eframe::Result<()> {
                 Some(video_frames_rx),
             );
             inner.set_pipeline_metrics_rx(pipeline_metrics_ui);
+            inner.set_audio_clock_rx(audio_clock_for_ui);
             Ok(Box::new(IronPlayerAppWithPipeline { inner, guard }))
         }),
     )

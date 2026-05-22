@@ -101,6 +101,16 @@ pub struct IronPlayerApp {
     ///
     /// SPEC-METRICS-PIPELINE-001
     pipeline_metrics_rx: Option<Arc<std::sync::RwLock<ts::metrics::PipelineMetrics>>>,
+    /// Handle do clock de áudio publicado pela thread `audio-out`.
+    ///
+    /// Quando `Some`, `poll_video_frames` troca `video_clock` de
+    /// `MasterClock::Wall` para `MasterClock::Audio`, fazendo o vídeo
+    /// sincronizar contra o relógio real de reprodução WASAPI em vez de
+    /// wall-clock, eliminando o drift causado pela latência do decoder
+    /// multi-thread (frame threading).
+    ///
+    /// Preenchido via `set_audio_clock_rx` após `new()`.
+    audio_clock_rx: Option<Arc<std::sync::RwLock<Option<av::AudioClockHandle>>>>,
 }
 
 impl IronPlayerApp {
@@ -158,6 +168,7 @@ impl IronPlayerApp {
             video_dims: None,
             aspect_ratio_mode: AspectRatioMode::default(),
             last_metrics_snapshot_timestamp: None,
+            audio_clock_rx: None,
             seen_pcr_jitter_records: 0,
             pipeline_metrics_rx: None,
         }
@@ -173,6 +184,19 @@ impl IronPlayerApp {
         rx: Arc<std::sync::RwLock<ts::metrics::PipelineMetrics>>,
     ) {
         self.pipeline_metrics_rx = Some(rx);
+    }
+
+    /// Associa o `AudioClockHandle` compartilhado publicado por `audio-out`.
+    ///
+    /// Quando a thread `audio-out` cria (ou recria) o `AudioOutput`, grava
+    /// um novo `AudioClockHandle` neste `Arc`; `poll_video_frames` lê o
+    /// handle na primeira oportunidade e troca `video_clock` de
+    /// `MasterClock::Wall` para `MasterClock::Audio`, sincronizando o vídeo
+    /// ao relógio real de reprodução WASAPI.
+    ///
+    /// Deve ser chamado logo após `new()`, antes do primeiro `update()`.
+    pub fn set_audio_clock_rx(&mut self, rx: Arc<std::sync::RwLock<Option<av::AudioClockHandle>>>) {
+        self.audio_clock_rx = Some(rx);
     }
 
     /// Retorna uma referência imutável ao estado atual da UI.
@@ -253,8 +277,17 @@ impl IronPlayerApp {
             while rx.try_recv().is_ok() {}
         }
         self.video_queue.clear();
+        // Volta ao wall clock; na próxima conexão o audio_clock_rx fornecerá
+        // um novo AudioClockHandle e video_clock será trocado novamente.
         self.video_clock = MasterClock::wall(0);
         self.video_clock_initialized = false;
+        // Limpa o handle de áudio obsoleto para que poll_video_frames troque
+        // para o novo handle da próxima sessão.
+        if let Some(rx) = &self.audio_clock_rx {
+            if let Ok(mut guard) = rx.write() {
+                *guard = None;
+            }
+        }
         // av_sync_history é limpo via state.reset_stream_data() acima.
     }
 
@@ -263,17 +296,20 @@ impl IronPlayerApp {
     ///
     /// # Algoritmo
     ///
-    /// 1. Drena até 16 frames do canal `video_frames_rx` e os insere na
+    /// 1. Tenta trocar `video_clock` de `WallClock` para `AudioClock` assim que
+    ///    a thread `audio-out` publicar um `AudioClockHandle`. Com áudio como
+    ///    clock master, o vídeo é sincronizado contra o PTS real de reprodução
+    ///    WASAPI, eliminando o drift causado pela latência do decoder multi-thread.
+    /// 2. Drena até 16 frames do canal `video_frames_rx` e os insere na
     ///    `VideoQueue` com as políticas drop/hold/resync/wrap.
-    /// 2. Na primeira chegada de frame com PTS definido, ancora o
-    ///    `video_clock` no PTS do frame (`reset(anchor)`), garantindo que o
-    ///    clock esteja alinhado com o início do stream.
-    /// 3. Chama `pop_ready(clock.now_pts90())` para extrair o próximo frame
+    /// 3. Fallback: se ainda sem AudioClock, ancora o `WallClock` no PTS do
+    ///    primeiro frame de vídeo recebido (`reset(anchor)`).
+    /// 4. Chama `pop_ready(clock.now_pts90())` para extrair o próximo frame
     ///    na janela de exibição:
     ///    - `Ready`: faz upload ao renderer.
     ///    - `Resync`: reseta o clock para `new_anchor` e faz upload.
     ///    - `TooEarly` / `Empty`: nenhuma ação.
-    /// 4. Atualiza os campos de sincronização A/V em `state.metrics`
+    /// 5. Atualiza os campos de sincronização A/V em `state.metrics`
     ///    e amostra o offset no histórico de 60 s a ~1 Hz.
     ///
     /// SPEC-AV-003 · SPEC-AV-VQ-001 · SPEC-METRICS-SYNC-001
@@ -283,9 +319,26 @@ impl IronPlayerApp {
             None => return,
         };
 
-        // 1. Drena até 16 frames do canal e insere na fila PTS-ordenada.
+        // 1. Tenta trocar para AudioClock assim que audio-out publicar o handle.
+        //    Isso é feito antes de drenar frames para que o clock já esteja
+        //    correto quando processarmos o primeiro frame abaixo.
+        //    `video_clock_initialized` é reaproveitado como flag "já trocado".
+        if !self.video_clock_initialized {
+            if let Some(rx) = &self.audio_clock_rx {
+                if let Ok(guard) = rx.try_read() {
+                    if let Some(handle) = guard.as_ref() {
+                        self.video_clock = MasterClock::Audio(handle.clone());
+                        self.video_clock_initialized = true;
+                        tracing::debug!("poll_video_frames: trocado para AudioClock (A/V master)");
+                    }
+                }
+            }
+        }
+
+        // 2. Drena até 16 frames do canal e insere na fila PTS-ordenada.
         for frame in rx.try_iter().take(16) {
-            // Ancora o clock no PTS do primeiro frame recebido.
+            // Fallback: ancora o WallClock no PTS do primeiro frame caso ainda
+            // não tenhamos AudioClock disponível.
             if !self.video_clock_initialized {
                 if let Some(pts) = frame.pts {
                     self.video_clock.reset(pts as i64);

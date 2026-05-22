@@ -10,7 +10,7 @@ use av::MediaCodec;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tracing::{trace, warn};
-use ts::tables::{Bat, Descriptor, Eit, Nit, Pat, Pmt, Sdt, Tdt};
+use ts::tables::{Bat, Cat, Descriptor, Eit, Nit, Pat, Pmt, Sdt, Tdt, Tot};
 use ts::{CompleteSection, Pid};
 use ui::{AudioOperationalState, AudioStatusSnapshot, AudioTrackInfo, TableEvent};
 
@@ -25,6 +25,10 @@ pub enum DemuxCommand {
     Reset,
     /// Registra um PID de PMT descoberto na PAT.
     RegisterPmtPid(Pid),
+    /// Registra o PID dinâmico da NIT descoberto na PAT (`program_number == 0`).
+    ///
+    /// SPEC-TS-NIT-DYN-001
+    RegisterNitPid(Pid),
     /// Registra um PID A/V descoberto na PMT.
     RegisterAvPid(Pid),
     /// Remove um PID A/V do roteamento (ao trocar de serviço).
@@ -274,12 +278,14 @@ impl TableDispatcher {
     fn dispatch(&mut self, section: CompleteSection) {
         match section.table_id {
             0x00 => self.dispatch_pat(&section),
+            0x01 => self.dispatch_cat(&section),
             0x02 => self.dispatch_pmt(&section),
             0x40 | 0x41 => self.dispatch_full_section("NIT", &section, Nit::parse, TableEvent::Nit),
             0x42 | 0x46 => self.dispatch_full_section("SDT", &section, Sdt::parse, TableEvent::Sdt),
             0x4A => self.dispatch_full_section("BAT", &section, Bat::parse, TableEvent::Bat),
             0x4E | 0x4F => self.dispatch_eit_pf(&section),
             0x70 => self.dispatch_tdt(&section),
+            0x73 => self.dispatch_tot(&section),
             other => {
                 trace!(
                     pid = section.pid,
@@ -323,6 +329,11 @@ impl TableDispatcher {
                 }
                 for pid in pat.pmt_pids() {
                     self.send_demux_command(DemuxCommand::RegisterPmtPid(pid));
+                }
+                // SPEC-TS-NIT-DYN-001: registra PID dinâmico da NIT quando
+                // a PAT declara program_number == 0 com PID diferente do padrão.
+                if let Some(nit_pid) = pat.nit_pid() {
+                    self.send_demux_command(DemuxCommand::RegisterNitPid(nit_pid));
                 }
                 self.tx.try_send(TableEvent::Pat(pat));
             }
@@ -610,6 +621,32 @@ impl TableDispatcher {
                 pid = section.pid,
                 error = %error,
                 "falha ao parsear TDT"
+            ),
+        }
+    }
+
+    fn dispatch_tot(&self, section: &CompleteSection) {
+        match Tot::parse(&section.data) {
+            Ok(tot) => {
+                self.tx.try_send(TableEvent::Tot(tot));
+            }
+            Err(error) => warn!(
+                pid = section.pid,
+                error = %error,
+                "falha ao parsear TOT"
+            ),
+        }
+    }
+
+    fn dispatch_cat(&self, section: &CompleteSection) {
+        match Cat::parse(&section.data) {
+            Ok(cat) => {
+                self.tx.try_send(TableEvent::Cat(cat));
+            }
+            Err(error) => warn!(
+                pid = section.pid,
+                error = %error,
+                "falha ao parsear CAT"
             ),
         }
     }
@@ -2015,5 +2052,156 @@ mod tests {
             })
         );
         assert_eq!(snapshot.state, AudioOperationalState::Buffering);
+    }
+
+    // ── SPEC-TS-CAT-001 / SPEC-TABLE-TOT-001 / SPEC-TS-NIT-DYN-001 ───────────
+
+    /// Constrói uma seção CAT mínima para testes do dispatcher.
+    fn make_cat_section(version: u8) -> CompleteSection {
+        use ts::crc::crc32_mpeg2;
+        let section_length = 2 + 3 + 0 + 4; // reserved(2) + version_bytes(3) + no descs + CRC
+        let mut data = vec![
+            0x01u8,
+            0x80 | ((section_length >> 8) as u8),
+            (section_length & 0xFF) as u8,
+            0xFF, 0xFF,
+            0xC0 | ((version & 0x1F) << 1) | 0x01,
+            0x00,
+            0x00,
+        ];
+        let crc_pos = data.len();
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        let crc = crc32_mpeg2(&data[..crc_pos]);
+        data[crc_pos..].copy_from_slice(&crc.to_be_bytes());
+        CompleteSection {
+            pid: 0x0001,
+            table_id: 0x01,
+            data: Bytes::from(data),
+        }
+    }
+
+    /// Constrói uma seção TOT mínima para testes do dispatcher.
+    fn make_tot_section() -> CompleteSection {
+        use ts::crc::crc32_mpeg2;
+        // MJD para 2024-01-15 + 12:00:00 BCD
+        let mjd: u16 = 60324;
+        let section_length = 5 + 2 + 0 + 4; // MJD+BCD + desc_loop_len + no descs + CRC
+        let mut data = vec![
+            0x73u8,
+            0x70 | ((section_length >> 8) as u8),
+            (section_length & 0xFF) as u8,
+            (mjd >> 8) as u8,
+            mjd as u8,
+            0x12, 0x00, 0x00, // 12:00:00 BCD
+            0xF0, 0x00, // desc_loop_len = 0
+        ];
+        let crc_pos = data.len();
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        let crc = crc32_mpeg2(&data[..crc_pos]);
+        data[crc_pos..].copy_from_slice(&crc.to_be_bytes());
+        CompleteSection {
+            pid: 0x0014,
+            table_id: 0x73,
+            data: Bytes::from(data),
+        }
+    }
+
+    /// Constrói uma seção PAT que inclui um programa 0 apontando para NIT PID dinâmico.
+    fn make_pat_section_with_nit(
+        ts_id: u16,
+        version: u8,
+        nit_pid: u16,
+        pmt_pids: &[(u16, u16)],
+    ) -> CompleteSection {
+        let version_byte = ((version & 0x1F) << 1) | 0x01;
+        let mut body: Vec<u8> = vec![
+            (ts_id >> 8) as u8,
+            ts_id as u8,
+            version_byte,
+            0x00,
+            0x00,
+            // program_number = 0 → NIT PID
+            0x00, 0x00,
+            0xE0 | ((nit_pid >> 8) as u8 & 0x1F),
+            nit_pid as u8,
+        ];
+        for (prog_num, pmt_pid) in pmt_pids {
+            body.push((*prog_num >> 8) as u8);
+            body.push(*prog_num as u8);
+            body.push(0xE0 | ((*pmt_pid >> 8) as u8 & 0x1F));
+            body.push(*pmt_pid as u8);
+        }
+        let mut data = vec![0x00u8, 0x80, (body.len() + 4) as u8];
+        data.extend_from_slice(&body);
+        CompleteSection {
+            pid: 0x0000,
+            table_id: 0x00,
+            data: Bytes::from(data),
+        }
+    }
+
+    /// SPEC-TS-CAT-001: dispatcher processa seção CAT (PID 0x0001) e emite TableEvent::Cat.
+    #[test]
+    fn spec_ts_cat_001_dispatcher_emits_cat_event() {
+        let (mut dispatcher, _tx, events_rx, _demux_rx, _pes_rx, _decode_rx, _audio) =
+            make_dispatcher();
+        let cat = make_cat_section(2);
+        dispatcher.process_section(cat);
+        let event = events_rx.try_recv().expect("deve ter TableEvent::Cat");
+        assert!(
+            matches!(event, TableEvent::Cat(_)),
+            "evento deve ser TableEvent::Cat, foi: {event:?}"
+        );
+    }
+
+    /// SPEC-TABLE-TOT-001: dispatcher processa seção TOT (table_id 0x73) e emite TableEvent::Tot.
+    #[test]
+    fn spec_table_tot_001_dispatcher_emits_tot_event() {
+        let (mut dispatcher, _tx, events_rx, _demux_rx, _pes_rx, _decode_rx, _audio) =
+            make_dispatcher();
+        let tot = make_tot_section();
+        dispatcher.process_section(tot);
+        let event = events_rx.try_recv().expect("deve ter TableEvent::Tot");
+        assert!(
+            matches!(event, TableEvent::Tot(_)),
+            "evento deve ser TableEvent::Tot, foi: {event:?}"
+        );
+    }
+
+    /// SPEC-TS-NIT-DYN-001: PAT com program_number=0 (NIT PID dinâmico) envia
+    /// DemuxCommand::RegisterNitPid com o PID declarado.
+    #[test]
+    fn spec_ts_nit_dyn_001_pat_with_nit_pid_sends_register_nit_pid() {
+        let (mut dispatcher, _tx, _events_rx, demux_rx, _pes_rx, _decode_rx, _audio) =
+            make_dispatcher();
+        // PAT com NIT PID dinâmico = 0x0020 e um programa normal
+        let pat = make_pat_section_with_nit(0x0001, 1, 0x0020, &[(1, 0x0100)]);
+        dispatcher.process_section(pat);
+
+        // Coleta todos os comandos demux emitidos
+        let cmds: Vec<DemuxCommand> = std::iter::from_fn(|| demux_rx.try_recv().ok()).collect();
+        assert!(
+            cmds.contains(&DemuxCommand::RegisterNitPid(0x0020)),
+            "deve emitir RegisterNitPid(0x0020); comandos recebidos: {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&DemuxCommand::RegisterPmtPid(0x0100)),
+            "deve emitir RegisterPmtPid(0x0100); comandos recebidos: {cmds:?}"
+        );
+    }
+
+    /// SPEC-TS-NIT-DYN-001: PAT sem program_number=0 NÃO emite RegisterNitPid.
+    #[test]
+    fn spec_ts_nit_dyn_001_pat_without_nit_entry_no_register_nit_pid() {
+        let (mut dispatcher, _tx, _events_rx, demux_rx, _pes_rx, _decode_rx, _audio) =
+            make_dispatcher();
+        let pat = make_pat_section(0x0001, 1, &[(1, 0x0100)]);
+        dispatcher.process_section(pat);
+
+        let cmds: Vec<DemuxCommand> = std::iter::from_fn(|| demux_rx.try_recv().ok()).collect();
+        assert!(
+            !cmds.iter().any(|c| matches!(c, DemuxCommand::RegisterNitPid(_))),
+            "PAT sem program_number=0 não deve emitir RegisterNitPid; comandos: {cmds:?}"
+        );
     }
 }

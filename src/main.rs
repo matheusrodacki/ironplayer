@@ -370,6 +370,9 @@ fn main() -> eframe::Result<()> {
                                 DemuxCommand::RegisterPmtPid(pid) => {
                                     demuxer.register_pmt_pid(pid);
                                 }
+                                DemuxCommand::RegisterNitPid(pid) => {
+                                    demuxer.register_nit_pid(pid);
+                                }
                                 DemuxCommand::RegisterAvPid(pid) => {
                                     demuxer.register_av_pid(pid);
                                 }

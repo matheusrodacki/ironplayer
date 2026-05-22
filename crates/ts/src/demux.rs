@@ -17,6 +17,8 @@ use crate::{PcrEvent, Pid, TsError, TsEvent};
 
 /// PAT — Program Association Table.
 const PID_PAT: Pid = 0x0000;
+/// CAT — Conditional Access Table.
+const PID_CAT: Pid = 0x0001;
 /// NIT — Network Information Table.
 const PID_NIT: Pid = 0x0010;
 /// SDT/BAT — Service Description / Bouquet Association Table.
@@ -70,6 +72,11 @@ pub struct TsDemuxer {
     cc_state: HashMap<Pid, u8>,
     /// PIDs de PMT registrados dinamicamente ao parsear a PAT.
     pmt_pids: HashSet<Pid>,
+    /// PID dinâmico da NIT (quando diferente do padrão 0x0010), registrado
+    /// ao parsear a PAT com `program_number == 0`.
+    ///
+    /// SPEC-TS-NIT-DYN-001
+    dynamic_nit_pid: Option<Pid>,
     /// PIDs de A/V registrados dinamicamente ao parsear a PMT.
     av_pids: HashSet<Pid>,
     /// Último WARN de canal cheio para eventos Packet, que são de alta frequência.
@@ -95,6 +102,7 @@ impl TsDemuxer {
             event_tx,
             cc_state: HashMap::new(),
             pmt_pids: HashSet::new(),
+            dynamic_nit_pid: None,
             av_pids: HashSet::new(),
             last_packet_event_full_warn: None,
             pcr_tracker: None,
@@ -118,6 +126,14 @@ impl TsDemuxer {
     /// SPEC-TS-002a
     pub fn register_pmt_pid(&mut self, pid: Pid) {
         self.pmt_pids.insert(pid);
+    }
+
+    /// Registra o PID dinâmico da NIT (chamado ao parsear a PAT quando
+    /// `program_number == 0` aponta para um PID diferente de 0x0010).
+    ///
+    /// SPEC-TS-NIT-DYN-001
+    pub fn register_nit_pid(&mut self, pid: Pid) {
+        self.dynamic_nit_pid = Some(pid);
     }
 
     /// Registra um PID como A/V (chamado ao parsear a PMT).
@@ -145,6 +161,7 @@ impl TsDemuxer {
     pub fn reset_dynamic_state(&mut self) {
         self.cc_state.clear();
         self.pmt_pids.clear();
+        self.dynamic_nit_pid = None;
         self.av_pids.clear();
     }
 
@@ -319,8 +336,9 @@ impl TsDemuxer {
     /// registradas dinamicamente.
     #[inline]
     fn is_section_pid(&self, pid: Pid) -> bool {
-        matches!(pid, PID_PAT | PID_NIT | PID_SDT | PID_EIT | PID_TDT)
+        matches!(pid, PID_PAT | PID_CAT | PID_NIT | PID_SDT | PID_EIT | PID_TDT)
             || self.pmt_pids.contains(&pid)
+            || self.dynamic_nit_pid == Some(pid)
     }
 
     fn should_warn_packet_event_full(&mut self) -> bool {

@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use ts::metrics::{MetricsSnapshot, PcrJitterRecord};
-use ts::tables::{Bat, EitEvent, Nit, Pat, Pmt, Sdt, Tdt};
+use ts::tables::{Bat, Cat, EitEvent, Nit, Pat, Pmt, Sdt, Tdt, Tot};
 use ts::Pid;
 
 // ---------------------------------------------------------------------------
@@ -182,8 +182,12 @@ pub enum TableEvent {
     },
     /// Snapshot mais recente da TDT.
     Tdt(Tdt),
+    /// Snapshot mais recente da TOT.
+    Tot(Tot),
     /// Snapshot mais recente da BAT.
     Bat(Bat),
+    /// Snapshot mais recente da CAT.
+    Cat(Cat),
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +227,9 @@ pub struct TablesSnapshot {
     /// `service_id` → `(atual, próximo)`
     pub eit_pf: HashMap<u16, (Option<EitEvent>, Option<EitEvent>)>,
     pub tdt: Option<Tdt>,
+    pub tot: Option<Tot>,
     pub bat: Option<Bat>,
+    pub cat: Option<Cat>,
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +304,9 @@ impl AppState {
                 self.tables.eit_pf.insert(service_id, (current, next));
             }
             TableEvent::Tdt(tdt) => self.tables.tdt = Some(tdt),
+            TableEvent::Tot(tot) => self.tables.tot = Some(tot),
             TableEvent::Bat(bat) => self.tables.bat = Some(bat),
+            TableEvent::Cat(cat) => self.tables.cat = Some(cat),
         }
     }
 }

@@ -6,6 +6,7 @@
 //! `Result<T, TableError>`. Zero estado, zero side-effects.
 
 pub mod bat;
+pub mod cat;
 pub mod descriptor;
 pub mod dvb_string;
 pub mod eit;
@@ -14,8 +15,10 @@ pub mod pat;
 pub mod pmt;
 pub mod sdt;
 pub mod tdt;
+pub mod tot;
 
 pub use bat::{Bat, BatTransportStream};
+pub use cat::{Cat, CatCaDescriptor};
 pub use descriptor::{Descriptor, KnownDescriptor};
 pub use eit::{Eit, EitEvent};
 pub use nit::{Nit, NitTransportStream};
@@ -23,6 +26,7 @@ pub use pat::{Pat, PatProgram};
 pub use pmt::{stream_type_label, Pmt, PmtStream};
 pub use sdt::{RunningStatus, Sdt, SdtService};
 pub use tdt::Tdt;
+pub use tot::{LocalTimeOffset, Tot};
 
 use thiserror::Error;
 

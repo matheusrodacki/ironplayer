@@ -17,6 +17,7 @@
 //! `ts` e `net` permanecem zero-FFI.
 
 pub mod audio;
+pub mod clock;
 pub mod codec;
 pub mod decoder;
 pub mod error;
@@ -27,6 +28,7 @@ pub mod renderer;
 // ── Re-exportações públicas ───────────────────────────────────────────────────
 
 pub use audio::{AudioFrame, AudioOutput, AudioRingBuffer};
+pub use clock::{AudioClockHandle, Clock, MasterClock, Pts90, WallClockHandle};
 pub use codec::{AudioCodec, MediaCodec, VideoCodec};
 pub use decoder::{DecodedFrame, FfmpegDecoder};
 pub use error::AvError;

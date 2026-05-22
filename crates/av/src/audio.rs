@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use crate::clock::{AudioClockHandle, Pts90};
 use crate::error::AvError;
 
 // ─── AudioFrame ──────────────────────────────────────────────────────────────
@@ -259,6 +260,11 @@ struct AudioSharedState {
     restart_requested: AtomicBool,
     underruns: AtomicU64,
     overruns: AtomicU64,
+    /// Contador atômico de samples interleaved consumidos pelo driver WASAPI.
+    /// Incrementado pela callback cpal; compartilhado com `AudioClockHandle`.
+    ///
+    /// SPEC-AV-CLOCK-002
+    samples_played: Arc<AtomicU64>,
 }
 
 impl AudioSharedState {
@@ -269,6 +275,7 @@ impl AudioSharedState {
             restart_requested: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
+            samples_played: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -343,6 +350,13 @@ impl AudioOutput {
                     if report.missing_samples > 0 {
                         callback_state.underruns.fetch_add(1, Ordering::Relaxed);
                     }
+
+                    // Incrementa o contador de samples consumidos pelo driver.
+                    // Usado pelo `AudioClockHandle` para calcular o PTS atual.
+                    // SPEC-AV-CLOCK-002
+                    callback_state
+                        .samples_played
+                        .fetch_add(output.len() as u64, Ordering::Relaxed);
 
                     apply_volume(output, volume);
                 },
@@ -448,6 +462,26 @@ impl AudioOutput {
             .lock()
             .map(|state| state.buffer_level())
             .unwrap_or(0.0)
+    }
+
+    /// Retorna um `AudioClockHandle` conectado ao contador de samples desta
+    /// saída de áudio.
+    ///
+    /// O handle compartilha o `Arc<AtomicU64>` interno com a callback cpal —
+    /// qualquer chamada a `now_pts90()` no handle refletirá o estado real de
+    /// reprodução do driver.
+    ///
+    /// O `anchor_pts` inicial é `0`; use `AudioClockHandle::reset()` para
+    /// reposicionar a âncora após receber o primeiro PTS do stream.
+    ///
+    /// SPEC-AV-CLOCK-002
+    pub fn clock_handle(&self, anchor_pts: Pts90) -> AudioClockHandle {
+        AudioClockHandle::with_counter(
+            Arc::clone(&self.shared.samples_played),
+            self.sample_rate,
+            self.channels,
+            anchor_pts,
+        )
     }
 
     /// Retorna `true` quando o stream WASAPI sinalizou falha e precisa ser recriado.

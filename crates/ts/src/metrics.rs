@@ -729,6 +729,7 @@ mod tests {
             early_frames_held: 0,
             pts_discontinuities: 0,
             video_queue_depth: 0,
+            pipeline: PipelineMetrics::default(),
         };
         let cloned = snap.clone();
         assert_eq!(cloned.total_bitrate_kbps, snap.total_bitrate_kbps);

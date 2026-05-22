@@ -130,7 +130,7 @@ impl AudioClockHandle {
     /// Retorna um clone do `Arc<AtomicU64>` para ser usado na callback cpal.
     ///
     /// A callback deve chamar:
-    /// ```rust,ignore
+    /// ```text
     /// samples_played.fetch_add(output.len() as u64, Ordering::Relaxed);
     /// ```
     ///

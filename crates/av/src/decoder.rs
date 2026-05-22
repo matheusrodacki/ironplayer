@@ -102,7 +102,7 @@ struct CodecState {
 ///
 /// # Exemplo de uso
 ///
-/// ```ignore
+/// ```text
 /// let mut decoder = FfmpegDecoder::new()?;
 /// let frames = decoder.decode(&pes_packet)?;
 /// ```

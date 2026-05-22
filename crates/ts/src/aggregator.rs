@@ -159,7 +159,7 @@ struct PidInfo {
 ///
 /// ## Criação
 ///
-/// ```rust,ignore
+/// ```text
 /// let (ts_tx, ts_rx) = crossbeam_channel::bounded(256);
 /// let (pcr_tx, pcr_rx) = crossbeam_channel::bounded(64);
 /// let (net_tx, net_rx) = crossbeam_channel::bounded(64);

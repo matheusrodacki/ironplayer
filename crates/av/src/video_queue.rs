@@ -16,7 +16,7 @@
 //!
 //! ## Uso típico
 //!
-//! ```ignore
+//! ```text
 //! let mut q = VideoQueue::default();
 //! let clock = MasterClock::wall(0);
 //!

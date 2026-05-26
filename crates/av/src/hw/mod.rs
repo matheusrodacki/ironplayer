@@ -13,9 +13,12 @@
 #[cfg(windows)]
 mod d3d11_impl;
 #[cfg(windows)]
-pub use d3d11_impl::{D3d11Device, D3d11Texture, HwPixelFormat};
+pub use d3d11_impl::{AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwPixelFormat, TransferFunction};
 
 #[cfg(not(windows))]
 mod stub;
 #[cfg(not(windows))]
-pub use stub::{D3d11Device, D3d11Texture, HwPixelFormat};
+pub use stub::{AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwPixelFormat, TransferFunction};
+
+mod hwaccel_mode;
+pub use hwaccel_mode::{HwAccelMode, HwAccelState};

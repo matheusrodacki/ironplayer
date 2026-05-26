@@ -35,7 +35,10 @@ pub use clock::{AudioClockHandle, Clock, MasterClock, Pts90, WallClockHandle};
 pub use codec::{AudioCodec, CodecConfig, MediaCodec, ThreadType, VideoCodec};
 pub use decoder::{DecodedFrame, FfmpegDecoder};
 pub use error::AvError;
-pub use hw::{D3d11Device, D3d11Texture, HwPixelFormat};
+pub use hw::{
+    AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwAccelMode, HwAccelState, HwPixelFormat,
+    TransferFunction,
+};
 pub use pes::{PesAssembler, PesPacket};
 pub use renderer::VideoRenderer;
 pub use video_queue::{

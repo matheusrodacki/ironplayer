@@ -306,6 +306,37 @@ pub struct PipelineMetrics {
     ///
     /// Valores possíveis: `"Limited"`, `"Full"`. `None` antes do primeiro frame.
     pub color_range: Option<String>,
+    // ── Hardware acceleration (Sprint 2, SPEC-METRICS-HW-001) ────────────────
+    /// `true` enquanto o decoder está produzindo frames acelerados em GPU.
+    ///
+    /// SPEC-METRICS-HW-001
+    pub hw_decode_active: bool,
+    /// Identificador do codec hwaccel ativo (ex.: `"hevc_d3d11va"`).
+    ///
+    /// SPEC-METRICS-HW-001
+    pub hw_decode_codec: Option<String>,
+    /// Razão registrada quando o caminho hwaccel caiu para CPU.
+    ///
+    /// `None` quando não houve fallback ou quando hwaccel não foi solicitado.
+    ///
+    /// SPEC-METRICS-HW-001
+    pub hw_decode_fallback_reason: Option<String>,
+    /// Frames atualmente em uso no pool D3D11VA (Frames "ocupados").
+    ///
+    /// SPEC-METRICS-HW-001
+    pub hw_frame_pool_in_use: u32,
+    /// Eventos de TDR (Timeout Detection and Recovery) tratados na sessão.
+    ///
+    /// SPEC-METRICS-HW-001
+    pub tdr_recoveries: u64,
+    /// Nome legível do adapter GPU em uso (ex.: `"NVIDIA GeForce RTX 4060"`).
+    ///
+    /// SPEC-METRICS-HW-001
+    pub gpu_adapter_name: Option<String>,
+    /// LUID do adapter GPU em uso, codificado como u64.
+    ///
+    /// SPEC-METRICS-HW-001
+    pub gpu_adapter_luid: u64,
 }
 
 impl Default for MetricsSnapshot {

@@ -5,7 +5,7 @@ mod table_dispatcher;
 
 use bytes::Bytes;
 use channels::BoundedSender;
-use config::AppConfig;
+use config::{AppConfig, HwAccelChoice};
 use net::{
     ReceiverConfig, RtpStripper, StopHandle as NetStopHandle, StopToken as NetStopToken, StreamUrl,
     UdpReceiver,
@@ -22,7 +22,52 @@ use ts::{
 };
 use ui::IronPlayerApp;
 
-// ── SenderGuard ───────────────────────────────────────────────────────────────
+// ── CLI parsing ───────────────────────────────────────────────────────────────
+
+/// Argumentos de linha de comando reconhecidos pelo IronPlayer.
+///
+/// Faz parsing manual para evitar dependência de `clap`.  Suporta:
+/// - `--hwaccel <auto|d3d11va|none>` (SPEC-CFG-HW-001)
+/// - `--help` / `-h`
+///
+/// Valores ausentes mantêm o `HwAccelChoice` lido do `ironstream.toml`.
+struct CliArgs {
+    hwaccel_override: Option<HwAccelChoice>,
+}
+
+impl CliArgs {
+    fn parse_from(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut hwaccel_override = None;
+        let mut iter = args.into_iter().skip(1); // pula nome do binário
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    eprintln!(
+                        "IronPlayer — uso:\n  \
+                         ironplayer [--hwaccel auto|d3d11va|none]\n"
+                    );
+                    std::process::exit(0);
+                }
+                "--hwaccel" => {
+                    let v = iter
+                        .next()
+                        .ok_or_else(|| "--hwaccel requer um valor".to_string())?;
+                    hwaccel_override = Some(HwAccelChoice::parse_cli(&v)?);
+                }
+                other if other.starts_with("--hwaccel=") => {
+                    let v = &other["--hwaccel=".len()..];
+                    hwaccel_override = Some(HwAccelChoice::parse_cli(v)?);
+                }
+                other => {
+                    return Err(format!("argumento desconhecido: '{other}' (use --help)"));
+                }
+            }
+        }
+        Ok(Self { hwaccel_override })
+    }
+}
+
+
 
 /// Mantém os senders do pipeline vivos até o shutdown limpo.
 ///
@@ -212,8 +257,30 @@ fn main() -> eframe::Result<()> {
     }
 
     // 3. Carrega AppConfig (ironstream.toml ou defaults)
-    let cfg = AppConfig::load_or_default();
-    tracing::info!("IronPlayer iniciado");
+    let mut cfg = AppConfig::load_or_default();
+
+    // 3.1 CLI override (SPEC-CFG-HW-001) — --hwaccel sobrescreve [player].hwaccel
+    match CliArgs::parse_from(std::env::args()) {
+        Ok(cli) => {
+            if let Some(choice) = cli.hwaccel_override {
+                tracing::info!(
+                    cli = choice.label(),
+                    cfg = cfg.player.hwaccel.label(),
+                    "CLI: --hwaccel sobrescreve [player].hwaccel"
+                );
+                cfg.player.hwaccel = choice;
+            }
+        }
+        Err(e) => {
+            eprintln!("[IronPlayer] {e}");
+            std::process::exit(2);
+        }
+    }
+
+    tracing::info!(
+        hwaccel = cfg.player.hwaccel.label(),
+        "IronPlayer iniciado"
+    );
 
     // 4. Cria todos os canais bounded do pipeline
     let ch = channels::AppChannels::create();
@@ -973,29 +1040,44 @@ fn main() -> eframe::Result<()> {
     // selecionar o mesmo adapter físico (via PowerPreference::HighPerformance em
     // sistemas com iGPU+dGPU) e registramos o LUID no log.
     //
+    // O bootstrap é pulado quando `--hwaccel none` foi solicitado.
+    //
     // Risco R1: eframe 0.29 não expõe API para injetar wgpu::Device pré-criado;
     // a sincronização de adapter é feita por LUID no CreationContext callback.
+    let hwaccel_request_active = !matches!(cfg.player.hwaccel, HwAccelChoice::None);
     #[cfg(windows)]
-    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = match av::D3d11Device::new() {
-        Ok(dev) => {
-            tracing::info!(
-                adapter = dev.adapter_description(),
-                luid = dev.adapter_luid().as_u64(),
-                vendor_id = format!("{:#06x}", dev.vendor_id()),
-                "hw: D3d11Device bootstrap OK (Fase A)"
-            );
-            Some(dev)
+    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = if hwaccel_request_active {
+        match av::D3d11Device::new() {
+            Ok(dev) => {
+                tracing::info!(
+                    adapter = dev.adapter_description(),
+                    luid = dev.adapter_luid().as_u64(),
+                    vendor_id = format!("{:#06x}", dev.vendor_id()),
+                    hwaccel_choice = cfg.player.hwaccel.label(),
+                    "hw: D3d11Device bootstrap OK (Fase A)"
+                );
+                Some(dev)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    hwaccel_choice = cfg.player.hwaccel.label(),
+                    "hw: D3d11Device bootstrap falhou — hwaccel desabilitado; usando decode CPU"
+                );
+                None
+            }
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "hw: D3d11Device bootstrap falhou — hwaccel desabilitado; usando decode CPU"
-            );
-            None
-        }
+    } else {
+        tracing::info!(
+            "hw: --hwaccel=none — bootstrap D3D11 ignorado; decode 100% CPU"
+        );
+        None
     };
     #[cfg(not(windows))]
-    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = None;
+    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = {
+        let _ = hwaccel_request_active; // suprime warning
+        None
+    };
 
     // Usa PowerPreference::HighPerformance para que wgpu e D3D11 selecionem
     // o mesmo adapter físico em sistemas com múltiplas GPUs (iGPU + dGPU).

@@ -12,6 +12,7 @@ pub enum HwPixelFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ColorSpace {
     Bt601,
     Bt709,
@@ -19,11 +20,30 @@ pub enum ColorSpace {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum TransferFunction {
     Bt1886,
     Pq,
     Hlg,
     Srgb,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterLuid {
+    pub low_part: u32,
+    pub high_part: i32,
+}
+
+impl AdapterLuid {
+    pub fn as_u64(self) -> u64 {
+        ((self.high_part as u32 as u64) << 32) | self.low_part as u64
+    }
+}
+
+impl std::fmt::Display for AdapterLuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#010x}:{:#010x}", self.high_part, self.low_part)
+    }
 }
 
 /// Stub de `D3d11Device` para plataformas não-Windows.
@@ -35,8 +55,11 @@ impl D3d11Device {
             "D3D11 não suportado nesta plataforma".into(),
         ))
     }
-    pub fn adapter_luid(&self) -> u64 {
-        0
+    pub fn adapter_luid(&self) -> AdapterLuid {
+        AdapterLuid {
+            low_part: 0,
+            high_part: 0,
+        }
     }
     pub fn vendor_id(&self) -> u32 {
         0

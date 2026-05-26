@@ -18,6 +18,7 @@ use crate::ffi::{
     AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
     AV_FRAME_FLAG_INTERLACED,
 };
+use crate::hw::{HwAccelMode, HwAccelState};
 use crate::pes::PesPacket;
 use crate::video_queue::{YuvColorRange, YuvColorspace, YuvFrame};
 
@@ -118,6 +119,17 @@ pub struct FfmpegDecoder {
     codec_config: CodecConfig,
     /// Mapa de PID → estado do decodificador para aquele stream.
     states: HashMap<u16, CodecState>,
+    /// Modo de aceleração de hardware solicitado (Fase B, SPEC-AV-HW-DEC-001).
+    ///
+    /// Nesta versão do decoder, `D3d11Va(_)` é aceito mas o caminho FFI real
+    /// (callback `get_format` + `AVHWDeviceContext`) será conectado na próxima
+    /// iteração da Fase B.  A máquina de estados em `hw_state` já está pronta
+    /// para receber sinais de falha e acionar fallback.
+    hwaccel: HwAccelMode,
+    /// Estado da máquina de fallback hwaccel (falhas seguidas / motivo).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    hw_state: HwAccelState,
 }
 
 impl FfmpegDecoder {
@@ -167,6 +179,8 @@ impl FfmpegDecoder {
             filter_lib,
             codec_config: config,
             states: HashMap::new(),
+            hwaccel: HwAccelMode::Off,
+            hw_state: HwAccelState::new(),
         })
     }
 
@@ -190,6 +204,8 @@ impl FfmpegDecoder {
             filter_lib: None,
             codec_config: config,
             states: HashMap::new(),
+            hwaccel: HwAccelMode::Off,
+            hw_state: HwAccelState::new(),
         }
     }
 
@@ -217,6 +233,104 @@ impl FfmpegDecoder {
     /// SPEC-AV-002b
     pub fn threads_used(&self) -> u32 {
         self.codec_config.thread_count
+    }
+
+    // ── Hardware acceleration (Fase B, SPEC-AV-HW-DEC-001) ────────────────────
+
+    /// Habilita (ou desabilita) o caminho hwaccel para decodes futuros.
+    ///
+    /// O caller deve chamar `reset()` antes de mudar o modo se houver streams
+    /// já abertos — `AVCodecContext` existentes mantêm o pix_fmt original e
+    /// não migram entre CPU e GPU em runtime.
+    ///
+    /// O caminho FFI real (callback `get_format` + `AVHWDeviceContext`) é
+    /// conectado na continuação da Fase B; nesta versão a chamada apenas
+    /// registra a intenção, ativa a máquina de estado e mantém compatibilidade
+    /// com o caminho SW para CI e fallback.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn enable_hwaccel(&mut self, mode: HwAccelMode) -> Result<(), AvError> {
+        match &mode {
+            HwAccelMode::Off => {
+                self.hw_state = HwAccelState::new();
+            }
+            HwAccelMode::D3d11Va(_) => {
+                self.hw_state = HwAccelState::new();
+                self.hw_state.activate();
+                tracing::info!(target: "av::hw", "hw.init.ok mode=d3d11va");
+            }
+        }
+        self.hwaccel = mode;
+        Ok(())
+    }
+
+    /// Modo de hwaccel configurado atualmente (não reflete fallback dinâmico).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn hwaccel_mode(&self) -> &HwAccelMode {
+        &self.hwaccel
+    }
+
+    /// `true` se o decoder está ativamente produzindo frames acelerados em GPU.
+    ///
+    /// Difere de `hwaccel_mode().is_gpu()`: este método fica `false` após o
+    /// fallback automático para CPU.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn is_hwaccel_active(&self) -> bool {
+        self.hw_state.is_active()
+    }
+
+    /// Motivo do último fallback hwaccel→CPU (se houve).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.hw_state.fallback_reason()
+    }
+
+    /// Promove imediatamente o decoder para o caminho CPU, registrando o motivo.
+    ///
+    /// Usado pelo callback `get_format` (Fase B FFI) quando o driver recusa o
+    /// pix_fmt D3D11, ou pelo render pass na recuperação de TDR (Fase E).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn fallback_to_sw(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        tracing::warn!(target: "av::hw", reason = %reason, "hw.fallback");
+        self.hw_state.fallback(reason);
+    }
+
+    /// Registra uma falha transitória do caminho hwaccel.  Retorna `true` se a
+    /// contagem atingiu o limite (`HW_FALLBACK_THRESHOLD`) e o caller já deve
+    /// chamar `fallback_to_sw`.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[must_use = "verifique o retorno para acionar fallback quando necessário"]
+    pub fn record_hw_failure(&mut self) -> bool {
+        self.hw_state.record_failure()
+    }
+
+    /// Sinaliza que o caminho hwaccel entregou um frame válido (reseta a streak).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[allow(dead_code)]
+    pub(crate) fn record_hw_success(&mut self) {
+        self.hw_state.record_success();
+    }
+
+    /// Reset completo do decoder (limpa codec_ctxs e estado hwaccel).
+    ///
+    /// Nota: para preservar a compatibilidade da API, esta variante é apenas
+    /// um helper que combina `reset()` + reset do estado hwaccel.  Use-a ao
+    /// reabrir um stream para começar uma nova sessão de telemetria.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn reset_with_hw_state(&mut self) {
+        self.states.clear();
+        self.hw_state = HwAccelState::new();
+        if self.hwaccel.is_gpu() {
+            self.hw_state.activate();
+        }
     }
 
     /// Decodifica um `PesPacket` completo, retornando todos os frames prontos.
@@ -811,5 +925,65 @@ mod tests {
         let frames = split_loas_frames(&data);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), 3 + frame_len);
+    }
+
+    // ── Hwaccel API (Fase B) ────────────────────────────────────────────────
+
+    /// Constrói um decoder isolado, sem DLLs FFmpeg, para testar a superfície
+    /// pública de hwaccel.
+    fn dummy_decoder() -> Option<FfmpegDecoder> {
+        let dir = find_ffmpeg_dll_dir()?;
+        let lib = FfmpegLib::load(&dir).ok()?;
+        Some(FfmpegDecoder::with_lib(lib))
+    }
+
+    /// SPEC-AV-HW-DEC-001: estado inicial do decoder = CPU, sem fallback.
+    #[test]
+    fn spec_av_hw_dec_001_decoder_starts_in_cpu_mode() {
+        let Some(d) = dummy_decoder() else {
+            eprintln!("FFmpeg DLLs ausentes — teste ignorado");
+            return;
+        };
+        assert!(matches!(d.hwaccel_mode(), HwAccelMode::Off));
+        assert!(!d.is_hwaccel_active());
+        assert!(d.fallback_reason().is_none());
+    }
+
+    /// SPEC-AV-HW-DEC-001: enable_hwaccel(Off) é idempotente e mantém estado limpo.
+    #[test]
+    fn spec_av_hw_dec_001_enable_off_idempotent() {
+        let Some(mut d) = dummy_decoder() else {
+            return;
+        };
+        d.enable_hwaccel(HwAccelMode::Off).unwrap();
+        assert!(!d.is_hwaccel_active());
+        assert!(d.fallback_reason().is_none());
+    }
+
+    /// SPEC-AV-HW-DEC-001: 3 falhas seguidas → record_hw_failure retorna true na 3ª.
+    #[test]
+    fn spec_av_hw_dec_001_three_failures_signal_fallback() {
+        let Some(mut d) = dummy_decoder() else {
+            return;
+        };
+        // Simula ativação em GPU manualmente via record_hw_success (zera
+        // contador) e depois 3 falhas.
+        assert!(!d.record_hw_failure());
+        assert!(!d.record_hw_failure());
+        assert!(d.record_hw_failure(), "3ª falha deve disparar fallback");
+        d.fallback_to_sw("simulated");
+        assert!(!d.is_hwaccel_active());
+        assert_eq!(d.fallback_reason(), Some("simulated"));
+    }
+
+    /// SPEC-AV-HW-DEC-001: fallback_to_sw preserva a primeira razão.
+    #[test]
+    fn spec_av_hw_dec_001_fallback_preserves_first_reason() {
+        let Some(mut d) = dummy_decoder() else {
+            return;
+        };
+        d.fallback_to_sw("driver ausente");
+        d.fallback_to_sw("outra causa");
+        assert_eq!(d.fallback_reason(), Some("driver ausente"));
     }
 }

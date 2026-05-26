@@ -39,6 +39,12 @@ pub enum AvError {
     #[error("canal cheio; frame descartado no PID {pid}")]
     ChannelFull { pid: u16 },
 
+    /// Falha na inicialização do hardware hwaccel (D3D11VA).
+    ///
+    /// SPEC-AV-HW-001
+    #[error("falha na inicialização de hwaccel: {0}")]
+    HwInitFailed(String),
+
     /// Erro genérico encapsulado com contexto.
     ///
     /// SPEC-AV-002

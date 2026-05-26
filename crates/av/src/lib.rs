@@ -23,6 +23,7 @@ pub mod decoder;
 pub(crate) mod deinterlace;
 pub mod error;
 pub mod ffi;
+pub mod hw;
 pub mod pes;
 pub mod renderer;
 pub mod video_queue;
@@ -34,6 +35,7 @@ pub use clock::{AudioClockHandle, Clock, MasterClock, Pts90, WallClockHandle};
 pub use codec::{AudioCodec, CodecConfig, MediaCodec, ThreadType, VideoCodec};
 pub use decoder::{DecodedFrame, FfmpegDecoder};
 pub use error::AvError;
+pub use hw::{D3d11Device, D3d11Texture, HwPixelFormat};
 pub use pes::{PesAssembler, PesPacket};
 pub use renderer::VideoRenderer;
 pub use video_queue::{

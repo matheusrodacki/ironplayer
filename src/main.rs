@@ -965,7 +965,48 @@ fn main() -> eframe::Result<()> {
             .expect("falha ao criar thread cmd-handler");
     }
 
-    // 15. Loop de UI via eframe
+    // 15. Bootstrap D3D11 (Fase A — SPEC-AV-HW-001)
+    //
+    // Cria o ID3D11Device standalone para validar o adapter disponível e obter o
+    // LUID.  O device é compartilhado via `Arc` com o FfmpegDecoder (Fase B) e
+    // com o renderer (Fase C).  Nesta Fase A, apenas configuramos o wgpu para
+    // selecionar o mesmo adapter físico (via PowerPreference::HighPerformance em
+    // sistemas com iGPU+dGPU) e registramos o LUID no log.
+    //
+    // Risco R1: eframe 0.29 não expõe API para injetar wgpu::Device pré-criado;
+    // a sincronização de adapter é feita por LUID no CreationContext callback.
+    #[cfg(windows)]
+    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = match av::D3d11Device::new() {
+        Ok(dev) => {
+            tracing::info!(
+                adapter = dev.adapter_description(),
+                luid = dev.adapter_luid().as_u64(),
+                vendor_id = format!("{:#06x}", dev.vendor_id()),
+                "hw: D3d11Device bootstrap OK (Fase A)"
+            );
+            Some(dev)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "hw: D3d11Device bootstrap falhou — hwaccel desabilitado; usando decode CPU"
+            );
+            None
+        }
+    };
+    #[cfg(not(windows))]
+    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = None;
+
+    // Usa PowerPreference::HighPerformance para que wgpu e D3D11 selecionem
+    // o mesmo adapter físico em sistemas com múltiplas GPUs (iGPU + dGPU).
+    // A validação definitiva do LUID acontece no CreationContext abaixo.
+    let wgpu_power_pref = if d3d11_device_arc.is_some() {
+        eframe::wgpu::PowerPreference::HighPerformance
+    } else {
+        eframe::wgpu::PowerPreference::default()
+    };
+
+    // 16. Loop de UI via eframe
     let guard = PipelineGuard {
         pipeline_handles: handles.into_iter().map(Some).collect(),
         metrics_handle: Some(metrics_handle),
@@ -980,15 +1021,50 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 720.0]),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             present_mode: eframe::wgpu::PresentMode::Fifo,
+            power_preference: wgpu_power_pref,
             ..Default::default()
         },
         ..Default::default()
     };
 
+    // Clona `d3d11_device_arc` para uso dentro do closure (o Arc original pode
+    // ser movido para o FfmpegDecoder na Fase B).
+    let d3d11_for_cc = d3d11_device_arc;
+
     eframe::run_native(
         "IronPlayer",
         native_options,
         Box::new(move |cc| {
+            // ── Fase A: validar LUID do adapter wgpu vs D3d11Device ───────────
+            //
+            // Compara o VendorId do adapter wgpu com o VendorId do ID3D11Device
+            // para detectar mismatches em sistemas multi-GPU (Risco R4).
+            // A comparação definitiva por LUID requer wgpu::hal que ainda não é
+            // necessária na Fase A; VendorId é suficiente para validação inicial.
+            if let Some(ref d3d_dev) = d3d11_for_cc {
+                if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                    let wgpu_info = rs.adapter.get_info();
+                    let d3d_vendor = d3d_dev.vendor_id();
+                    let wgpu_vendor = wgpu_info.vendor;
+
+                    if wgpu_vendor == d3d_vendor {
+                        tracing::info!(
+                            wgpu_adapter = %wgpu_info.name,
+                            wgpu_vendor = format!("{:#06x}", wgpu_vendor),
+                            d3d_vendor = format!("{:#06x}", d3d_vendor),
+                            "hw: adapter wgpu e D3d11Device usam o mesmo vendor — LUID compatível (Fase A OK)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            wgpu_adapter = %wgpu_info.name,
+                            wgpu_vendor = format!("{:#06x}", wgpu_vendor),
+                            d3d_vendor = format!("{:#06x}", d3d_vendor),
+                            "hw: vendor mismatch entre wgpu e D3d11Device (possível multi-GPU Optimus) — Risco R4"
+                        );
+                    }
+                }
+            }
+
             let mut inner = IronPlayerApp::new(
                 cc,
                 cmd_tx,

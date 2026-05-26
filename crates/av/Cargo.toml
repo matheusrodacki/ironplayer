@@ -18,4 +18,13 @@ wgpu              = "22"
 egui-wgpu         = "0.29"
 bytemuck          = { version = "1", features = ["derive"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.54", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Com",
+] }
+
 [dev-dependencies]

@@ -11,16 +11,20 @@ use crate::error::NetError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamUrl {
     /// `udp://@<group>:<port>[?iface=<ip>]`
+    /// ou `udp://<source>@<group>:<port>[?iface=<ip>]`
     UdpMulticast {
         group: Ipv4Addr,
         port: u16,
         iface: Option<Ipv4Addr>,
+        source: Option<Ipv4Addr>,
     },
     /// `rtp://@<group>:<port>[?iface=<ip>]`
+    /// ou `rtp://<source>@<group>:<port>[?iface=<ip>]`
     RtpMulticast {
         group: Ipv4Addr,
         port: u16,
         iface: Option<Ipv4Addr>,
+        source: Option<Ipv4Addr>,
     },
 }
 
@@ -53,9 +57,18 @@ impl StreamUrl {
             .rsplit_once(':')
             .ok_or_else(|| NetError::MalformedUrl(url.to_string()))?;
 
-        let group: Ipv4Addr = host_str
+        let (source, group_str) = if let Some((source_str, group_str)) = host_str.split_once('@') {
+            let source: Ipv4Addr = source_str.parse().map_err(|_| {
+                NetError::MalformedUrl(format!("source inválido: {source_str} em {url}"))
+            })?;
+            (Some(source), group_str)
+        } else {
+            (None, host_str)
+        };
+
+        let group: Ipv4Addr = group_str
             .parse()
-            .map_err(|_| NetError::MalformedUrl(format!("endereço inválido: {host_str}")))?;
+            .map_err(|_| NetError::MalformedUrl(format!("endereço inválido: {group_str}")))?;
 
         let port: u16 = port_str
             .parse()
@@ -72,16 +85,25 @@ impl StreamUrl {
         }
 
         // Parse do parâmetro ?iface=
-        let iface = if let Some(q) = query {
-            parse_iface(q, url)?
-        } else {
-            None
+        let iface = match query {
+            Some(q) => parse_iface(q, url)?,
+            None => None,
         };
 
         if scheme == "udp" {
-            Ok(StreamUrl::UdpMulticast { group, port, iface })
+            Ok(StreamUrl::UdpMulticast {
+                group,
+                port,
+                iface,
+                source,
+            })
         } else {
-            Ok(StreamUrl::RtpMulticast { group, port, iface })
+            Ok(StreamUrl::RtpMulticast {
+                group,
+                port,
+                iface,
+                source,
+            })
         }
     }
 }
@@ -112,6 +134,7 @@ mod tests {
                 group: "239.1.1.1".parse().unwrap(),
                 port: 1234,
                 iface: None,
+                source: None,
             }
         );
     }
@@ -126,6 +149,7 @@ mod tests {
                 group: "239.0.0.5".parse().unwrap(),
                 port: 5004,
                 iface: None,
+                source: None,
             }
         );
     }
@@ -161,6 +185,22 @@ mod tests {
                 group: "239.1.1.1".parse().unwrap(),
                 port: 1234,
                 iface: Some("192.168.1.10".parse().unwrap()),
+                source: None,
+            }
+        );
+    }
+
+    /// SPEC-NET-001 — parsing de source-specific multicast no authority
+    #[test]
+    fn spec_net_001_source_authority() {
+        let result = StreamUrl::parse("udp://10.218.152.146@232.15.0.93:50000").unwrap();
+        assert_eq!(
+            result,
+            StreamUrl::UdpMulticast {
+                group: "232.15.0.93".parse().unwrap(),
+                port: 50000,
+                iface: None,
+                source: Some("10.218.152.146".parse().unwrap()),
             }
         );
     }

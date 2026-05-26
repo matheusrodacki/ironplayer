@@ -64,9 +64,19 @@ impl UdpReceiver {
     ///
     /// SPEC-NET-002
     pub fn run(self, stop: StopToken) -> Result<(), NetError> {
-        let (group, port, iface) = match &self.url {
-            StreamUrl::UdpMulticast { group, port, iface } => (*group, *port, *iface),
-            StreamUrl::RtpMulticast { group, port, iface } => (*group, *port, *iface),
+        let (group, port, iface, source) = match &self.url {
+            StreamUrl::UdpMulticast {
+                group,
+                port,
+                iface,
+                source,
+            } => (*group, *port, *iface, *source),
+            StreamUrl::RtpMulticast {
+                group,
+                port,
+                iface,
+                source,
+            } => (*group, *port, *iface, *source),
         };
         let iface_addr = iface.unwrap_or(Ipv4Addr::UNSPECIFIED);
 
@@ -103,12 +113,18 @@ impl UdpReceiver {
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         socket.bind(&bind_addr.into()).map_err(NetError::Io)?;
 
-        // 4. IP_ADD_MEMBERSHIP
-        socket
-            .join_multicast_v4(&group, &iface_addr)
-            .map_err(NetError::JoinFailed)?;
-
-        info!(group = %group, port = port, iface = %iface_addr, "multicast join OK");
+        // 4. IP_ADD_MEMBERSHIP / IP_ADD_SOURCE_MEMBERSHIP
+        if let Some(source_addr) = source {
+            socket
+                .join_ssm_v4(&source_addr, &group, &iface_addr)
+                .map_err(NetError::JoinFailed)?;
+            info!(source = %source_addr, group = %group, port = port, iface = %iface_addr, "SSM multicast join OK");
+        } else {
+            socket
+                .join_multicast_v4(&group, &iface_addr)
+                .map_err(NetError::JoinFailed)?;
+            info!(group = %group, port = port, iface = %iface_addr, "multicast join OK");
+        }
 
         // Configurar timeout de leitura (SPEC-NET-002c)
         socket
@@ -150,7 +166,11 @@ impl UdpReceiver {
                     error!(error = %e, "erro fatal no recv");
                     // Tentar leave antes de propagar o erro
                     let sock2 = Socket::from(std_socket);
-                    let _ = sock2.leave_multicast_v4(&group, &iface_addr);
+                    if let Some(source_addr) = source {
+                        let _ = sock2.leave_ssm_v4(&source_addr, &group, &iface_addr);
+                    } else {
+                        let _ = sock2.leave_multicast_v4(&group, &iface_addr);
+                    }
                     return Err(NetError::Io(e));
                 }
             }
@@ -158,7 +178,12 @@ impl UdpReceiver {
 
         // 6. IP_DROP_MEMBERSHIP + fechar socket (SPEC-NET-002d)
         let sock2 = Socket::from(std_socket);
-        if let Err(e) = sock2.leave_multicast_v4(&group, &iface_addr) {
+        let leave_result = if let Some(source_addr) = source {
+            sock2.leave_ssm_v4(&source_addr, &group, &iface_addr)
+        } else {
+            sock2.leave_multicast_v4(&group, &iface_addr)
+        };
+        if let Err(e) = leave_result {
             warn!(error = %e, "falha ao sair do grupo multicast");
         }
         info!(group = %group, "multicast leave OK");
@@ -197,6 +222,7 @@ mod tests {
             group: "239.255.0.1".parse().unwrap(),
             port: 54320,
             iface: Some("127.0.0.1".parse().unwrap()),
+            source: None,
         };
         let (tx, _rx) = bounded::<Bytes>(16);
         let (ev_tx, ev_rx) = bounded::<NetEvent>(32);
@@ -233,6 +259,7 @@ mod tests {
             group: "239.255.0.2".parse().unwrap(),
             port: 54321,
             iface: Some("127.0.0.1".parse().unwrap()),
+            source: None,
         };
         let (tx, _rx) = bounded::<Bytes>(16);
         let (ev_tx, ev_rx) = bounded::<NetEvent>(32);
@@ -291,6 +318,7 @@ mod tests {
             group: "239.255.0.3".parse().unwrap(),
             port: 54322,
             iface: Some("127.0.0.1".parse().unwrap()),
+            source: None,
         };
         let (tx, _rx) = bounded::<Bytes>(16);
         let (ev_tx, ev_rx) = bounded::<NetEvent>(32);

@@ -97,16 +97,17 @@ net →  (zero deps internas; socket2 + tokio)
 /// Formatos aceitos:
 ///   udp://@239.x.x.x:PORT        multicast (join de grupo)
 ///   udp://239.x.x.x:PORT         idem (@ é opcional)
+///   udp://SOURCE@232.x.x.x:PORT  SSM (source-specific multicast)
 ///   rtp://@239.x.x.x:PORT        RTP sobre UDP multicast
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamUrl {
-    UdpMulticast { group: Ipv4Addr, port: u16, iface: Option<Ipv4Addr> },
-    RtpMulticast  { group: Ipv4Addr, port: u16, iface: Option<Ipv4Addr> },
+    UdpMulticast { group: Ipv4Addr, port: u16, iface: Option<Ipv4Addr>, source: Option<Ipv4Addr> },
+    RtpMulticast  { group: Ipv4Addr, port: u16, iface: Option<Ipv4Addr>, source: Option<Ipv4Addr> },
 }
 
 impl StreamUrl {
     /// SPEC-NET-001a
-    /// Faz o parse de uma string no formato udp://@<ip>:<port>[?iface=<ip>]
+    /// Faz o parse de uma string no formato udp://[<source>@]<ip>:<port>[?iface=<ip>]
     /// Retorna Err se o IP não for multicast (224.0.0.0/4) ou a porta for 0.
     pub fn parse(s: &str) -> Result<Self, NetError>;
 }
@@ -114,14 +115,15 @@ impl StreamUrl {
 
 **Casos de teste obrigatórios — `net::tests::spec_net_001`:**
 
-| Entrada | Resultado esperado |
-|---|---|
-| `"udp://@239.1.1.1:1234"` | `Ok(UdpMulticast { group: 239.1.1.1, port: 1234, iface: None })` |
-| `"rtp://@239.0.0.5:5004"` | `Ok(RtpMulticast { group: 239.0.0.5, port: 5004, iface: None })` |
-| `"udp://10.0.0.1:1234"` | `Err(NetError::NotMulticast)` |
-| `"udp://@239.1.1.1:0"` | `Err(NetError::InvalidPort)` |
-| `"http://example.com"` | `Err(NetError::UnsupportedScheme)` |
-| `"udp://@239.1.1.1:1234?iface=192.168.1.10"` | `Ok(UdpMulticast { .., iface: Some(192.168.1.10) })` |
+| Entrada                                      | Resultado esperado                                                                                |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `"udp://@239.1.1.1:1234"`                    | `Ok(UdpMulticast { group: 239.1.1.1, port: 1234, iface: None })`                                  |
+| `"rtp://@239.0.0.5:5004"`                    | `Ok(RtpMulticast { group: 239.0.0.5, port: 5004, iface: None })`                                  |
+| `"udp://10.0.0.1:1234"`                      | `Err(NetError::NotMulticast)`                                                                     |
+| `"udp://@239.1.1.1:0"`                       | `Err(NetError::InvalidPort)`                                                                      |
+| `"http://example.com"`                       | `Err(NetError::UnsupportedScheme)`                                                                |
+| `"udp://@239.1.1.1:1234?iface=192.168.1.10"` | `Ok(UdpMulticast { .., iface: Some(192.168.1.10) })`                                              |
+| `"udp://10.218.152.146@232.15.0.93:50000"`   | `Ok(UdpMulticast { group: 232.15.0.93, port: 50000, source: Some(10.218.152.146), iface: None })` |
 
 ---
 
@@ -178,13 +180,13 @@ pub struct RtpStripper {
 
 **Casos de teste — `net::tests::spec_net_003`:**
 
-| Cenário | Comportamento |
-|---|---|
-| Buffer com RTP header válido (PT=33) | Remove 12 bytes de header; passa payload |
-| Buffer com CSRC count = 2 | Remove 12 + 8 = 20 bytes |
-| Buffer sem RTP (sync byte 0x47 no offset 0) | Passa integralmente |
-| Sequence number 0xFFFF → 0x0001 (wrap) | Não emite OutOfOrder (wrap legítimo) |
-| Sequence number 100 → 102 (pulo) | Emite `OutOfOrder { expected: 101, got: 102 }` |
+| Cenário                                     | Comportamento                                  |
+| ------------------------------------------- | ---------------------------------------------- |
+| Buffer com RTP header válido (PT=33)        | Remove 12 bytes de header; passa payload       |
+| Buffer com CSRC count = 2                   | Remove 12 + 8 = 20 bytes                       |
+| Buffer sem RTP (sync byte 0x47 no offset 0) | Passa integralmente                            |
+| Sequence number 0xFFFF → 0x0001 (wrap)      | Não emite OutOfOrder (wrap legítimo)           |
+| Sequence number 100 → 102 (pulo)            | Emite `OutOfOrder { expected: 101, got: 102 }` |
 
 ---
 
@@ -253,14 +255,14 @@ impl TsPacket {
 
 **Casos de teste — `ts::tests::spec_ts_001`:**
 
-| Cenário | Resultado |
-|---|---|
-| Byte 0 != 0x47 | `Err(TsError::InvalidSyncByte)` |
-| Slice com 187 bytes | `Err(TsError::InvalidPacketSize)` |
-| Null packet (PID 0x1FFF) | `Ok` com `pid == 0x1FFF` |
-| TEI bit setado | `tei == true` |
+| Cenário                  | Resultado                                          |
+| ------------------------ | -------------------------------------------------- |
+| Byte 0 != 0x47           | `Err(TsError::InvalidSyncByte)`                    |
+| Slice com 187 bytes      | `Err(TsError::InvalidPacketSize)`                  |
+| Null packet (PID 0x1FFF) | `Ok` com `pid == 0x1FFF`                           |
+| TEI bit setado           | `tei == true`                                      |
 | adaptation_only (AFC=10) | `payload == None`, `adaptation_field == Some(...)` |
-| payload_only (AFC=01) | `adaptation_field == None`, `payload == Some(...)` |
+| payload_only (AFC=01)    | `adaptation_field == None`, `payload == Some(...)` |
 
 ---
 
@@ -284,17 +286,17 @@ pub struct TsDemuxer {
 
 **SPEC-TS-002a — Roteamento por PID:**
 
-| PID | Destino |
-|---|---|
-| 0x0000 (PAT) | `section_tx` |
-| 0x0010 (NIT) | `section_tx` |
-| 0x0011 (SDT/BAT) | `section_tx` |
-| 0x0012 (EIT) | `section_tx` |
-| 0x0014 (TDT/TOT) | `section_tx` |
-| PIDs de PMT (descobertos via PAT) | `section_tx` |
-| PIDs de vídeo/áudio (descobertos via PMT) | `pes_tx` |
-| 0x1FFF (Null) | descartado (contabilizado em metrics) |
-| qualquer outro | `section_tx` (tentativa; ignorado se table_id desconhecido) |
+| PID                                       | Destino                                                     |
+| ----------------------------------------- | ----------------------------------------------------------- |
+| 0x0000 (PAT)                              | `section_tx`                                                |
+| 0x0010 (NIT)                              | `section_tx`                                                |
+| 0x0011 (SDT/BAT)                          | `section_tx`                                                |
+| 0x0012 (EIT)                              | `section_tx`                                                |
+| 0x0014 (TDT/TOT)                          | `section_tx`                                                |
+| PIDs de PMT (descobertos via PAT)         | `section_tx`                                                |
+| PIDs de vídeo/áudio (descobertos via PMT) | `pes_tx`                                                    |
+| 0x1FFF (Null)                             | descartado (contabilizado em metrics)                       |
+| qualquer outro                            | `section_tx` (tentativa; ignorado se table_id desconhecido) |
 
 **SPEC-TS-002b — Validação de Continuity Counter:**
 
@@ -355,13 +357,13 @@ SPEC-TS-003b — CRC-32:
 
 **Casos de teste — `ts::tests::spec_ts_003`:**
 
-| Cenário | Comportamento |
-|---|---|
-| Seção em pacote único (PUSI=true, completa) | Emitida imediatamente |
-| Seção fragmentada em 3 pacotes | Emitida só após o 3º pacote |
-| PUSI=true com buffer pendente | Descarta anterior, inicia nova |
-| CRC inválido | Descarta + emite `CrcError` |
-| `section_length` > 4093 (máximo legal) | `Err(TsError::SectionTooLarge)` |
+| Cenário                                     | Comportamento                   |
+| ------------------------------------------- | ------------------------------- |
+| Seção em pacote único (PUSI=true, completa) | Emitida imediatamente           |
+| Seção fragmentada em 3 pacotes              | Emitida só após o 3º pacote     |
+| PUSI=true com buffer pendente               | Descarta anterior, inicia nova  |
+| CRC inválido                                | Descarta + emite `CrcError`     |
+| `section_length` > 4093 (máximo legal)      | `Err(TsError::SectionTooLarge)` |
 
 ---
 
@@ -475,19 +477,19 @@ impl Pmt {
 
 **Mapeamento `stream_type` → label (SPEC-TABLE-002b):**
 
-| stream_type | label |
-|---|---|
-| 0x01 | MPEG-1 Video |
-| 0x02 | MPEG-2 Video |
-| 0x03 | MPEG-1 Audio (MP1) |
-| 0x04 | MPEG-2 Audio (MP2) |
-| 0x0F | AAC Audio (ADTS) |
-| 0x11 | AAC Audio (LATM) |
-| 0x1B | H.264 / AVC Video |
-| 0x24 | H.265 / HEVC Video |
-| 0x81 | AC-3 Audio (ATSC) |
-| 0x06 | Private Data (verificar descriptors) |
-| _ | `"Unknown (0xXX)"` |
+| stream_type | label                                |
+| ----------- | ------------------------------------ |
+| 0x01        | MPEG-1 Video                         |
+| 0x02        | MPEG-2 Video                         |
+| 0x03        | MPEG-1 Audio (MP1)                   |
+| 0x04        | MPEG-2 Audio (MP2)                   |
+| 0x0F        | AAC Audio (ADTS)                     |
+| 0x11        | AAC Audio (LATM)                     |
+| 0x1B        | H.264 / AVC Video                    |
+| 0x24        | H.265 / HEVC Video                   |
+| 0x81        | AC-3 Audio (ATSC)                    |
+| 0x06        | Private Data (verificar descriptors) |
+| _           | `"Unknown (0xXX)"`                   |
 
 ---
 
@@ -969,18 +971,18 @@ pub struct AudioFrame {
 
 **Codecs suportados em v1.0 (SPEC-AV-002c):**
 
-| VideoCodec | libavcodec decoder |
-|---|---|
-| `H264` | `h264` |
-| `Hevc` | `hevc` |
-| `Mpeg2Video` | `mpeg2video` |
+| VideoCodec   | libavcodec decoder |
+| ------------ | ------------------ |
+| `H264`       | `h264`             |
+| `Hevc`       | `hevc`             |
+| `Mpeg2Video` | `mpeg2video`       |
 
 | AudioCodec | libavcodec decoder |
-|---|---|
-| `Aac` | `aac` |
-| `Ac3` | `ac3` |
-| `Mp2` | `mp2` |
-| `Eac3` | `eac3` |
+| ---------- | ------------------ |
+| `Aac`      | `aac`              |
+| `Ac3`      | `ac3`              |
+| `Mp2`      | `mp2`              |
+| `Eac3`     | `eac3`             |
 
 ---
 
@@ -1114,14 +1116,14 @@ pub enum AppCommand {
 
 **Colunas obrigatórias:**
 
-| Coluna | Tipo | Ordenável |
-|---|---|---|
-| PID (hex) | `String` ("0x0100") | sim |
-| Tipo | `PidType` label | sim |
-| Descrição | `String` | não |
-| Bitrate (kbps) | `f64` | sim |
-| Pacotes | `u64` | sim |
-| Erros CC | `u64` | sim (padrão: desc) |
+| Coluna         | Tipo                | Ordenável          |
+| -------------- | ------------------- | ------------------ |
+| PID (hex)      | `String` ("0x0100") | sim                |
+| Tipo           | `PidType` label     | sim                |
+| Descrição      | `String`            | não                |
+| Bitrate (kbps) | `f64`               | sim                |
+| Pacotes        | `u64`               | sim                |
+| Erros CC       | `u64`               | sim (padrão: desc) |
 
 **Comportamento (SPEC-UI-003a):**
 - Linha com `cc_errors > 0`: fundo vermelho claro.
@@ -1227,14 +1229,14 @@ MetricsAggregator ──[watch::Sender<MetricsSnapshot>]──► UI/MetricsPane
 **Regra de backpressure (SPEC-CHAN-001):**
 Se qualquer canal atingir 90% da capacidade, o produtor emite um log `WARN` com o nome do canal e a capacidade. Se atingir 100%: comportamento por canal:
 
-| Canal | Comportamento no full |
-|---|---|
-| `Bytes` (net → ts) | Drop do buffer + incrementa `udp_overflows` |
-| `SectionData` | Drop da seção + loga |
-| `PesPacket` | Drop do PES + loga (frame perdido, não é erro fatal) |
-| `TsEvent` | Drop do evento (métricas podem perder precisão momentaneamente) |
-| `VideoFrame` | Drop do frame mais antigo (FIFO; frame mais novo prevalece) |
-| `AudioFrame` | Drop do frame se buffer de jitter > 2× tamanho nominal |
+| Canal              | Comportamento no full                                           |
+| ------------------ | --------------------------------------------------------------- |
+| `Bytes` (net → ts) | Drop do buffer + incrementa `udp_overflows`                     |
+| `SectionData`      | Drop da seção + loga                                            |
+| `PesPacket`        | Drop do PES + loga (frame perdido, não é erro fatal)            |
+| `TsEvent`          | Drop do evento (métricas podem perder precisão momentaneamente) |
+| `VideoFrame`       | Drop do frame mais antigo (FIFO; frame mais novo prevalece)     |
+| `AudioFrame`       | Drop do frame se buffer de jitter > 2× tamanho nominal          |
 
 ---
 

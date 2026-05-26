@@ -56,6 +56,7 @@ fn start_receiver(
         group: group.parse().unwrap(),
         port,
         iface: Some(LOOPBACK.parse().unwrap()),
+        source: None,
     };
     let cfg = ReceiverConfig {
         buf_size: 65536,

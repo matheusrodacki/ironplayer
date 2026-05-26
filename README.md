@@ -1,5 +1,7 @@
 # IronPlayer
 
+[English](README.en.md) | **Português (BR)**
+
 **MPEG-TS Multicast Player & Stream Analyzer** — Rust · Windows 10/11 x86-64
 
 > Player e analisador de MPEG-TS para profissionais de vídeo e streaming. Gratuito, open source, sem licença por seat, sem call-home, sem feature-wall.
@@ -51,11 +53,20 @@ Regra de dependência: `ui → ts, av, net` · `av → ts` · `ts` e `net` são 
 - Windows 10/11 x86-64
 - DLLs FFmpeg 7.x em `ffmpeg/` na raiz (ver [spec técnica](docs/ironstream-spec.md#workspace--crates))
 
-## Build & Test
+## Build, Run & Test
 
 ```bash
-# Build
+# Build de desenvolvimento (debug)
 cargo build
+
+# Build otimizado (release)
+cargo build --release
+
+# Executar em modo debug
+cargo run --bin ironplayer
+
+# Executar em modo release
+cargo run --release --bin ironplayer
 
 # Testar crate individual
 cargo test -p ts

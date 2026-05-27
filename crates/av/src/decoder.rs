@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioFrame;
-use crate::codec::{AudioCodec, CodecConfig, MediaCodec};
+use crate::codec::{AudioCodec, CodecConfig, MediaCodec, VideoCodec};
 use crate::deinterlace::Deinterlacer;
 use crate::error::AvError;
 use crate::ffi::{
@@ -19,9 +19,9 @@ use crate::ffi::{
     AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
     AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
 };
+use crate::hw::{ColorSpace, TransferFunction};
 use crate::hw::{HwAccelMode, HwAccelState};
 use crate::pes::PesPacket;
-use crate::hw::{ColorSpace, HwPixelFormat, TransferFunction};
 use crate::video_queue::{HwVideoFrame, VideoFrame, YuvColorRange, YuvColorspace, YuvFrame};
 
 // ─── DecodedFrame ─────────────────────────────────────────────────────────────
@@ -138,6 +138,8 @@ pub struct FfmpegDecoder {
     ///
     /// SPEC-AV-HW-DEC-001
     hw_state: HwAccelState,
+    /// Codec do último decoder HW aberto com sucesso (telemetria/UI).
+    last_hw_codec: Option<String>,
 }
 
 impl FfmpegDecoder {
@@ -189,6 +191,7 @@ impl FfmpegDecoder {
             states: HashMap::new(),
             hwaccel: HwAccelMode::Off,
             hw_state: HwAccelState::new(),
+            last_hw_codec: None,
         })
     }
 
@@ -214,6 +217,7 @@ impl FfmpegDecoder {
             states: HashMap::new(),
             hwaccel: HwAccelMode::Off,
             hw_state: HwAccelState::new(),
+            last_hw_codec: None,
         }
     }
 
@@ -296,6 +300,19 @@ impl FfmpegDecoder {
         self.hw_state.fallback_reason()
     }
 
+    /// Label do último codec HW ativo (ex.: `hevc_d3d11va`).
+    pub fn hw_decode_codec(&self) -> Option<&str> {
+        self.last_hw_codec.as_deref()
+    }
+
+    /// Contagem aproximada de contextos de vídeo HW ativos nesta sessão.
+    pub fn hw_frame_pool_in_use(&self) -> u32 {
+        if !self.hw_state.is_active() {
+            return 0;
+        }
+        self.states.values().filter(|state| state.is_video).count() as u32
+    }
+
     /// Promove imediatamente o decoder para o caminho CPU, registrando o motivo.
     ///
     /// Usado pelo callback `get_format` (Fase B FFI) quando o driver recusa o
@@ -336,6 +353,7 @@ impl FfmpegDecoder {
     pub fn reset_with_hw_state(&mut self) {
         self.states.clear();
         self.hw_state = HwAccelState::new();
+        self.last_hw_codec = None;
         if self.hwaccel.is_gpu() {
             self.hw_state.activate();
         }
@@ -369,6 +387,7 @@ impl FfmpegDecoder {
                     AV_HWDEVICE_TYPE_D3D11VA,
                 ) {
                     Ok(ctx) => {
+                        self.last_hw_codec = hw_codec_label(pes.codec).map(str::to_owned);
                         tracing::debug!(pid = pid_raw, "hwaccel D3D11VA aberto para PID");
                         ctx
                     }
@@ -540,12 +559,20 @@ impl FfmpegDecoder {
 
                             // Extrai ponteiro/metadados sem download CPU.
                             match state.frame.hw_frame_info() {
-                                Ok((tex_ptr, slice, w, h, pts_raw, sar, raw_cs, _raw_cr)) => {
+                                Ok((
+                                    tex_ptr,
+                                    slice,
+                                    w,
+                                    h,
+                                    pts_raw,
+                                    sar,
+                                    raw_trc,
+                                    raw_cs,
+                                    raw_cr,
+                                )) => {
                                     // Obtém Arc<D3d11Device> do modo hwaccel configurado.
                                     let d3d11_dev = match &self.hwaccel {
-                                        crate::hw::HwAccelMode::D3d11Va(dev) => {
-                                            Arc::clone(dev)
-                                        }
+                                        crate::hw::HwAccelMode::D3d11Va(dev) => Arc::clone(dev),
                                         crate::hw::HwAccelMode::Off => {
                                             // Não deveria ocorrer: frame HW sem device.
                                             tracing::warn!(
@@ -562,12 +589,11 @@ impl FfmpegDecoder {
                                         crate::hw::D3d11Texture::from_raw_addref(
                                             tex_ptr,
                                             slice,
-                                            HwPixelFormat::Nv12,
                                             w,
                                             h,
                                             ColorSpace::from_avutil(raw_cs),
-                                            TransferFunction::Srgb,
-                                            false,
+                                            TransferFunction::from_avutil(raw_trc),
+                                            matches!(raw_cr, 2),
                                         )
                                     };
                                     match tex_result {
@@ -718,6 +744,15 @@ impl FfmpegDecoder {
         }
 
         Ok(frames)
+    }
+}
+
+fn hw_codec_label(codec: MediaCodec) -> Option<&'static str> {
+    match codec {
+        MediaCodec::Video(VideoCodec::Mpeg2) => Some("mpeg2video_d3d11va"),
+        MediaCodec::Video(VideoCodec::H264) => Some("h264_d3d11va"),
+        MediaCodec::Video(VideoCodec::Hevc) => Some("hevc_d3d11va"),
+        MediaCodec::Audio(_) => None,
     }
 }
 
@@ -989,10 +1024,16 @@ mod tests {
                     assert!(frame.is_video(), "esperava frame de vídeo");
                     if let DecodedFrame::Video(vf) = frame {
                         // Dimensões devem ser positivas se frame for decodificado.
-                        assert!(vf.width > 0, "width deve ser > 0");
-                        assert!(vf.height > 0, "height deve ser > 0");
-                        let y_expected = vf.width as usize * vf.height as usize;
-                        assert_eq!(vf.planes[0].len(), y_expected, "plano Y deve ter w*h bytes");
+                        assert!(vf.width() > 0, "width deve ser > 0");
+                        assert!(vf.height() > 0, "height deve ser > 0");
+                        if let VideoFrame::Sw(sw) = vf {
+                            let y_expected = sw.width as usize * sw.height as usize;
+                            assert_eq!(
+                                sw.planes[0].len(),
+                                y_expected,
+                                "plano Y deve ter w*h bytes"
+                            );
+                        }
                     }
                 }
             }
@@ -1157,5 +1198,22 @@ mod tests {
         d.fallback_to_sw("driver ausente");
         d.fallback_to_sw("outra causa");
         assert_eq!(d.fallback_reason(), Some("driver ausente"));
+    }
+
+    #[test]
+    fn spec_av_hw_dec_001_hw_codec_labels_are_stable() {
+        assert_eq!(
+            hw_codec_label(MediaCodec::Video(VideoCodec::Mpeg2)),
+            Some("mpeg2video_d3d11va")
+        );
+        assert_eq!(
+            hw_codec_label(MediaCodec::Video(VideoCodec::H264)),
+            Some("h264_d3d11va")
+        );
+        assert_eq!(
+            hw_codec_label(MediaCodec::Video(VideoCodec::Hevc)),
+            Some("hevc_d3d11va")
+        );
+        assert_eq!(hw_codec_label(MediaCodec::Audio(AudioCodec::Mp2)), None);
     }
 }

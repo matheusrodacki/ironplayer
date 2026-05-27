@@ -1,18 +1,8 @@
-// Shader WGSL: NV12 semi-planar YUV → RGB — Fase C zero-copy.
+// Shader WGSL: NV12/P010 semi-planar YUV → RGB — Fase D.
 //
-// Dois planos:
-//   tex_y  — R8Unorm   (luma Y, W × H)
-//   tex_uv — Rg8Unorm  (croma UV interleaved, W/2 × H/2; R=U/Cb, G=V/Cr)
-//
-// Usa o mesmo UBO de 64 bytes que o pipeline YUV420P tri-planar (YuvParams):
-//   mat3x3f matrix         — 48 bytes (3 colunas × vec4f)
-//   vec3f   offset         — 12 bytes
-//   f32     range_scale    —  4 bytes
-//
-// Referência: mesma estrutura de `yuv_to_rgb.wgsl`, apenas binding 1 e 2
-// substituídos por um único `tex_uv` Rg8Unorm.
-//
-// SPEC-AV-RENDER-NV12-001
+// Fase D: o mesmo pipeline aceita NV12 (8-bit) e P010 (10-bit em R16/RG16),
+// com matriz YUV→RGB parametrizada por colorspace e TRC. Streams HDR10/HLG
+// ainda saem em fallback SDR sRGB com clipping explícito/documentado.
 
 override DECODE_SRGB: f32 = 0.0;
 
@@ -62,21 +52,77 @@ fn srgb_to_linear(c: f32) -> f32 {
     return pow((c + 0.055) / 1.055, 2.4);
 }
 
+fn bt1886_to_linear(c: f32) -> f32 {
+    return pow(clamp(c, 0.0, 1.0), 2.4);
+}
+
+fn pq_to_linear(c: f32) -> f32 {
+    let m1 = 2610.0 / 16384.0;
+    let m2 = 2523.0 / 32.0;
+    let c1 = 3424.0 / 4096.0;
+    let c2 = 2413.0 / 128.0;
+    let c3 = 2392.0 / 128.0;
+    let x = pow(clamp(c, 0.0, 1.0), 1.0 / m2);
+    let num = max(x - c1, 0.0);
+    let den = max(c2 - c3 * x, 1e-6);
+    return pow(num / den, 1.0 / m1);
+}
+
+fn hlg_to_linear(c: f32) -> f32 {
+    if c <= 0.5 {
+        return (c * c) / 3.0;
+    }
+    let a = 0.17883277;
+    let b = 0.28466892;
+    let cc = 0.55991073;
+    return (exp((c - cc) / a) + b) / 12.0;
+}
+
+fn decode_transfer(rgb: vec3<f32>, mode: f32) -> vec3<f32> {
+    if mode < 0.5 {
+        return vec3<f32>(
+            bt1886_to_linear(rgb.r),
+            bt1886_to_linear(rgb.g),
+            bt1886_to_linear(rgb.b),
+        );
+    }
+    if mode < 1.5 {
+        return vec3<f32>(
+            pq_to_linear(rgb.r),
+            pq_to_linear(rgb.g),
+            pq_to_linear(rgb.b),
+        );
+    }
+    if mode < 2.5 {
+        return vec3<f32>(
+            hlg_to_linear(rgb.r),
+            hlg_to_linear(rgb.g),
+            hlg_to_linear(rgb.b),
+        );
+    }
+    return vec3<f32>(
+        srgb_to_linear(rgb.r),
+        srgb_to_linear(rgb.g),
+        srgb_to_linear(rgb.b),
+    );
+}
+
 /// Fragment: NV12 → RGB via matriz BT.xxx configurável.
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let y  = textureSample(tex_y,  samp, in.uv).r;
     let uv = textureSample(tex_uv, samp, in.uv).rg;
 
-    // Centraliza croma: NV12 armazena U/V em [0, 1]; 128/255 ≈ 0.502 ≈ 0.5.
-    let u = uv.r - 0.5;
-    let v = uv.g - 0.5;
+    let uv_center = params.offset_and_range.y;
+    let u = uv.r - uv_center;
+    let v = uv.g - uv_center;
 
-    let offset      = params.offset_and_range.xyz;
+    let y_offset    = params.offset_and_range.x;
     let range_scale = params.offset_and_range.w;
+    let transfer    = params.col0.w;
+    let hdr_clip    = params.col1.w;
 
-    // Aplica escala de range no luma (1.164 para TV-range, 1.0 para full).
-    let y_scaled = (y - offset.x) * range_scale;
+    let y_scaled = max((y - y_offset) * range_scale, 0.0);
 
     // Reconstrói o vetor YUV e aplica a matriz de cor.
     let yuv = vec3<f32>(y_scaled, u, v);
@@ -85,17 +131,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let col0 = params.col0.xyz;
     let col1 = params.col1.xyz;
     let col2 = params.col2.xyz;
-    var rgb = mat3x3<f32>(col0, col1, col2) * yuv + offset;
+    var rgb = mat3x3<f32>(col0, col1, col2) * yuv;
+    rgb = decode_transfer(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), transfer);
 
-    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-
-    // Decodifica sRGB → linear quando o framebuffer de saída é sRGB.
-    if DECODE_SRGB > 0.5 {
-        rgb = vec3<f32>(
-            srgb_to_linear(rgb.r),
-            srgb_to_linear(rgb.g),
-            srgb_to_linear(rgb.b),
-        );
+    if hdr_clip > 0.5 || DECODE_SRGB > 0.5 {
+        rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
     return vec4<f32>(rgb, 1.0);

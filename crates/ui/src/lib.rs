@@ -135,16 +135,24 @@ impl IronPlayerApp {
         selected_service_rx: Option<Arc<RwLock<Option<u16>>>>,
         table_events_rx: Option<Receiver<TableEvent>>,
         video_frames_rx: Option<Receiver<VideoFrame>>,
+        d3d11_device: Option<Arc<av::D3d11Device>>,
     ) -> Self {
         // Inicializa VideoRenderer em modo GPU (D3D11) quando wgpu disponível,
         // ou em modo CPU como fallback. SPEC-AV-003 · SPEC-AV-003c
         let video_renderer = video_frames_rx.as_ref().map(|_| {
             if let Some(wgpu_state) = &cc.wgpu_render_state {
-                VideoRenderer::new_gpu(
-                    wgpu_state.device.clone(),
-                    wgpu_state.queue.clone(),
-                    wgpu_state.target_format,
-                )
+                match d3d11_device.as_ref() {
+                    Some(d3d11_dev) => VideoRenderer::new_hw_gpu(
+                        wgpu_state.device.clone(),
+                        Arc::clone(d3d11_dev),
+                        wgpu_state.target_format,
+                    ),
+                    None => VideoRenderer::new_gpu(
+                        wgpu_state.device.clone(),
+                        wgpu_state.queue.clone(),
+                        wgpu_state.target_format,
+                    ),
+                }
             } else {
                 VideoRenderer::new_cpu(cc.egui_ctx.clone())
             }
@@ -198,6 +206,10 @@ impl IronPlayerApp {
     /// Deve ser chamado logo após `new()`, antes do primeiro `update()`.
     pub fn set_audio_clock_rx(&mut self, rx: Arc<std::sync::RwLock<Option<av::AudioClockHandle>>>) {
         self.audio_clock_rx = Some(rx);
+    }
+
+    pub fn set_hwaccel_choice(&mut self, choice: HwAccelChoice) {
+        self.metrics_panel.set_hwaccel_choice(choice);
     }
 
     /// Retorna uma referência imutável ao estado atual da UI.
@@ -314,7 +326,7 @@ impl IronPlayerApp {
     ///    e amostra o offset no histórico de 60 s a ~1 Hz.
     ///
     /// SPEC-AV-003 · SPEC-AV-VQ-001 · SPEC-METRICS-SYNC-001
-    fn poll_video_frames(&mut self) {
+    fn poll_video_frames(&mut self, ctx: &egui::Context) {
         let rx = match &self.video_frames_rx {
             Some(r) => r.clone(),
             None => return,
@@ -394,6 +406,9 @@ impl IronPlayerApp {
                         self.video_dims = Some((frame.width(), display_h.max(1)));
                     }
                     Err(e) => {
+                        if e.is_device_removed() {
+                            self.handle_device_removed(ctx, &e);
+                        }
                         tracing::warn!(error = %e, "poll_video_frames: falha no upload do frame");
                     }
                 }
@@ -449,12 +464,38 @@ impl IronPlayerApp {
     fn poll_pipeline_metrics(&mut self) {
         if let Some(rx) = &self.pipeline_metrics_rx {
             if let Ok(m) = rx.read() {
-                self.state.metrics.pipeline.decoder_threads_used = m.decoder_threads_used;
-                self.state.metrics.pipeline.deinterlacer_active = m.deinterlacer_active;
-                self.state.metrics.pipeline.decode_time_ms_p50 = m.decode_time_ms_p50.clone();
-                self.state.metrics.pipeline.decode_time_ms_p99 = m.decode_time_ms_p99.clone();
+                self.state.metrics.pipeline = m.clone();
             }
         }
+    }
+
+    fn handle_device_removed(&mut self, _ctx: &egui::Context, error: &av::AvError) {
+        if let Some(rx) = &self.video_frames_rx {
+            while rx.try_recv().is_ok() {}
+        }
+        self.video_queue.clear();
+        self.video_dims = None;
+        self.state.metrics.video_queue_depth = 0;
+        self.state.metrics.pipeline.hw_decode_active = false;
+        self.state.metrics.pipeline.hw_decode_fallback_reason =
+            Some("DXGI_ERROR_DEVICE_REMOVED".to_string());
+        self.state.metrics.pipeline.tdr_recoveries =
+            self.state.metrics.pipeline.tdr_recoveries.saturating_add(1);
+
+        if let Some(renderer) = &mut self.video_renderer {
+            let _ = renderer.fallback_to_software();
+        }
+
+        if let Some(shared) = &self.pipeline_metrics_rx {
+            if let Ok(mut metrics) = shared.write() {
+                metrics.hw_decode_active = false;
+                metrics.hw_decode_fallback_reason = Some("DXGI_ERROR_DEVICE_REMOVED".to_string());
+                metrics.tdr_recoveries = metrics.tdr_recoveries.saturating_add(1);
+            }
+        }
+
+        let _ = self.cmd_tx.try_send(AppCommand::GpuDeviceRemoved);
+        tracing::warn!(error = %error, "poll_video_frames: device D3D11 removido; fila drenada e fallback SW ativado");
     }
 }
 
@@ -517,8 +558,8 @@ impl eframe::App for IronPlayerApp {
         // ── Poll de métricas do pipeline ──────────────────────────────────
         self.poll_snapshot();
         self.poll_table_events();
-        self.poll_video_frames();
         self.poll_pipeline_metrics();
+        self.poll_video_frames(ctx);
 
         // eframe é reactive por padrão. Para vídeo em tempo real, pedimos
         // repaint reativo na chegada de cada frame (via ctx.request_repaint()
@@ -630,7 +671,7 @@ pub fn run(title: &str) -> eframe::Result {
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(IronPlayerApp::new(
-                cc, cmd_tx, None, None, None, None, None, None,
+                cc, cmd_tx, None, None, None, None, None, None, None,
             )))
         }),
     )

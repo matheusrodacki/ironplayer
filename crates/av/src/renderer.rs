@@ -16,7 +16,7 @@ use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
 use egui_wgpu::CallbackTrait;
 
 use crate::error::AvError;
-use crate::hw::D3d11Device;
+use crate::hw::{ColorSpace, D3d11Device, HwPixelFormat, TransferFunction};
 use crate::video_queue::{HwVideoFrame, YuvColorRange, YuvColorspace, YuvFrame};
 
 // ─── Constante: shader WGSL embutido ─────────────────────────────────────────
@@ -37,13 +37,13 @@ const NV12_SHADER_SRC: &str = include_str!("nv12_to_rgb.wgsl");
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct YuvParamsGpu {
-    /// Coluna 0 da mat3x3f (coeficientes Y → R,G,B) + padding.
+    /// Coluna 0 da mat3x3f (coeficientes Y → R,G,B) + transfer mode.
     col0: [f32; 4],
-    /// Coluna 1 da mat3x3f (coeficientes U/Cb → R,G,B) + padding.
+    /// Coluna 1 da mat3x3f (coeficientes U/Cb → R,G,B) + hdr_clip flag.
     col1: [f32; 4],
     /// Coluna 2 da mat3x3f (coeficientes V/Cr → R,G,B) + padding.
     col2: [f32; 4],
-    /// Offset RGB constante + range_scale na quarta posição.
+    /// x=luma_offset, y=centro UV, z reservado, w=range_scale.
     offset_and_range: [f32; 4],
 }
 
@@ -69,19 +69,19 @@ impl YuvParamsGpu {
         out
     }
 
-    /// Computa os parâmetros YUV → RGB a partir de `colorspace` e `color_range`.
+    /// Computa os parâmetros YUV → RGB a partir dos metadados do frame.
     ///
     /// O shader usa:
-    ///   `yuv = vec3((y - offset.x) * range_scale, u, v)`
-    ///   `rgb = matrix * yuv + offset`
-    ///
-    /// onde `u = U_tex - 0.5` e `v = V_tex - 0.5` (centragem de croma).
-    ///
-    /// Os coeficientes UV das colunas 1 e 2 já embutem a escala de range
-    /// (255/224 = 1,1384 para TV-range 8-bit; 1,0 para full-range).
+    ///   `yuv = vec3((y - luma_offset) * range_scale, u - uv_center, v - uv_center)`
+    ///   `rgb = matrix * yuv`
     ///
     /// SPEC-AV-003
-    fn for_frame(colorspace: YuvColorspace, color_range: YuvColorRange) -> Self {
+    fn for_frame(
+        colorspace: YuvColorspace,
+        color_range: YuvColorRange,
+        transfer: TransferFunction,
+        ten_bit: bool,
+    ) -> Self {
         // Coeficientes BT.xxx para Y normalizado (0..1), U/V centrados (-0.5..0.5).
         // Formato colunas: col0=Y, col1=U/Cb, col2=V/Cr (cada coluna produz [R,G,B]).
         let (cy, cu, cv): ([f32; 3], [f32; 3], [f32; 3]) = match colorspace {
@@ -103,31 +103,70 @@ impl YuvParamsGpu {
             ),
         };
 
+        let transfer_mode = match transfer {
+            TransferFunction::Bt1886 => 0.0,
+            TransferFunction::Pq => 1.0,
+            TransferFunction::Hlg => 2.0,
+            TransferFunction::Srgb => 3.0,
+        };
+        let hdr_clip =
+            matches!(transfer, TransferFunction::Pq | TransferFunction::Hlg) as u8 as f32;
+
         match color_range {
             // ─ TV-range (limited): Y ∈ [16,235], U/V ∈ [16,240] (8-bit).
-            // range_scale(Y) = 255/219 ≈ 1.1644; scale(UV) = 255/224 ≈ 1.1384
+            // Em 10-bit: Y ∈ [64,940], U/V ∈ [64,960].
             YuvColorRange::Limited => {
-                let uv_scale = 255.0_f32 / 224.0;
-                let range_scale = 255.0_f32 / 219.0;
-                let col0 = [cy[0], cy[1], cy[2], 0.0];
-                let col1 = [cu[0] * uv_scale, cu[1] * uv_scale, cu[2] * uv_scale, 0.0];
+                let (luma_min, luma_max, chroma_span) = if ten_bit {
+                    (
+                        64.0_f32 / 1023.0_f32,
+                        940.0_f32 / 1023.0_f32,
+                        896.0_f32 / 1023.0_f32,
+                    )
+                } else {
+                    (
+                        16.0_f32 / 255.0_f32,
+                        235.0_f32 / 255.0_f32,
+                        224.0_f32 / 255.0_f32,
+                    )
+                };
+                let uv_scale = 1.0_f32 / chroma_span;
+                let range_scale = 1.0_f32 / (luma_max - luma_min);
+                let col0 = [cy[0], cy[1], cy[2], transfer_mode];
+                let col1 = [
+                    cu[0] * uv_scale,
+                    cu[1] * uv_scale,
+                    cu[2] * uv_scale,
+                    hdr_clip,
+                ];
                 let col2 = [cv[0] * uv_scale, cv[1] * uv_scale, cv[2] * uv_scale, 0.0];
                 Self {
                     col0,
                     col1,
                     col2,
-                    offset_and_range: [0.0, 0.0, 0.0, range_scale],
+                    offset_and_range: [luma_min, 0.5, 0.0, range_scale],
                 }
             }
 
             // ─ Full-range: Y, U, V ∈ [0,255]; sem escala adicional.
             YuvColorRange::Full => Self {
-                col0: [cy[0], cy[1], cy[2], 0.0],
-                col1: [cu[0], cu[1], cu[2], 0.0],
+                col0: [cy[0], cy[1], cy[2], transfer_mode],
+                col1: [cu[0], cu[1], cu[2], hdr_clip],
                 col2: [cv[0], cv[1], cv[2], 0.0],
-                offset_and_range: [0.0, 0.0, 0.0, 1.0],
+                offset_and_range: [0.0, 0.5, 0.0, 1.0],
             },
         }
+    }
+
+    fn for_sw_frame(colorspace: YuvColorspace, color_range: YuvColorRange, ten_bit: bool) -> Self {
+        Self::for_frame(colorspace, color_range, TransferFunction::Bt1886, ten_bit)
+    }
+}
+
+fn yuv_colorspace_from_hw(color_space: ColorSpace) -> YuvColorspace {
+    match color_space {
+        ColorSpace::Bt601 => YuvColorspace::Bt601,
+        ColorSpace::Bt709 => YuvColorspace::Bt709,
+        ColorSpace::Bt2020 => YuvColorspace::Bt2020,
     }
 }
 
@@ -427,7 +466,7 @@ impl YuvPipelineInner {
             );
         }
 
-        let params = YuvParamsGpu::for_frame(frame.colorspace, frame.color_range);
+        let params = YuvParamsGpu::for_sw_frame(frame.colorspace, frame.color_range, frame.ten_bit);
         queue.write_buffer(&self.uniform_buf, 0, &params.to_bytes());
     }
 
@@ -609,6 +648,10 @@ struct NvPendingFrame {
     colorspace: YuvColorspace,
     /// Color range para ajuste de range_scale.
     color_range: YuvColorRange,
+    /// TRC do conteúdo (BT.1886, PQ, HLG ou sRGB).
+    transfer: TransferFunction,
+    /// `true` quando os planos estão em 10-bit (P010).
+    ten_bit: bool,
 }
 
 /// Estado interno do pipeline NV12.
@@ -629,6 +672,7 @@ struct NvPipelineInner {
     tex_uv: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
     dims: Option<(u32, u32)>,
+    ten_bit: bool,
     pending: Option<NvPendingFrame>,
 }
 
@@ -753,6 +797,7 @@ impl NvPipelineInner {
             tex_uv: None,
             bind_group: None,
             dims: None,
+            ten_bit: false,
             pending: None,
         })
     }
@@ -772,9 +817,10 @@ impl NvPipelineInner {
         let h = frame.height;
         let uv_w = w.div_ceil(2);
         let uv_h = h.div_ceil(2);
+        let bytes_per_sample = if frame.ten_bit { 2 } else { 1 };
 
         // Recria as texturas somente se as dimensões mudaram.
-        let need_new = self.dims != Some((w, h));
+        let need_new = self.dims != Some((w, h)) || self.ten_bit != frame.ten_bit;
         if need_new {
             self.tex_y = Some(device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("nv12_y"),
@@ -786,7 +832,11 @@ impl NvPipelineInner {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R8Unorm,
+                format: if frame.ten_bit {
+                    wgpu::TextureFormat::R16Unorm
+                } else {
+                    wgpu::TextureFormat::R8Unorm
+                },
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             }));
@@ -800,11 +850,16 @@ impl NvPipelineInner {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rg8Unorm,
+                format: if frame.ten_bit {
+                    wgpu::TextureFormat::Rg16Unorm
+                } else {
+                    wgpu::TextureFormat::Rg8Unorm
+                },
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             }));
             self.dims = Some((w, h));
+            self.ten_bit = frame.ten_bit;
         }
 
         let tex_y = match &self.tex_y {
@@ -822,7 +877,7 @@ impl NvPipelineInner {
             &frame.y_data,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(w),
+                bytes_per_row: Some(w * bytes_per_sample),
                 rows_per_image: None,
             },
             wgpu::Extent3d {
@@ -839,7 +894,7 @@ impl NvPipelineInner {
             &frame.uv_data,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(w), // 2 canais × uv_w pixels = w bytes
+                bytes_per_row: Some(w * bytes_per_sample),
                 rows_per_image: None,
             },
             wgpu::Extent3d {
@@ -850,7 +905,12 @@ impl NvPipelineInner {
         );
 
         // Atualiza UBO com parâmetros YUV→RGB (reutiliza YuvParamsGpu).
-        let params = YuvParamsGpu::for_frame(frame.colorspace, frame.color_range);
+        let params = YuvParamsGpu::for_frame(
+            frame.colorspace,
+            frame.color_range,
+            frame.transfer,
+            frame.ten_bit,
+        );
         queue.write_buffer(&self.uniform_buf, 0, &params.to_bytes());
 
         // Reconstrói o bind group se as texturas foram recriadas.
@@ -968,8 +1028,14 @@ impl NvRenderer {
             uv_data: planes.uv_data,
             width: planes.width,
             height: planes.height,
-            colorspace: YuvColorspace::Bt709, // NV12 8-bit → BT.709 default
-            color_range: YuvColorRange::Limited,
+            colorspace: yuv_colorspace_from_hw(hw.tex.color_space),
+            color_range: if hw.tex.full_range {
+                YuvColorRange::Full
+            } else {
+                YuvColorRange::Limited
+            },
+            transfer: hw.tex.transfer,
+            ten_bit: planes.ten_bit,
         };
         if let Ok(mut inner) = self.state.lock() {
             inner.pending = Some(pending);
@@ -1068,6 +1134,13 @@ enum RendererInner {
     Cpu(CpuRenderer),
 }
 
+#[derive(Clone)]
+struct GpuRendererContext {
+    device: Arc<wgpu::Device>,
+    target_format: wgpu::TextureFormat,
+    d3d11_dev: Option<Arc<D3d11Device>>,
+}
+
 /// Renderizador de frames de vídeo: modo GPU (wgpu PaintCallback) ou CPU (fallback).
 ///
 /// ## Modo GPU
@@ -1082,6 +1155,8 @@ enum RendererInner {
 /// SPEC-AV-003 · SPEC-AV-003c
 pub struct VideoRenderer {
     inner: RendererInner,
+    gpu_context: Option<GpuRendererContext>,
+    cpu_ctx: Option<egui::Context>,
     /// Bytes enviados à GPU desde `upload_window_start`.
     upload_bytes_window: u64,
     /// Início da janela de medição de bytes por segundo.
@@ -1107,9 +1182,15 @@ impl VideoRenderer {
         d3d11_dev: Arc<D3d11Device>,
         target_format: wgpu::TextureFormat,
     ) -> Self {
-        match NvRenderer::new(&device, d3d11_dev, target_format) {
+        match NvRenderer::new(&device, Arc::clone(&d3d11_dev), target_format) {
             Ok(nv) => Self {
                 inner: RendererInner::HwGpu(nv),
+                gpu_context: Some(GpuRendererContext {
+                    device,
+                    target_format,
+                    d3d11_dev: Some(d3d11_dev),
+                }),
+                cpu_ctx: None,
                 upload_bytes_window: 0,
                 upload_window_start: std::time::Instant::now(),
                 upload_bytes_per_sec: 0,
@@ -1124,6 +1205,8 @@ impl VideoRenderer {
                 let ctx = egui::Context::default();
                 Self {
                     inner: RendererInner::Cpu(CpuRenderer { ctx, handle: None }),
+                    gpu_context: None,
+                    cpu_ctx: None,
                     upload_bytes_window: 0,
                     upload_window_start: std::time::Instant::now(),
                     upload_bytes_per_sec: 0,
@@ -1142,9 +1225,23 @@ impl VideoRenderer {
     ///
     /// SPEC-AV-RENDER-NV12-001
     pub fn upload_hw(&mut self, hw: &HwVideoFrame) -> Result<(), AvError> {
+        self.ensure_hw_renderer(Arc::clone(&hw.d3d11_dev))?;
+        self.last_colorspace = Some(yuv_colorspace_from_hw(hw.tex.color_space));
+        self.last_color_range = Some(if hw.tex.full_range {
+            YuvColorRange::Full
+        } else {
+            YuvColorRange::Limited
+        });
+
         // Contabiliza bytes: w × h (Y) + w × h/2 (UV interleaved) = w × h × 3/2.
-        let frame_bytes =
-            hw.width as u64 * hw.height as u64 + hw.width as u64 * hw.height.div_ceil(2) as u64;
+        let bytes_per_sample: u64 = if matches!(hw.tex.format, HwPixelFormat::P010) {
+            2
+        } else {
+            1
+        };
+        let frame_bytes = (hw.width as u64 * hw.height as u64
+            + hw.width as u64 * hw.height.div_ceil(2) as u64)
+            * bytes_per_sample;
         self.upload_bytes_window = self.upload_bytes_window.saturating_add(frame_bytes);
 
         let elapsed = self.upload_window_start.elapsed();
@@ -1175,9 +1272,15 @@ impl VideoRenderer {
         _queue: Arc<wgpu::Queue>,
         target_format: wgpu::TextureFormat,
     ) -> Self {
-        match GpuRenderer::new(device, target_format) {
+        match GpuRenderer::new(Arc::clone(&device), target_format) {
             Ok(gpu) => Self {
                 inner: RendererInner::Gpu(gpu),
+                gpu_context: Some(GpuRendererContext {
+                    device,
+                    target_format,
+                    d3d11_dev: None,
+                }),
+                cpu_ctx: None,
                 upload_bytes_window: 0,
                 upload_window_start: std::time::Instant::now(),
                 upload_bytes_per_sec: 0,
@@ -1192,6 +1295,8 @@ impl VideoRenderer {
                 let ctx = egui::Context::default();
                 Self {
                     inner: RendererInner::Cpu(CpuRenderer { ctx, handle: None }),
+                    gpu_context: None,
+                    cpu_ctx: None,
                     upload_bytes_window: 0,
                     upload_window_start: std::time::Instant::now(),
                     upload_bytes_per_sec: 0,
@@ -1207,7 +1312,12 @@ impl VideoRenderer {
     /// SPEC-AV-003c
     pub fn new_cpu(ctx: egui::Context) -> Self {
         Self {
-            inner: RendererInner::Cpu(CpuRenderer { ctx, handle: None }),
+            inner: RendererInner::Cpu(CpuRenderer {
+                ctx: ctx.clone(),
+                handle: None,
+            }),
+            gpu_context: None,
+            cpu_ctx: Some(ctx),
             upload_bytes_window: 0,
             upload_window_start: std::time::Instant::now(),
             upload_bytes_per_sec: 0,
@@ -1223,6 +1333,7 @@ impl VideoRenderer {
     ///
     /// SPEC-AV-003
     pub fn upload(&mut self, frame: &YuvFrame) -> Result<(), AvError> {
+        self.ensure_sw_renderer()?;
         // Atualiza metadados do último frame.
         self.last_colorspace = Some(frame.colorspace);
         self.last_color_range = Some(frame.color_range);
@@ -1329,6 +1440,49 @@ impl VideoRenderer {
             RendererInner::HwGpu(nv) => nv.has_frame(),
             RendererInner::Cpu(cpu) => cpu.texture_id().is_some(),
         }
+    }
+
+    /// Rebaixa o renderer para o caminho SW renderizável após perda do device HW.
+    pub fn fallback_to_software(&mut self) -> Result<(), AvError> {
+        self.ensure_sw_renderer()
+    }
+
+    fn ensure_sw_renderer(&mut self) -> Result<(), AvError> {
+        if !matches!(self.inner, RendererInner::HwGpu(_)) {
+            return Ok(());
+        }
+
+        if let Some(context) = self.gpu_context.clone() {
+            self.inner =
+                RendererInner::Gpu(GpuRenderer::new(context.device, context.target_format)?);
+            return Ok(());
+        }
+
+        if let Some(ctx) = self.cpu_ctx.clone() {
+            self.inner = RendererInner::Cpu(CpuRenderer { ctx, handle: None });
+            return Ok(());
+        }
+
+        Err(AvError::HwInitFailed(
+            "renderer não possui contexto para fallback SW".into(),
+        ))
+    }
+
+    fn ensure_hw_renderer(&mut self, d3d11_dev: Arc<D3d11Device>) -> Result<(), AvError> {
+        if matches!(self.inner, RendererInner::HwGpu(_)) {
+            return Ok(());
+        }
+
+        let Some(mut context) = self.gpu_context.clone() else {
+            return Err(AvError::HwInitFailed(
+                "renderer não possui contexto wgpu para ativar upload HW".into(),
+            ));
+        };
+        context.d3d11_dev = Some(Arc::clone(&d3d11_dev));
+        let nv = NvRenderer::new(&context.device, d3d11_dev, context.target_format)?;
+        self.gpu_context = Some(context);
+        self.inner = RendererInner::HwGpu(nv);
+        Ok(())
     }
 }
 
@@ -1486,14 +1640,14 @@ mod tests {
     /// Serialização de `YuvParamsGpu` deve produzir exatamente 64 bytes.
     #[test]
     fn spec_av_003_yuv_params_size() {
-        let p = YuvParamsGpu::for_frame(YuvColorspace::Bt709, YuvColorRange::Limited);
+        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt709, YuvColorRange::Limited, false);
         assert_eq!(p.to_bytes().len(), 64);
     }
 
     /// `range_scale` para limited range (BT.709) deve ser ≈ 255/219 ≈ 1.1644.
     #[test]
     fn spec_av_003_yuv_params_range_scale_limited() {
-        let p = YuvParamsGpu::for_frame(YuvColorspace::Bt709, YuvColorRange::Limited);
+        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt709, YuvColorRange::Limited, false);
         let range_scale = p.offset_and_range[3];
         let expected = 255.0_f32 / 219.0;
         assert!(
@@ -1502,15 +1656,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spec_av_003_yuv_params_luma_offset_limited_8bit() {
+        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt709, YuvColorRange::Limited, false);
+        let expected = 16.0_f32 / 255.0_f32;
+        assert!((p.offset_and_range[0] - expected).abs() < 1e-6);
+        assert!((p.offset_and_range[1] - 0.5_f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spec_av_003_yuv_params_luma_offset_limited_10bit() {
+        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt2020, YuvColorRange::Limited, true);
+        let expected = 64.0_f32 / 1023.0_f32;
+        assert!((p.offset_and_range[0] - expected).abs() < 1e-6);
+    }
+
     /// `range_scale` para full range deve ser 1.0.
     #[test]
     fn spec_av_003_yuv_params_range_scale_full() {
-        let p = YuvParamsGpu::for_frame(YuvColorspace::Bt709, YuvColorRange::Full);
+        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt709, YuvColorRange::Full, false);
         let range_scale = p.offset_and_range[3];
         assert!(
             (range_scale - 1.0_f32).abs() < 1e-6,
             "range_scale full deve ser 1.0, got {range_scale}"
         );
+    }
+
+    #[test]
+    fn spec_av_003_yuv_params_hdr_transfer_sets_shader_metadata() {
+        let p = YuvParamsGpu::for_frame(
+            YuvColorspace::Bt2020,
+            YuvColorRange::Limited,
+            TransferFunction::Pq,
+            true,
+        );
+        assert_eq!(p.col0[3], 1.0, "PQ deve mapear para transfer_mode=1");
+        assert_eq!(p.col1[3], 1.0, "PQ deve habilitar clipping SDR documentado");
     }
 
     // ── scale_10bit_plane ───────────────────────────────────────────────────

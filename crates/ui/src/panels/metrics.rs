@@ -61,6 +61,10 @@ impl MetricsPanel {
         self.seen_discontinuity = 0;
     }
 
+    pub(crate) fn set_hwaccel_choice(&mut self, choice: HwAccelChoice) {
+        self.hwaccel_choice = choice;
+    }
+
     /// Renderiza o painel de métricas completo dentro de `ui`.
     ///
     /// SPEC-UI-005
@@ -722,5 +726,12 @@ mod tests {
         assert_eq!(history[0].1, 0);
         assert_eq!(history[1].1, -10);
         assert_eq!(history[2].1, 8);
+    }
+
+    #[test]
+    fn spec_cfg_hw_001_set_hwaccel_choice_updates_panel_state() {
+        let mut panel = MetricsPanel::new();
+        panel.set_hwaccel_choice(HwAccelChoice::D3d11va);
+        assert_eq!(panel.hwaccel_choice, HwAccelChoice::D3d11va);
     }
 }

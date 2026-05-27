@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info};
 use windows::{
-    core::Interface,
+    core::{Error as WinError, Interface},
     Win32::Graphics::{
         Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
         Direct3D11::{
@@ -18,13 +18,23 @@ use windows::{
             D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
         },
         Dxgi::{
-            Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC},
+            Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC},
             CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1,
+            DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
         },
     },
 };
 
 use crate::error::AvError;
+
+fn map_d3d11_error(context: &str, error: WinError) -> AvError {
+    let code = error.code();
+    if code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET {
+        AvError::HwDeviceRemoved(format!("{context}: {error}"))
+    } else {
+        AvError::HwInitFailed(format!("{context}: {error}"))
+    }
+}
 
 // ── Tipos públicos ─────────────────────────────────────────────────────────────
 
@@ -279,6 +289,18 @@ pub enum TransferFunction {
     Srgb,
 }
 
+impl TransferFunction {
+    /// Converte `AVColorTransferCharacteristic` bruto para a TRC usada no shader.
+    pub fn from_avutil(trc: i32) -> Self {
+        match trc {
+            16 => Self::Pq,
+            18 => Self::Hlg,
+            13 => Self::Srgb,
+            _ => Self::Bt1886,
+        }
+    }
+}
+
 /// Referência a uma textura D3D11VA produzida pelo decoder FFmpeg.
 ///
 /// Encapsula um `ID3D11Texture2D` de array + índice de slice.  O caller
@@ -372,7 +394,6 @@ impl D3d11Texture {
     pub unsafe fn from_raw_addref(
         tex_ptr: *mut std::ffi::c_void,
         array_slice: u32,
-        format: HwPixelFormat,
         width: u32,
         height: u32,
         color_space: ColorSpace,
@@ -389,6 +410,7 @@ impl D3d11Texture {
                 std::mem::ManuallyDrop::new(ID3D11Texture2D::from_raw(tex_ptr as *mut _));
             (*borrowed).clone()
         };
+        let format = detect_texture_format(&texture)?;
         Ok(Self::new(
             texture,
             array_slice,
@@ -412,6 +434,21 @@ impl D3d11Texture {
     }
 }
 
+fn detect_texture_format(texture: &ID3D11Texture2D) -> Result<HwPixelFormat, AvError> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut desc) };
+    if desc.Format == DXGI_FORMAT_NV12 {
+        Ok(HwPixelFormat::Nv12)
+    } else if desc.Format == DXGI_FORMAT_P010 {
+        Ok(HwPixelFormat::P010)
+    } else {
+        Err(AvError::HwInitFailed(format!(
+            "formato D3D11VA não suportado: {:?}",
+            desc.Format
+        )))
+    }
+}
+
 // ── NvPlanes + extração via staging ──────────────────────────────────────────
 
 /// Planos NV12 extraídos via textura D3D11 staging (GPU→CPU).
@@ -420,15 +457,17 @@ impl D3d11Texture {
 ///
 /// SPEC-AV-HW-TEX-001
 pub struct NvPlanes {
-    /// Plano luma Y (R8, `width × height` bytes).
+    /// Plano luma Y compactado (`width × height × bytes_per_sample`).
     pub y_data: Vec<u8>,
-    /// Plano croma UV interleaved (Rg8, `width × (height/2)` bytes).
+    /// Plano croma UV interleaved (`width × ceil(height/2) × bytes_per_sample`).
     /// Layout: U0 V0 U1 V1 … por linha, `width/2` pares por linha.
     pub uv_data: Vec<u8>,
     /// Largura em pixels.
     pub width: u32,
     /// Altura em pixels.
     pub height: u32,
+    /// `true` quando a textura origem é P010.
+    pub ten_bit: bool,
 }
 
 impl D3d11Device {
@@ -459,12 +498,13 @@ impl D3d11Device {
         let array_size = src_desc.ArraySize;
 
         // ── 2. Cria textura staging NV12 (tamanho do frame individual) ────────
+        let is_p010 = matches!(tex.format, HwPixelFormat::P010);
         let staging_desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_NV12,
+            Format: if is_p010 { DXGI_FORMAT_P010 } else { DXGI_FORMAT_NV12 },
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -478,7 +518,7 @@ impl D3d11Device {
         unsafe {
             self.device
                 .CreateTexture2D(&staging_desc, None, Some(&mut staging_opt))
-                .map_err(|e| AvError::HwInitFailed(format!("CreateTexture2D staging: {e}")))?;
+                .map_err(|e| map_d3d11_error("CreateTexture2D staging", e))?;
         }
         let staging = staging_opt
             .ok_or_else(|| AvError::HwInitFailed("staging texture nula".into()))?;
@@ -516,7 +556,7 @@ impl D3d11Device {
         unsafe {
             self.context
                 .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped_y))
-                .map_err(|e| AvError::HwInitFailed(format!("Map Y: {e}")))?;
+                .map_err(|e| map_d3d11_error("Map Y", e))?;
         }
 
         // Map UV — se falhar, deve Unmap Y antes de retornar
@@ -526,15 +566,17 @@ impl D3d11Device {
         };
         if let Err(e) = uv_map_result {
             unsafe { self.context.Unmap(&staging_res, 0) };
-            return Err(AvError::HwInitFailed(format!("Map UV: {e}")));
+            return Err(map_d3d11_error("Map UV", e));
         }
 
         // Copia Y compactado (sem row padding do driver)
         let w = width as usize;
         let h = height as usize;
         let h_uv = h.div_ceil(2);
-        let mut y_data = vec![0u8; w * h];
-        let mut uv_data = vec![0u8; w * h_uv]; // w/2 pares × 2 bytes = w bytes/linha
+        let bytes_per_sample = if is_p010 { 2 } else { 1 };
+        let row_bytes = w * bytes_per_sample;
+        let mut y_data = vec![0u8; row_bytes * h];
+        let mut uv_data = vec![0u8; row_bytes * h_uv];
 
         let y_row_pitch = mapped_y.RowPitch as usize;
         let uv_row_pitch = mapped_uv.RowPitch as usize;
@@ -543,16 +585,16 @@ impl D3d11Device {
             let y_src = mapped_y.pData as *const u8;
             for row in 0..h {
                 let src = y_src.add(row * y_row_pitch);
-                let dst = y_data[row * w..].as_mut_ptr();
-                std::ptr::copy_nonoverlapping(src, dst, w);
+                let dst = y_data[row * row_bytes..].as_mut_ptr();
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
             }
 
             let uv_src = mapped_uv.pData as *const u8;
             for row in 0..h_uv {
-                // Cada linha UV tem w/2 pares UVUV = w bytes
+                // Cada linha UV tem `width × bytes_per_sample` bytes compactados.
                 let src = uv_src.add(row * uv_row_pitch);
-                let dst = uv_data[row * w..].as_mut_ptr();
-                std::ptr::copy_nonoverlapping(src, dst, w);
+                let dst = uv_data[row * row_bytes..].as_mut_ptr();
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
             }
         }
 
@@ -567,6 +609,7 @@ impl D3d11Device {
             uv_data,
             width,
             height,
+            ten_bit: is_p010,
         })
     }
 }
@@ -610,6 +653,13 @@ mod tests {
         // high_part -1 como u32 = 0xFFFFFFFF
         assert_eq!(u >> 32, 0xFFFF_FFFFu64);
         assert_eq!(u & 0xFFFF_FFFF, 0xDEAD_BEEFu64);
+    }
+
+    #[test]
+    fn spec_av_hw_001_transfer_function_from_avutil_maps_hdr_values() {
+        assert_eq!(TransferFunction::from_avutil(16), TransferFunction::Pq);
+        assert_eq!(TransferFunction::from_avutil(18), TransferFunction::Hlg);
+        assert_eq!(TransferFunction::from_avutil(1), TransferFunction::Bt1886);
     }
 
     /// Valida que D3d11Device pode ser criado em ambiente Windows com GPU real.

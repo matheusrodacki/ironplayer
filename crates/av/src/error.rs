@@ -45,9 +45,40 @@ pub enum AvError {
     #[error("falha na inicialização de hwaccel: {0}")]
     HwInitFailed(String),
 
+    /// O device D3D11/DXGI foi removido ou resetado pelo driver.
+    ///
+    /// Usado para distinguir TDR (`DXGI_ERROR_DEVICE_REMOVED` /
+    /// `DXGI_ERROR_DEVICE_RESET`) de erros genéricos do caminho HW.
+    #[error("device D3D11 removido/resetado: {0}")]
+    HwDeviceRemoved(String),
+
     /// Erro genérico encapsulado com contexto.
     ///
     /// SPEC-AV-002
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl AvError {
+    /// `true` quando o erro representa perda/reset do device D3D11/DXGI.
+    pub fn is_device_removed(&self) -> bool {
+        matches!(self, Self::HwDeviceRemoved(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AvError;
+
+    #[test]
+    fn spec_av_hw_001_hw_device_removed_is_detected() {
+        let err = AvError::HwDeviceRemoved("DXGI_ERROR_DEVICE_REMOVED".into());
+        assert!(err.is_device_removed());
+    }
+
+    #[test]
+    fn spec_av_hw_001_non_device_removed_error_is_not_detected() {
+        let err = AvError::HwInitFailed("generic hw init failure".into());
+        assert!(!err.is_device_removed());
+    }
 }

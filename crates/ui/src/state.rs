@@ -349,6 +349,8 @@ pub enum AppCommand {
     ///
     /// SPEC-CFG-HW-001
     SetHwAccel { choice: HwAccelChoice },
+    /// Notifica o backend que o renderer encontrou `DXGI_ERROR_DEVICE_REMOVED`.
+    GpuDeviceRemoved,
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +422,9 @@ mod tests {
     /// SPEC-CFG-HW-001
     #[test]
     fn spec_cfg_hw_001_set_hwaccel_command_payload() {
-        let cmd = AppCommand::SetHwAccel { choice: HwAccelChoice::D3d11va };
+        let cmd = AppCommand::SetHwAccel {
+            choice: HwAccelChoice::D3d11va,
+        };
         match cmd {
             AppCommand::SetHwAccel { choice } => {
                 assert_eq!(choice, HwAccelChoice::D3d11va);

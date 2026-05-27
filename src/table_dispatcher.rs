@@ -59,6 +59,8 @@ pub enum DecodeCommand {
     SetHwAccel {
         choice: crate::config::HwAccelChoice,
     },
+    /// Notifica o decoder que o render encontrou `DXGI_ERROR_DEVICE_REMOVED`.
+    HandleDeviceRemoved,
 }
 
 /// SPEC-TABLE

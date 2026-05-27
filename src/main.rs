@@ -226,6 +226,52 @@ fn reset_stream_routing(
     }
 }
 
+fn bootstrap_d3d11_device(
+    hwaccel_choice: HwAccelChoice,
+    pipeline_metrics: &Arc<std::sync::RwLock<ts::metrics::PipelineMetrics>>,
+) -> Option<std::sync::Arc<av::D3d11Device>> {
+    let hwaccel_request_active = !matches!(hwaccel_choice, HwAccelChoice::None);
+
+    #[cfg(windows)]
+    {
+        if !hwaccel_request_active {
+            tracing::info!("hw: --hwaccel=none — bootstrap D3D11 ignorado; decode 100% CPU");
+            return None;
+        }
+
+        match av::D3d11Device::new() {
+            Ok(dev) => {
+                tracing::info!(
+                    adapter = dev.adapter_description(),
+                    luid = dev.adapter_luid().as_u64(),
+                    vendor_id = format!("{:#06x}", dev.vendor_id()),
+                    hwaccel_choice = hwaccel_choice.label(),
+                    "hw: D3d11Device bootstrap OK (Fase E)"
+                );
+                if let Ok(mut metrics) = pipeline_metrics.write() {
+                    av::AdapterInfo::from_device(&dev).apply_to_metrics(&mut metrics);
+                }
+                Some(dev)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    hwaccel_choice = hwaccel_choice.label(),
+                    "hw: D3d11Device bootstrap falhou — hwaccel desabilitado; usando decode CPU"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = hwaccel_request_active;
+        let _ = pipeline_metrics;
+        None
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> eframe::Result<()> {
@@ -522,6 +568,7 @@ fn main() -> eframe::Result<()> {
             ts::metrics::PipelineMetrics::default(),
         ));
     let pipeline_metrics_ui = std::sync::Arc::clone(&pipeline_metrics_shared);
+    let d3d11_device_arc = bootstrap_d3d11_device(cfg.player.hwaccel, &pipeline_metrics_shared);
 
     {
         let pes_packets_rx = ch.pes_packets_rx;
@@ -565,6 +612,8 @@ fn main() -> eframe::Result<()> {
             },
         };
         let pipeline_metrics_decode = std::sync::Arc::clone(&pipeline_metrics_shared);
+        let d3d11_device_for_decode = d3d11_device_arc.clone();
+        let initial_hwaccel_choice = cfg.player.hwaccel;
         handles.push(
             std::thread::Builder::new()
                 .name("av-decode".into())
@@ -581,6 +630,18 @@ fn main() -> eframe::Result<()> {
                             return;
                         }
                     };
+
+                    match (initial_hwaccel_choice, d3d11_device_for_decode.as_ref()) {
+                        (config::HwAccelChoice::None, _) => {
+                            let _ = decoder.enable_hwaccel(av::HwAccelMode::Off);
+                        }
+                        (config::HwAccelChoice::Auto | config::HwAccelChoice::D3d11va, Some(dev)) => {
+                            let _ = decoder.enable_hwaccel(av::HwAccelMode::D3d11Va(Arc::clone(dev)));
+                        }
+                        (config::HwAccelChoice::Auto | config::HwAccelChoice::D3d11va, None) => {
+                            decoder.fallback_to_sw("D3D11 indisponível no bootstrap");
+                        }
+                    }
 
                     tracing::info!("av-decode: iniciado");
 
@@ -609,18 +670,11 @@ fn main() -> eframe::Result<()> {
                                     );
                                 }
                                 DecodeCommand::SetHwAccel { choice } => {
-                                    // Aplica modo de hwaccel no decoder.  Em
-                                    // Sprint 2 (escopo CI-testável), apenas a
-                                    // transição para `Off` é totalmente
-                                    // suportada em runtime; promoções para
-                                    // D3D11VA exigem reabertura do stream
-                                    // (o `Arc<D3d11Device>` só existe após o
-                                    // bootstrap, fora do escopo desta thread).
-                                    //
-                                    // SPEC-CFG-HW-001
                                     match choice {
                                         config::HwAccelChoice::None => {
                                             let _ = decoder.enable_hwaccel(av::HwAccelMode::Off);
+                                            decoder.reset_with_hw_state();
+                                            decode_times.clear();
                                             tracing::info!(
                                                 hwaccel = choice.label(),
                                                 "av-decode: hwaccel desativado em runtime"
@@ -628,12 +682,31 @@ fn main() -> eframe::Result<()> {
                                         }
                                         config::HwAccelChoice::Auto
                                         | config::HwAccelChoice::D3d11va => {
-                                            tracing::info!(
-                                                hwaccel = choice.label(),
-                                                "av-decode: ativação de hwaccel adiada até a próxima reabertura de stream"
-                                            );
+                                            if let Some(dev) = d3d11_device_for_decode.as_ref() {
+                                                let _ = decoder.enable_hwaccel(av::HwAccelMode::D3d11Va(Arc::clone(dev)));
+                                                decoder.reset_with_hw_state();
+                                                decode_times.clear();
+                                                tracing::info!(
+                                                    hwaccel = choice.label(),
+                                                    "av-decode: hwaccel ativado em runtime"
+                                                );
+                                            } else {
+                                                decoder.fallback_to_sw("D3D11 indisponível para runtime toggle");
+                                                tracing::warn!(
+                                                    hwaccel = choice.label(),
+                                                    "av-decode: runtime toggle para hwaccel ignorado por falta de D3D11"
+                                                );
+                                            }
                                         }
                                     }
+                                }
+                                DecodeCommand::HandleDeviceRemoved => {
+                                    decoder.fallback_to_sw("DXGI_ERROR_DEVICE_REMOVED");
+                                    decoder.reset();
+                                    decode_times.clear();
+                                    tracing::warn!(
+                                        "av-decode: device removed reportado pela UI; decoder rebaixado para SW"
+                                    );
                                 }
                             }
                         }
@@ -659,6 +732,10 @@ fn main() -> eframe::Result<()> {
                                     if let Ok(mut m) = pipeline_metrics_decode.write() {
                                         m.decoder_threads_used = decoder.threads_used();
                                         m.deinterlacer_active = decoder.has_deinterlacer_active();
+                                        m.hw_decode_active = decoder.is_hwaccel_active();
+                                        m.hw_decode_codec = decoder.hw_decode_codec().map(str::to_owned);
+                                        m.hw_decode_fallback_reason = decoder.fallback_reason().map(str::to_owned);
+                                        m.hw_frame_pool_in_use = decoder.hw_frame_pool_in_use();
                                         m.decode_time_ms_p50.clear();
                                         m.decode_time_ms_p99.clear();
                                         for (&vpid, times) in &decode_times {
@@ -1048,11 +1125,6 @@ fn main() -> eframe::Result<()> {
                             tracing::info!(service_id, pid, "trilha de áudio selecionada pelo usuário");
                         }
                         ui::AppCommand::SetHwAccel { choice } => {
-                            // SPEC-CFG-HW-001: traduz a escolha UI para a variante
-                            // de `config` (que o decoder/bootstrap entendem) e
-                            // propaga para a thread `av-decode`.  Em Sprint 2 a
-                            // troca efetiva só ocorre na próxima reinit do
-                            // decoder; aqui apenas registramos.
                             let cfg_choice: config::HwAccelChoice = choice.into();
                             if decode_cmd_tx
                                 .try_send(DecodeCommand::SetHwAccel { choice: cfg_choice })
@@ -1069,61 +1141,26 @@ fn main() -> eframe::Result<()> {
                                 );
                             }
                         }
+                        ui::AppCommand::GpuDeviceRemoved => {
+                            if decode_cmd_tx
+                                .try_send(DecodeCommand::HandleDeviceRemoved)
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "cmd-handler: canal decode_cmd cheio; HandleDeviceRemoved descartado"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "cmd-handler: HandleDeviceRemoved enviado ao decoder"
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }
             })
             .expect("falha ao criar thread cmd-handler");
     }
-
-    // 15. Bootstrap D3D11 (Fase A — SPEC-AV-HW-001)
-    //
-    // Cria o ID3D11Device standalone para validar o adapter disponível e obter o
-    // LUID.  O device é compartilhado via `Arc` com o FfmpegDecoder (Fase B) e
-    // com o renderer (Fase C).  Nesta Fase A, apenas configuramos o wgpu para
-    // selecionar o mesmo adapter físico (via PowerPreference::HighPerformance em
-    // sistemas com iGPU+dGPU) e registramos o LUID no log.
-    //
-    // O bootstrap é pulado quando `--hwaccel none` foi solicitado.
-    //
-    // Risco R1: eframe 0.29 não expõe API para injetar wgpu::Device pré-criado;
-    // a sincronização de adapter é feita por LUID no CreationContext callback.
-    let hwaccel_request_active = !matches!(cfg.player.hwaccel, HwAccelChoice::None);
-    #[cfg(windows)]
-    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = if hwaccel_request_active {
-        match av::D3d11Device::new() {
-            Ok(dev) => {
-                tracing::info!(
-                    adapter = dev.adapter_description(),
-                    luid = dev.adapter_luid().as_u64(),
-                    vendor_id = format!("{:#06x}", dev.vendor_id()),
-                    hwaccel_choice = cfg.player.hwaccel.label(),
-                    "hw: D3d11Device bootstrap OK (Fase A)"
-                );
-                // SPEC-METRICS-HW-001: publica nome/LUID do adapter na telemetria.
-                if let Ok(mut m) = pipeline_metrics_shared.write() {
-                    av::AdapterInfo::from_device(&dev).apply_to_metrics(&mut m);
-                }
-                Some(dev)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    hwaccel_choice = cfg.player.hwaccel.label(),
-                    "hw: D3d11Device bootstrap falhou — hwaccel desabilitado; usando decode CPU"
-                );
-                None
-            }
-        }
-    } else {
-        tracing::info!("hw: --hwaccel=none — bootstrap D3D11 ignorado; decode 100% CPU");
-        None
-    };
-    #[cfg(not(windows))]
-    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = {
-        let _ = hwaccel_request_active; // suprime warning
-        None
-    };
 
     // Usa PowerPreference::HighPerformance para que wgpu e D3D11 selecionem
     // o mesmo adapter físico em sistemas com múltiplas GPUs (iGPU + dGPU).
@@ -1157,7 +1194,8 @@ fn main() -> eframe::Result<()> {
 
     // Clona `d3d11_device_arc` para uso dentro do closure (o Arc original pode
     // ser movido para o FfmpegDecoder na Fase B).
-    let d3d11_for_cc = d3d11_device_arc;
+    let d3d11_for_cc = d3d11_device_arc.clone();
+    let d3d11_for_ui = d3d11_device_arc;
 
     eframe::run_native(
         "IronPlayer",
@@ -1202,9 +1240,11 @@ fn main() -> eframe::Result<()> {
                 Some(selected_service),
                 Some(table_events_rx.clone()),
                 Some(video_frames_rx),
+                d3d11_for_ui.clone(),
             );
             inner.set_pipeline_metrics_rx(pipeline_metrics_ui);
             inner.set_audio_clock_rx(audio_clock_for_ui);
+            inner.set_hwaccel_choice(cfg.player.hwaccel.into());
             Ok(Box::new(IronPlayerAppWithPipeline { inner, guard }))
         }),
     )

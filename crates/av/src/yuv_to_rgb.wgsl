@@ -1,27 +1,15 @@
 // YUV → RGB fragment shader. SPEC-AV-003
 //
-// Parâmetros:
-//   matrix     : mat3x3f coluna-maior; converte [Y, U-0.5, V-0.5] → RGB normalizado.
-//   offset     : vec3f   bias aplicado ao resultado (cte RGB proveniente da remoção do
-//                        offset de chroma e da escala de range de luma).
-//   range_scale: f32     fator de escala para o canal Y (luma).
-//                        TV-range 8-bit → 255/219 ≈ 1.1644
-//                        Full-range      → 1.0
-//
-// WGSL override: DECODE_SRGB (f32)
-//   0.0 (padrão) → target linear (ex.: Bgra8Unorm); saída em gamma-encoded (Y'CbCr′ → R′G′B′).
-//   1.0          → target sRGB   (ex.: Bgra8UnormSrgb); saída linearizada para
-//                  compensar a dupla codificação gamma pelo framebuffer.
+// Fase D: o UBO carrega matriz YUV→RGB, offsets de range, TRC (BT.1886, PQ,
+// HLG ou sRGB) e a flag de fallback HDR→sRGB com clipping explícito.
 
 override DECODE_SRGB: f32 = 0.0;
 
 struct YuvParams {
-    /// Matriz 3×3 coluna-maior para mistura R′G′B′.
-    matrix: mat3x3<f32>,
-    /// Offset constante RGB pós-conversão.
-    offset: vec3<f32>,
-    /// Fator de escala do canal de luma Y (TV-range vs full-range).
-    range_scale: f32,
+    col0: vec4<f32>,
+    col1: vec4<f32>,
+    col2: vec4<f32>,
+    offset_and_range: vec4<f32>,
 }
 
 @group(0) @binding(0) var tex_y: texture_2d<f32>;
@@ -35,12 +23,8 @@ struct VertexOutput {
     @location(0)       uv:       vec2<f32>,
 }
 
-// ── Vértice: triângulo de tela cheia ──────────────────────────────────────────
-
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
-    // Triângulo que cobre exatamente o NDC [-1, +1] × [-1, +1].
-    // UV (0,0) = canto superior-esquerdo; (1,1) = canto inferior-direito.
     var pos: array<vec2<f32>, 3> = array(
         vec2<f32>(-1.0, -1.0),
         vec2<f32>( 3.0, -1.0),
@@ -57,8 +41,6 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
-// ── Fragmento: YUV → RGB ──────────────────────────────────────────────────────
-
 fn srgb_to_linear_channel(c: f32) -> f32 {
     if c <= 0.04045 {
         return c / 12.92;
@@ -66,25 +48,82 @@ fn srgb_to_linear_channel(c: f32) -> f32 {
     return pow((c + 0.055) / 1.055, 2.4);
 }
 
+fn bt1886_to_linear(c: f32) -> f32 {
+    return pow(clamp(c, 0.0, 1.0), 2.4);
+}
+
+fn pq_to_linear(c: f32) -> f32 {
+    let m1 = 2610.0 / 16384.0;
+    let m2 = 2523.0 / 32.0;
+    let c1 = 3424.0 / 4096.0;
+    let c2 = 2413.0 / 128.0;
+    let c3 = 2392.0 / 128.0;
+    let x = pow(clamp(c, 0.0, 1.0), 1.0 / m2);
+    let num = max(x - c1, 0.0);
+    let den = max(c2 - c3 * x, 1e-6);
+    return pow(num / den, 1.0 / m1);
+}
+
+fn hlg_to_linear(c: f32) -> f32 {
+    if c <= 0.5 {
+        return (c * c) / 3.0;
+    }
+    let a = 0.17883277;
+    let b = 0.28466892;
+    let cc = 0.55991073;
+    return (exp((c - cc) / a) + b) / 12.0;
+}
+
+fn decode_transfer(rgb: vec3<f32>, mode: f32) -> vec3<f32> {
+    if mode < 0.5 {
+        return vec3<f32>(
+            bt1886_to_linear(rgb.r),
+            bt1886_to_linear(rgb.g),
+            bt1886_to_linear(rgb.b),
+        );
+    }
+    if mode < 1.5 {
+        return vec3<f32>(
+            pq_to_linear(rgb.r),
+            pq_to_linear(rgb.g),
+            pq_to_linear(rgb.b),
+        );
+    }
+    if mode < 2.5 {
+        return vec3<f32>(
+            hlg_to_linear(rgb.r),
+            hlg_to_linear(rgb.g),
+            hlg_to_linear(rgb.b),
+        );
+    }
+    return vec3<f32>(
+        srgb_to_linear_channel(rgb.r),
+        srgb_to_linear_channel(rgb.g),
+        srgb_to_linear_channel(rgb.b),
+    );
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let y = textureSample(tex_y, samp, in.uv).r;
-    let u = textureSample(tex_u, samp, in.uv).r - 0.5;
-    let v = textureSample(tex_v, samp, in.uv).r - 0.5;
+    let uv_center = params.offset_and_range.y;
+    let u = textureSample(tex_u, samp, in.uv).r - uv_center;
+    let v = textureSample(tex_v, samp, in.uv).r - uv_center;
 
-    // Aplica escala de range ao canal Y antes da multiplicação de matriz.
-    let yuv = vec3<f32>((y - params.offset.x) * params.range_scale, u, v);
-    var rgb  = params.matrix * yuv + params.offset;
-    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let y_offset = params.offset_and_range.x;
+    let range_scale = params.offset_and_range.w;
+    let transfer_mode = params.col0.w;
+    let hdr_clip = params.col1.w;
 
-    // Quando o framebuffer alvo é sRGB o driver gamma-encoda a saída linear;
-    // linearizamos aqui para compensar (resultando em identidade net).
-    if DECODE_SRGB > 0.5 {
-        rgb = vec3<f32>(
-            srgb_to_linear_channel(rgb.r),
-            srgb_to_linear_channel(rgb.g),
-            srgb_to_linear_channel(rgb.b),
-        );
+    let yuv = vec3<f32>(max((y - y_offset) * range_scale, 0.0), u, v);
+    let col0 = params.col0.xyz;
+    let col1 = params.col1.xyz;
+    let col2 = params.col2.xyz;
+    var rgb = mat3x3<f32>(col0, col1, col2) * yuv;
+    rgb = decode_transfer(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), transfer_mode);
+
+    if hdr_clip > 0.5 || DECODE_SRGB > 0.5 {
+        rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
     return vec4<f32>(rgb, 1.0);

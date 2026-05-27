@@ -38,6 +38,17 @@ pub enum TransferFunction {
     Srgb,
 }
 
+impl TransferFunction {
+    pub fn from_avutil(trc: i32) -> Self {
+        match trc {
+            16 => Self::Pq,
+            18 => Self::Hlg,
+            13 => Self::Srgb,
+            _ => Self::Bt1886,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdapterLuid {
     pub low_part: u32,
@@ -91,6 +102,7 @@ pub struct NvPlanes {
     pub uv_data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    pub ten_bit: bool,
 }
 
 /// Stub de `D3d11Texture` para plataformas não-Windows.
@@ -110,7 +122,6 @@ impl D3d11Texture {
     pub unsafe fn from_raw_addref(
         _tex_ptr: *mut std::ffi::c_void,
         _array_slice: u32,
-        _format: HwPixelFormat,
         _width: u32,
         _height: u32,
         _color_space: ColorSpace,

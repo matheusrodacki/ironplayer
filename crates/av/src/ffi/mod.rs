@@ -323,6 +323,17 @@ pub(crate) unsafe fn frame_colorspace(frame: *mut c_void) -> i32 {
     *((frame as *const u8).add(292) as *const i32)
 }
 
+/// Lê `color_trc` de um `AVFrame*` opaco (offset 288).
+///
+/// Valores relevantes: `1` = SDR (BT.1886), `16` = SMPTE ST 2084 (PQ),
+/// `18` = ARIB STD-B67 (HLG).
+///
+/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn frame_color_trc(frame: *mut c_void) -> i32 {
+    *((frame as *const u8).add(288) as *const i32)
+}
+
 /// Lê `flags` de um `AVFrame*` opaco (offset 276).
 ///
 /// Contém flags como `AV_FRAME_FLAG_INTERLACED (1 << 0)` e
@@ -1363,7 +1374,7 @@ impl FfmpegFrame {
     #[allow(clippy::type_complexity)]
     pub(crate) fn hw_frame_info(
         &self,
-    ) -> Result<(*mut c_void, u32, u32, u32, i64, (u32, u32), i32, i32), crate::error::AvError>
+    ) -> Result<(*mut c_void, u32, u32, u32, i64, (u32, u32), i32, i32, i32), crate::error::AvError>
     {
         if !self.is_hw() {
             return Err(crate::error::AvError::FfmpegError { code: -22 });
@@ -1382,6 +1393,7 @@ impl FfmpegFrame {
             } else {
                 (1u32, 1u32)
             };
+            let color_trc = frame_color_trc(self.frame);
             let colorspace = frame_colorspace(self.frame);
             let color_range = frame_color_range(self.frame);
             Ok((
@@ -1391,6 +1403,7 @@ impl FfmpegFrame {
                 height,
                 pts,
                 sar,
+                color_trc,
                 colorspace,
                 color_range,
             ))

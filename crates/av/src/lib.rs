@@ -37,12 +37,12 @@ pub use decoder::{DecodedFrame, FfmpegDecoder};
 pub use error::AvError;
 pub use hw::{
     AdapterInfo, AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwAccelMode, HwAccelState,
-    HwPixelFormat, TdrState, TransferFunction, HW_FALLBACK_THRESHOLD, TDR_MAX_ATTEMPTS,
+    HwPixelFormat, NvPlanes, TdrState, TransferFunction, HW_FALLBACK_THRESHOLD, TDR_MAX_ATTEMPTS,
     TDR_RETRY_COOLDOWN,
 };
 pub use pes::{PesAssembler, PesPacket};
 pub use renderer::VideoRenderer;
 pub use video_queue::{
-    PopResult, PushResult, VideoQueue, YuvColorRange, YuvColorspace, YuvFrame,
-    DEFAULT_CAPACITY as VIDEO_QUEUE_CAPACITY, DROP_PTS, HOLD_PTS, RESYNC_PTS,
+    HwVideoFrame, PopResult, PushResult, VideoFrame, VideoQueue, YuvColorRange, YuvColorspace,
+    YuvFrame, DEFAULT_CAPACITY as VIDEO_QUEUE_CAPACITY, DROP_PTS, HOLD_PTS, RESYNC_PTS,
 };

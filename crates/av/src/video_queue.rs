@@ -125,6 +125,110 @@ pub struct YuvFrame {
     pub ten_bit: bool,
 }
 
+// ─── HwVideoFrame ─────────────────────────────────────────────────────────────
+
+/// Frame de vídeo HW produzido pelo decoder D3D11VA — Fase C zero-copy.
+///
+/// Encapsula a textura D3D11 AddRef'd (viva enquanto este struct existir)
+/// e o `D3d11Device` necessário para a extração NV12 no renderer.
+///
+/// SPEC-AV-HW-TEX-001
+#[derive(Debug)]
+pub struct HwVideoFrame {
+    /// Textura D3D11VA com AddRef próprio.
+    pub tex: crate::hw::D3d11Texture,
+    /// Device D3D11 para staging copy na renderização.
+    pub d3d11_dev: std::sync::Arc<crate::hw::D3d11Device>,
+    /// PTS do frame em unidades de 90 kHz.
+    pub pts: Option<u64>,
+    /// Largura do frame em pixels.
+    pub width: u32,
+    /// Altura do frame em pixels.
+    pub height: u32,
+    /// Numerador do Sample Aspect Ratio.
+    pub sar_num: u32,
+    /// Denominador do Sample Aspect Ratio.
+    pub sar_den: u32,
+}
+
+// SAFETY: D3d11Texture e D3d11Device são Send+Sync (multithread protegido).
+unsafe impl Send for HwVideoFrame {}
+unsafe impl Sync for HwVideoFrame {}
+
+// ─── VideoFrame ───────────────────────────────────────────────────────────────
+
+/// Frame de vídeo unificado: software YUV420P ou hardware NV12 D3D11.
+///
+/// Transportado pelo canal `video_frames` e armazenado na `VideoQueue`.
+///
+/// SPEC-AV-HW-TEX-001 · SPEC-AV-VQ-001
+#[derive(Debug)]
+pub enum VideoFrame {
+    /// Frame software (YUV420P / YUV420P10LE).
+    Sw(YuvFrame),
+    /// Frame hardware D3D11VA (NV12 / P010).
+    Hw(HwVideoFrame),
+}
+
+impl VideoFrame {
+    /// PTS do frame em unidades de 90 kHz.
+    #[inline]
+    pub fn pts(&self) -> Option<u64> {
+        match self {
+            Self::Sw(f) => f.pts,
+            Self::Hw(f) => f.pts,
+        }
+    }
+
+    /// Largura do frame em pixels.
+    #[inline]
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Sw(f) => f.width,
+            Self::Hw(f) => f.width,
+        }
+    }
+
+    /// Altura do frame em pixels.
+    #[inline]
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Sw(f) => f.height,
+            Self::Hw(f) => f.height,
+        }
+    }
+
+    /// Numerador do SAR.
+    #[inline]
+    pub fn sar_num(&self) -> u32 {
+        match self {
+            Self::Sw(f) => f.sar_num,
+            Self::Hw(f) => f.sar_num,
+        }
+    }
+
+    /// Denominador do SAR.
+    #[inline]
+    pub fn sar_den(&self) -> u32 {
+        match self {
+            Self::Sw(f) => f.sar_den,
+            Self::Hw(f) => f.sar_den,
+        }
+    }
+}
+
+impl From<YuvFrame> for VideoFrame {
+    fn from(f: YuvFrame) -> Self {
+        Self::Sw(f)
+    }
+}
+
+impl From<HwVideoFrame> for VideoFrame {
+    fn from(f: HwVideoFrame) -> Self {
+        Self::Hw(f)
+    }
+}
+
 // ─── Limiares ─────────────────────────────────────────────────────────────────
 
 /// Limiar HOLD: frame mais de 20 ms à frente do clock → aguardar.
@@ -163,7 +267,7 @@ pub const DEFAULT_CAPACITY: usize = 16;
 #[derive(Debug)]
 pub enum PopResult {
     /// Frame pronto para exibir agora.
-    Ready(YuvFrame),
+    Ready(VideoFrame),
     /// Próximo frame está muito adiantado (PTS > clock + HOLD_PTS); aguardar.
     TooEarly,
     /// Fila vazia.
@@ -174,7 +278,7 @@ pub enum PopResult {
     /// `new_anchor` antes do próximo `pop_ready`.
     Resync {
         /// Frame com PTS discontinuo (deve ser exibido).
-        frame: YuvFrame,
+        frame: VideoFrame,
         /// Novo PTS âncora sugerido para o clock.
         new_anchor: Pts90,
     },
@@ -213,7 +317,7 @@ pub enum PushResult {
 /// SPEC-AV-VQ-001
 pub struct VideoQueue {
     /// Frames na fila em ordem crescente de PTS ajustado.
-    frames: VecDeque<(Pts90, YuvFrame)>,
+    frames: VecDeque<(Pts90, VideoFrame)>,
     /// Capacidade máxima (número de frames).
     capacity: usize,
     /// Offset acumulado por wraps de PTS 33-bit (múltiplos de 2^33).
@@ -327,8 +431,8 @@ impl VideoQueue {
     /// - `Inserted` caso contrário.
     ///
     /// SPEC-AV-VQ-001
-    pub fn push(&mut self, frame: YuvFrame) -> PushResult {
-        let (adj_pts, wrap_detected) = match frame.pts {
+    pub fn push(&mut self, frame: VideoFrame) -> PushResult {
+        let (adj_pts, wrap_detected) = match frame.pts() {
             Some(raw) => self.adjust_pts(raw),
             None => {
                 // Sem PTS: usa last_pts + 1 para manter ordem FIFO
@@ -443,6 +547,23 @@ impl Default for VideoQueue {
 mod tests {
     use super::*;
 
+    fn make_frame(pts: Option<u64>) -> VideoFrame {
+        let y = vec![0u8; 4 * 4];
+        let uv = vec![0u8; 2 * 2];
+        VideoFrame::Sw(YuvFrame {
+            planes: [y, uv.clone(), uv],
+            width: 4,
+            height: 4,
+            pts,
+            sar_num: 1,
+            sar_den: 1,
+            colorspace: YuvColorspace::Bt709,
+            color_range: YuvColorRange::Limited,
+            ten_bit: false,
+        })
+    }
+
+    #[allow(dead_code)]
     fn make_yuv_frame(pts: Option<u64>) -> YuvFrame {
         let y = vec![0u8; 4 * 4];
         let uv = vec![0u8; 2 * 2];
@@ -471,7 +592,7 @@ mod tests {
     #[test]
     fn spec_av_vq_001_push_single_frame() {
         let mut q = VideoQueue::new(4);
-        let r = q.push(make_yuv_frame(Some(1000)));
+        let r = q.push(make_frame(Some(1000)));
         assert_eq!(r, PushResult::Inserted);
         assert_eq!(q.len(), 1);
     }
@@ -482,7 +603,7 @@ mod tests {
     #[test]
     fn spec_av_vq_001_push_no_pts_uses_synthetic() {
         let mut q = VideoQueue::new(4);
-        let r = q.push(make_yuv_frame(None));
+        let r = q.push(make_frame(None));
         assert_eq!(r, PushResult::Inserted);
         assert_eq!(q.len(), 1);
     }
@@ -493,16 +614,16 @@ mod tests {
     #[test]
     fn spec_av_vq_001_push_out_of_order_reordered() {
         let mut q = VideoQueue::new(4);
-        q.push(make_yuv_frame(Some(3000)));
-        q.push(make_yuv_frame(Some(1000)));
-        q.push(make_yuv_frame(Some(2000)));
+        q.push(make_frame(Some(3000)));
+        q.push(make_frame(Some(1000)));
+        q.push(make_frame(Some(2000)));
 
         // Extrai frames com clock progressivo: verifica que saem em ordem
         // crescente de PTS (1000, 2000, 3000).
         let mut pts_list = Vec::new();
         for clock in [1000i64, 2000, 3000] {
             match q.pop_ready(clock) {
-                PopResult::Ready(f) => pts_list.push(f.pts.unwrap()),
+                PopResult::Ready(f) => pts_list.push(f.pts().unwrap()),
                 other => panic!("esperava Ready no clock {clock}, obteve {:?}", other),
             }
         }
@@ -515,9 +636,9 @@ mod tests {
     #[test]
     fn spec_av_vq_001_push_at_capacity_drops_oldest() {
         let mut q = VideoQueue::new(2);
-        q.push(make_yuv_frame(Some(100)));
-        q.push(make_yuv_frame(Some(200)));
-        let r = q.push(make_yuv_frame(Some(300)));
+        q.push(make_frame(Some(100)));
+        q.push(make_frame(Some(200)));
+        let r = q.push(make_frame(Some(300)));
         assert_eq!(r, PushResult::DroppedOldest);
         assert_eq!(q.len(), 2);
     }
@@ -541,7 +662,7 @@ mod tests {
     #[test]
     fn spec_av_vq_001_pop_ready_exact_pts() {
         let mut q = VideoQueue::new(4);
-        q.push(make_yuv_frame(Some(9000)));
+        q.push(make_frame(Some(9000)));
         let clock = make_clock_pts(9000);
         assert!(matches!(q.pop_ready(clock), PopResult::Ready(_)));
     }
@@ -554,7 +675,7 @@ mod tests {
     fn spec_av_vq_001_pop_ready_within_window() {
         let mut q = VideoQueue::new(4);
         // PTS = 9000, clock = 9500 → diff = -500 → dentro da janela
-        q.push(make_yuv_frame(Some(9000)));
+        q.push(make_frame(Some(9000)));
         assert!(matches!(q.pop_ready(9500), PopResult::Ready(_)));
     }
 
@@ -567,7 +688,7 @@ mod tests {
     fn spec_av_vq_001_pop_too_early() {
         let mut q = VideoQueue::new(4);
         // frame_pts = clock + HOLD_PTS + 1 → hold
-        q.push(make_yuv_frame(Some(10_000)));
+        q.push(make_frame(Some(10_000)));
         let clock = make_clock_pts(10_000 - HOLD_PTS - 1);
         assert!(matches!(q.pop_ready(clock), PopResult::TooEarly));
         assert_eq!(q.held_early, 1);
@@ -583,7 +704,7 @@ mod tests {
     fn spec_av_vq_001_pop_drop_late() {
         let mut q = VideoQueue::new(4);
         // frame_pts = 100, clock = 100 + DROP_PTS + 1 → drop
-        q.push(make_yuv_frame(Some(100)));
+        q.push(make_frame(Some(100)));
         let clock = make_clock_pts(100 + DROP_PTS + 1);
         assert!(matches!(q.pop_ready(clock), PopResult::Empty));
         assert_eq!(q.dropped_late, 1);
@@ -597,7 +718,7 @@ mod tests {
     fn spec_av_vq_001_pop_multiple_late_then_ready() {
         let mut q = VideoQueue::new(8);
         for pts in [100u64, 200, 300, 9_500] {
-            q.push(make_yuv_frame(Some(pts)));
+            q.push(make_frame(Some(pts)));
         }
         let clock = make_clock_pts(9_000 + DROP_PTS); // 18000
                                                       // 100, 200, 300 estão todos abaixo de clock - DROP_PTS = 9000
@@ -621,7 +742,7 @@ mod tests {
     fn spec_av_vq_001_pop_resync_large_jump() {
         let mut q = VideoQueue::new(4);
         let frame_pts: u64 = 500_000;
-        q.push(make_yuv_frame(Some(frame_pts)));
+        q.push(make_frame(Some(frame_pts)));
         // clock = 0 → diff = 500_000 > RESYNC_PTS (45_000)
         match q.pop_ready(0) {
             PopResult::Resync {
@@ -644,9 +765,9 @@ mod tests {
     fn spec_av_vq_001_wrap_33bit_detected() {
         let mut q = VideoQueue::new(4);
         let near_max: u64 = (1u64 << 33) - 1 - 1000;
-        q.push(make_yuv_frame(Some(near_max)));
+        q.push(make_frame(Some(near_max)));
         // Agora PTS = 500 (wraparound)
-        let r = q.push(make_yuv_frame(Some(500)));
+        let r = q.push(make_frame(Some(500)));
         assert_eq!(r, PushResult::WrapDetected);
     }
 
@@ -658,11 +779,11 @@ mod tests {
         let mut q = VideoQueue::new(8);
         let near_max: u64 = (1u64 << 33) - 5_000;
         // Insere dois frames pré-wrap
-        q.push(make_yuv_frame(Some(near_max - 1000)));
-        q.push(make_yuv_frame(Some(near_max)));
+        q.push(make_frame(Some(near_max - 1000)));
+        q.push(make_frame(Some(near_max)));
         // Insere dois frames pós-wrap
-        q.push(make_yuv_frame(Some(500)));
-        q.push(make_yuv_frame(Some(1000)));
+        q.push(make_frame(Some(500)));
+        q.push(make_frame(Some(1000)));
 
         assert_eq!(q.len(), 4);
 
@@ -680,13 +801,13 @@ mod tests {
     #[test]
     fn spec_av_vq_001_clear_resets_state() {
         let mut q = VideoQueue::new(4);
-        q.push(make_yuv_frame(Some(1000)));
-        q.push(make_yuv_frame(Some(2000)));
+        q.push(make_frame(Some(1000)));
+        q.push(make_frame(Some(2000)));
         q.clear();
         assert!(q.is_empty());
         assert_eq!(q.len(), 0);
         // Após clear, novo frame começa do zero
-        let r = q.push(make_yuv_frame(Some(100)));
+        let r = q.push(make_frame(Some(100)));
         assert_eq!(r, PushResult::Inserted);
     }
 
@@ -712,7 +833,7 @@ mod tests {
         let mut q = VideoQueue::new(4);
         let clock_pts: Pts90 = 90_000;
         // frame_pts = clock + HOLD_PTS → diff = HOLD_PTS → hold (diff > HOLD_PTS é false)
-        q.push(make_yuv_frame(Some((clock_pts + HOLD_PTS) as u64)));
+        q.push(make_frame(Some((clock_pts + HOLD_PTS) as u64)));
         // diff == HOLD_PTS → NOT > HOLD_PTS → Ready
         assert!(matches!(q.pop_ready(clock_pts), PopResult::Ready(_)));
     }
@@ -725,7 +846,7 @@ mod tests {
         let mut q = VideoQueue::new(4);
         let clock_pts: Pts90 = 90_000;
         // frame_pts = clock - DROP_PTS → diff = -DROP_PTS → NOT < -DROP_PTS → Ready
-        q.push(make_yuv_frame(Some((clock_pts - DROP_PTS) as u64)));
+        q.push(make_frame(Some((clock_pts - DROP_PTS) as u64)));
         assert!(matches!(q.pop_ready(clock_pts), PopResult::Ready(_)));
     }
 
@@ -746,9 +867,9 @@ mod tests {
     #[test]
     fn spec_av_vq_001_front_pts_returns_smallest() {
         let mut q = VideoQueue::new(4);
-        q.push(make_yuv_frame(Some(3000)));
-        q.push(make_yuv_frame(Some(1000)));
-        q.push(make_yuv_frame(Some(2000)));
+        q.push(make_frame(Some(3000)));
+        q.push(make_frame(Some(1000)));
+        q.push(make_frame(Some(2000)));
         // Fila está ordenada por PTS; front deve ser o menor PTS (1000).
         assert_eq!(q.front_pts(), Some(1000));
     }
@@ -759,7 +880,7 @@ mod tests {
     #[test]
     fn spec_av_vq_001_front_pts_does_not_consume() {
         let mut q = VideoQueue::new(4);
-        q.push(make_yuv_frame(Some(500)));
+        q.push(make_frame(Some(500)));
         let pts_before = q.front_pts();
         let pts_after = q.front_pts();
         assert_eq!(pts_before, pts_after);

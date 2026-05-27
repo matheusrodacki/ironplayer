@@ -82,6 +82,23 @@ pub const AVERROR_EOF: c_int = -541_478_725_i32;
 /// Introduzido em FFmpeg 6.x em substituição ao campo deprecated `interlaced_frame`.
 pub const AV_FRAME_FLAG_INTERLACED: c_int = 1;
 
+/// `AV_PIX_FMT_NV12` — semi-planar YCbCr 4:2:0 (plano Y + UV intercalado).
+/// Formato nativo de saída do decoder D3D11VA.
+pub const AV_PIX_FMT_NV12: c_int = 23;
+
+/// `AV_PIX_FMT_D3D11` — frame em textura D3D11 (hardware surface).
+/// Retornado por `avcodec_receive_frame` quando D3D11VA está ativo.
+pub const AV_PIX_FMT_D3D11: c_int = 224;
+
+/// `AV_HWDEVICE_TYPE_D3D11VA` — identificador do tipo de device hardware D3D11VA.
+pub const AV_HWDEVICE_TYPE_D3D11VA: c_int = 7;
+
+/// Offset do campo `hw_device_ctx` em `AVCodecContext` (FFmpeg 7.x / avcodec-62, x86-64).
+///
+/// Confirmado via sondagem runtime: `hwaccel_flags` (AVOption) está em offset +568,
+/// portanto o ponteiro `AVBufferRef*` imediatamente anterior fica em +560.
+pub(crate) const AV_CTX_HW_DEVICE_CTX_OFFSET: usize = 560;
+
 // ─── Tipos opacos FFmpeg ──────────────────────────────────────────────────────
 
 /// Tipo opaco para `AVCodec*`.
@@ -379,6 +396,27 @@ type FnAvDictSet = unsafe extern "C" fn(
 
 type FnAvDictFree = unsafe extern "C" fn(m: *mut *mut AvDictionary);
 
+// ─── Tipos de função para hardware acceleration ────────────────────────────────
+
+/// `av_hwdevice_ctx_create` — cria um `AVBufferRef*` wrapping um `AVHWDeviceContext`.
+type FnAvHwdeviceCtxCreate = unsafe extern "C" fn(
+    device_ctx: *mut *mut c_void,
+    hw_type: c_int,
+    device: *const std::ffi::c_char,
+    opts: *mut c_void,
+    flags: c_int,
+) -> c_int;
+
+/// `av_hwframe_transfer_data` — copia dados de um frame HW para um frame SW.
+type FnAvHwframeTransferData =
+    unsafe extern "C" fn(dst: *mut c_void, src: *const c_void, flags: c_int) -> c_int;
+
+/// `av_buffer_ref` — incrementa refcount e retorna novo `AVBufferRef*`.
+type FnAvBufferRef = unsafe extern "C" fn(buf: *mut c_void) -> *mut c_void;
+
+/// `av_buffer_unref` — decrementa refcount; libera se chegar a zero.
+type FnAvBufferUnref = unsafe extern "C" fn(buf: *mut *mut c_void);
+
 // ─── FfmpegLib ────────────────────────────────────────────────────────────────
 
 /// Bibliotecas FFmpeg carregadas e ponteiros de função resolvidos.
@@ -423,6 +461,12 @@ pub struct FfmpegLib {
     // Funções de dicionário avutil (usadas para opções de codec)
     pub(crate) av_dict_set: FnAvDictSet,
     pub(crate) av_dict_free: FnAvDictFree,
+
+    // Funções hw-accel (D3D11VA, SPEC-AV-HW-DEC-001)
+    pub(crate) av_hwdevice_ctx_create: FnAvHwdeviceCtxCreate,
+    pub(crate) av_hwframe_transfer_data: FnAvHwframeTransferData,
+    pub(crate) av_buffer_ref: FnAvBufferRef,
+    pub(crate) av_buffer_unref: FnAvBufferUnref,
 }
 
 // SAFETY: Os ponteiros de função são obtidos de DLLs thread-safe do FFmpeg.
@@ -524,6 +568,16 @@ impl FfmpegLib {
         let av_dict_set = sym!(avutil, b"av_dict_set\0", FnAvDictSet);
         let av_dict_free = sym!(avutil, b"av_dict_free\0", FnAvDictFree);
 
+        let av_hwdevice_ctx_create =
+            sym!(avutil, b"av_hwdevice_ctx_create\0", FnAvHwdeviceCtxCreate);
+        let av_hwframe_transfer_data = sym!(
+            avutil,
+            b"av_hwframe_transfer_data\0",
+            FnAvHwframeTransferData
+        );
+        let av_buffer_ref = sym!(avutil, b"av_buffer_ref\0", FnAvBufferRef);
+        let av_buffer_unref = sym!(avutil, b"av_buffer_unref\0", FnAvBufferUnref);
+
         Ok(Arc::new(Self {
             _avutil: avutil,
             _avcodec: avcodec,
@@ -550,6 +604,10 @@ impl FfmpegLib {
             swr_free,
             av_dict_set,
             av_dict_free,
+            av_hwdevice_ctx_create,
+            av_hwframe_transfer_data,
+            av_buffer_ref,
+            av_buffer_unref,
         }))
     }
 
@@ -690,6 +748,140 @@ impl FfmpegCodecContext {
             flag2_fast = config.flag2_fast,
             "decodificador FFmpeg aberto"
         );
+        Ok(Self { ctx, lib })
+    }
+
+    /// Abre um decodificador FFmpeg com aceleração de hardware D3D11VA.
+    ///
+    /// Cria um `AVHWDeviceContext` via `av_hwdevice_ctx_create` (o FFmpeg cria
+    /// internamente um `ID3D11Device` próprio) e o escreve no campo
+    /// `hw_device_ctx` de `AVCodecContext` (offset +560, verificado via sondagem
+    /// em tempo de execução) antes de chamar `avcodec_open2`.
+    ///
+    /// O `avcodec_default_get_format` padrão do FFmpeg seleciona automaticamente
+    /// `AV_PIX_FMT_D3D11` quando `hw_device_ctx` está preenchido — não é
+    /// necessário registrar um callback `get_format` customizado.
+    ///
+    /// Retorna `Err` se o device HW não puder ser criado ou o codec falhar ao
+    /// abrir com o device — o caller deve fazer fallback para `open()` (SW).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn open_with_hwaccel(
+        lib: Arc<FfmpegLib>,
+        codec_id: u32,
+        config: &CodecConfig,
+        hw_type: c_int,
+    ) -> Result<Self, AvError> {
+        // SAFETY: avcodec_find_decoder é thread-safe e retorna ponteiro estático.
+        let codec = unsafe { (lib.avcodec_find_decoder)(codec_id) };
+        if codec.is_null() {
+            return Err(AvError::FfmpegUnavailable {
+                message: format!("codec id={codec_id} não encontrado para hwaccel"),
+            });
+        }
+
+        // SAFETY: avcodec_alloc_context3 aloca com av_malloc; codec é válido.
+        let ctx = unsafe { (lib.avcodec_alloc_context3)(codec) };
+        if ctx.is_null() {
+            return Err(AvError::FfmpegError { code: -12 }); // ENOMEM
+        }
+
+        // Cria AVHWDeviceContext. O FFmpeg cria um ID3D11Device interno para o tipo
+        // solicitado. No Windows, hw_type=7 (AV_HWDEVICE_TYPE_D3D11VA).
+        let mut hw_ctx: *mut c_void = std::ptr::null_mut();
+        let hw_ret = unsafe {
+            (lib.av_hwdevice_ctx_create)(
+                &mut hw_ctx,
+                hw_type,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if hw_ret < 0 {
+            let mut p = ctx;
+            unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+            return Err(AvError::FfmpegError { code: hw_ret });
+        }
+
+        // Cria uma referência adicional ao hw_ctx para transferir ao AVCodecContext.
+        // O FFmpeg AddRef-a internamente durante avcodec_open2; liberamos nossa cópia
+        // original logo após a abertura. hw_ref passa a ser propriedade do contexto.
+        let hw_ref = unsafe { (lib.av_buffer_ref)(hw_ctx) };
+        if hw_ref.is_null() {
+            let mut hw = hw_ctx;
+            unsafe { (lib.av_buffer_unref)(&mut hw) };
+            let mut p = ctx;
+            unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+            return Err(AvError::FfmpegError { code: -12 });
+        }
+
+        // Escreve hw_ref no campo hw_device_ctx do AVCodecContext (offset +560).
+        // SAFETY: ctx é não-nulo e alinhado a 8 bytes; offset 560 é múltiplo de 8;
+        //         hw_ref é um AVBufferRef* não-nulo.
+        unsafe {
+            std::ptr::write_unaligned(
+                (ctx as *mut u8).add(AV_CTX_HW_DEVICE_CTX_OFFSET) as *mut *mut c_void,
+                hw_ref,
+            );
+        }
+
+        // Libera nossa referência original (hw_ctx). A cópia hw_ref já foi
+        // transferida para o contexto — o FFmpeg a mantém viva enquanto o
+        // AVCodecContext existir e a libera via avcodec_free_context.
+        let mut hw = hw_ctx;
+        unsafe { (lib.av_buffer_unref)(&mut hw) };
+
+        // Monta AVDictionary com as opções de codec (mesma lógica de open()).
+        let mut opts: *mut AvDictionary = std::ptr::null_mut();
+
+        if config.thread_count > 0 {
+            let count_cstr =
+                CString::new(config.thread_count.to_string()).expect("thread_count ASCII");
+            unsafe {
+                (lib.av_dict_set)(&mut opts, c"threads".as_ptr(), count_cstr.as_ptr(), 0);
+            }
+        }
+        match config.thread_type {
+            ThreadType::Frame => unsafe {
+                (lib.av_dict_set)(&mut opts, c"thread_type".as_ptr(), c"frame".as_ptr(), 0);
+            },
+            ThreadType::Slice => unsafe {
+                (lib.av_dict_set)(&mut opts, c"thread_type".as_ptr(), c"slice".as_ptr(), 0);
+            },
+            ThreadType::Auto => {}
+        }
+        if config.skip_loop_filter {
+            unsafe {
+                (lib.av_dict_set)(
+                    &mut opts,
+                    c"skip_loop_filter".as_ptr(),
+                    c"noref".as_ptr(),
+                    0,
+                );
+            }
+        }
+
+        // SAFETY: avcodec_open2 usa o hw_device_ctx já configurado no contexto.
+        let ret = unsafe {
+            (lib.avcodec_open2)(
+                ctx,
+                codec,
+                &mut opts as *mut *mut AvDictionary as *mut *mut c_void,
+            )
+        };
+
+        if !opts.is_null() {
+            unsafe { (lib.av_dict_free)(&mut opts) };
+        }
+
+        if ret < 0 {
+            let mut p = ctx;
+            unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        tracing::debug!(codec_id, "decodificador FFmpeg aberto com D3D11VA");
         Ok(Self { ctx, lib })
     }
 
@@ -1144,6 +1336,112 @@ impl FfmpegFrame {
     pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.frame
     }
+
+    /// Retorna `true` se o frame contém uma surface de hardware D3D11VA
+    /// (`format == AV_PIX_FMT_D3D11`).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[inline]
+    pub(crate) fn is_hw(&self) -> bool {
+        // SAFETY: frame é não-nulo; frame_format lê offset 116 (int).
+        unsafe { frame_format(self.frame) == AV_PIX_FMT_D3D11 }
+    }
+
+    /// Extrai o ponteiro bruto `ID3D11Texture2D*` e metadados de um frame HW
+    /// **sem** chamar `av_hwframe_transfer_data` — zero cópia CPU.
+    ///
+    /// No D3D11VA o AVFrame armazena:
+    /// - `data[0]` → `ID3D11Texture2D*` (textura array, COM não AddRef'd)
+    /// - `data[1]` → índice de slice do array (cast de inteiro para ponteiro)
+    ///
+    /// O chamador é responsável por chamar `AddRef` na textura se precisar
+    /// armazená-la além do tempo de vida do `FfmpegFrame`.
+    ///
+    /// Retorna `Err` se o frame não for HW (`!is_hw()`).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn hw_frame_info(
+        &self,
+    ) -> Result<(*mut c_void, u32, u32, u32, i64, (u32, u32), i32, i32), crate::error::AvError>
+    {
+        if !self.is_hw() {
+            return Err(crate::error::AvError::FfmpegError { code: -22 });
+        }
+        // SAFETY: frame HW D3D11VA válido; data[0]/[1] preenchidos pelo decoder.
+        unsafe {
+            let tex_ptr = frame_data_ptr(self.frame, 0) as *mut c_void;
+            // data[1] é o índice do array armazenado como ponteiro (cast de usize).
+            let slice = frame_data_ptr(self.frame, 1) as usize as u32;
+            let width = frame_width(self.frame) as u32;
+            let height = frame_height(self.frame) as u32;
+            let pts = frame_pts(self.frame);
+            let raw_sar = frame_sar(self.frame);
+            let sar = if raw_sar.0 > 0 && raw_sar.1 > 0 {
+                (raw_sar.0 as u32, raw_sar.1 as u32)
+            } else {
+                (1u32, 1u32)
+            };
+            let colorspace = frame_colorspace(self.frame);
+            let color_range = frame_color_range(self.frame);
+            Ok((
+                tex_ptr,
+                slice,
+                width,
+                height,
+                pts,
+                sar,
+                colorspace,
+                color_range,
+            ))
+        }
+    }
+
+    /// Baixa um frame HW (D3D11VA, `AV_PIX_FMT_D3D11`) para CPU via
+    /// `av_hwframe_transfer_data` e extrai os planos YUV.
+    ///
+    /// Suporta formatos de saída `AV_PIX_FMT_NV12` (semi-planar, nativo D3D11VA)
+    /// e `AV_PIX_FMT_YUV420P` (planar, caso o driver suporte).
+    /// Para NV12, o plano UV interleaved é desinterlaceado em U/V separados.
+    ///
+    /// Retorna os mesmos campos que `to_yuv_planes()`, com `ten_bit = false`
+    /// (D3D11VA 8-bit não usa o caminho 10-bit via este método).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[allow(clippy::type_complexity)]
+    #[allow(dead_code)]
+    pub(crate) fn download_to_yuv_planes(
+        &self,
+    ) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {
+        // Aloca frame SW destino — av_hwframe_transfer_data aloca os buffers de
+        // dados automaticamente (não precisamos chamar av_frame_get_buffer).
+        // SAFETY: av_frame_alloc aloca com av_malloc e zera o struct.
+        let sw_frame = unsafe { (self.lib.av_frame_alloc)() };
+        if sw_frame.is_null() {
+            return Err(AvError::FfmpegError { code: -12 });
+        }
+
+        // Copia dados da surface D3D11 para memória do host.
+        // O formato do sw_frame é determinado pelo sw_format configurado no
+        // AVHWFramesContext interno do FFmpeg (normalmente NV12 para H.264/HEVC).
+        // SAFETY: self.frame é um frame HW válido retornado por avcodec_receive_frame.
+        let ret = unsafe { (self.lib.av_hwframe_transfer_data)(sw_frame, self.frame, 0) };
+        if ret < 0 {
+            let mut p = sw_frame;
+            unsafe { (self.lib.av_frame_free)(&mut p) };
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        // Extrai planos YUV do frame SW (NV12 ou YUV420P).
+        // SAFETY: av_hwframe_transfer_data preencheu sw_frame com dados válidos.
+        let result = unsafe { extract_sw_yuv_planes(sw_frame) };
+
+        // Libera o sw_frame (dados já copiados para Vec<u8>).
+        let mut p = sw_frame;
+        unsafe { (self.lib.av_frame_free)(&mut p) };
+
+        result
+    }
 }
 
 impl Drop for FfmpegFrame {
@@ -1151,6 +1449,134 @@ impl Drop for FfmpegFrame {
         // SAFETY: frame foi alocado por av_frame_alloc; é o único dono.
         unsafe { (self.lib.av_frame_free)(&mut self.frame) };
     }
+}
+
+// ─── Extração de planos YUV de frames SW ──────────────────────────────────────
+
+/// Extrai planos YUV de um `AVFrame*` SW (YUV420P ou NV12).
+///
+/// Para `AV_PIX_FMT_NV12`: desinterlaça o plano UV (UVUVUV…) em U e V separados.
+/// Para `AV_PIX_FMT_YUV420P`: copia diretamente os três planos planares.
+///
+/// SAFETY: `frame` deve ser um `AVFrame*` SW válido com buffers preenchidos.
+#[allow(clippy::type_complexity)]
+#[allow(dead_code)]
+unsafe fn extract_sw_yuv_planes(
+    frame: *mut c_void,
+) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {
+    let fmt = frame_format(frame);
+    let width = frame_width(frame);
+    let height = frame_height(frame);
+    let pts = frame_pts(frame);
+    let raw_sar = frame_sar(frame);
+    let raw_colorspace = frame_colorspace(frame);
+    let raw_color_range = frame_color_range(frame);
+
+    if width <= 0 || height <= 0 {
+        return Err(AvError::FfmpegError { code: -22 }); // EINVAL
+    }
+
+    let w = width as usize;
+    let h = height as usize;
+    let sar = if raw_sar.0 > 0 && raw_sar.1 > 0 {
+        (raw_sar.0 as u32, raw_sar.1 as u32)
+    } else {
+        (1u32, 1u32)
+    };
+
+    let planes = if fmt == AV_PIX_FMT_YUV420P {
+        extract_yuv420p_planes(frame, w, h)?
+    } else if fmt == AV_PIX_FMT_NV12 {
+        extract_nv12_planes(frame, w, h)?
+    } else {
+        tracing::warn!(fmt, "download_to_yuv_planes: formato SW inesperado");
+        return Err(AvError::FfmpegError { code: -22 });
+    };
+
+    Ok((
+        width as u32,
+        height as u32,
+        pts,
+        planes,
+        sar,
+        raw_colorspace,
+        raw_color_range,
+        false, // Fase B: apenas 8-bit via D3D11VA
+    ))
+}
+
+/// Extrai planos YUV420P planares de um `AVFrame*`.
+///
+/// SAFETY: `frame` deve ser um AVFrame* com dados YUV420P válidos.
+#[allow(dead_code)]
+unsafe fn extract_yuv420p_planes(
+    frame: *mut c_void,
+    w: usize,
+    h: usize,
+) -> Result<[Vec<u8>; 3], AvError> {
+    let w_uv = w / 2;
+    let h_uv = h / 2;
+    let ls_y = frame_linesize(frame, 0) as usize;
+    let ls_u = frame_linesize(frame, 1) as usize;
+    let ls_v = frame_linesize(frame, 2) as usize;
+
+    let mut y = vec![0u8; w * h];
+    let mut u = vec![0u8; w_uv * h_uv];
+    let mut v = vec![0u8; w_uv * h_uv];
+
+    for row in 0..h {
+        let src = frame_data_ptr(frame, 0).add(row * ls_y);
+        std::ptr::copy_nonoverlapping(src, y[row * w..].as_mut_ptr(), w);
+    }
+    for row in 0..h_uv {
+        let src_u = frame_data_ptr(frame, 1).add(row * ls_u);
+        let src_v = frame_data_ptr(frame, 2).add(row * ls_v);
+        std::ptr::copy_nonoverlapping(src_u, u[row * w_uv..].as_mut_ptr(), w_uv);
+        std::ptr::copy_nonoverlapping(src_v, v[row * w_uv..].as_mut_ptr(), w_uv);
+    }
+
+    Ok([y, u, v])
+}
+
+/// Extrai e desinterlaça planos NV12 (semi-planar UV) de um `AVFrame*`.
+///
+/// NV12: data[0] = Y planar, data[1] = UV interleaved (UVUV…).
+/// Converte para YUV420P planar separando U e V.
+///
+/// SAFETY: `frame` deve ser um AVFrame* com dados NV12 válidos.
+#[allow(dead_code)]
+unsafe fn extract_nv12_planes(
+    frame: *mut c_void,
+    w: usize,
+    h: usize,
+) -> Result<[Vec<u8>; 3], AvError> {
+    let w_uv = w / 2;
+    let h_uv = h / 2;
+    let ls_y = frame_linesize(frame, 0) as usize;
+    let ls_uv = frame_linesize(frame, 1) as usize;
+
+    let mut y = vec![0u8; w * h];
+    let mut u = vec![0u8; w_uv * h_uv];
+    let mut v = vec![0u8; w_uv * h_uv];
+
+    // Plano Y (igual a YUV420P)
+    for row in 0..h {
+        let src = frame_data_ptr(frame, 0).add(row * ls_y);
+        std::ptr::copy_nonoverlapping(src, y[row * w..].as_mut_ptr(), w);
+    }
+
+    // Desinterlaça UV: cada linha de UV tem w/2 pares UVUV…
+    for row in 0..h_uv {
+        let src_uv = frame_data_ptr(frame, 1).add(row * ls_uv);
+        let u_row = &mut u[row * w_uv..(row + 1) * w_uv];
+        let v_row = &mut v[row * w_uv..(row + 1) * w_uv];
+        for col in 0..w_uv {
+            u_row[col] = *src_uv.add(col * 2);
+            v_row[col] = *src_uv.add(col * 2 + 1);
+        }
+    }
+
+    Ok([y, u, v])
 }
 
 // ─── Utilitários de busca e carregamento ──────────────────────────────────────

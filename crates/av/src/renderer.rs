@@ -16,11 +16,13 @@ use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
 use egui_wgpu::CallbackTrait;
 
 use crate::error::AvError;
-use crate::video_queue::{YuvColorRange, YuvColorspace, YuvFrame};
+use crate::hw::D3d11Device;
+use crate::video_queue::{HwVideoFrame, YuvColorRange, YuvColorspace, YuvFrame};
 
 // ─── Constante: shader WGSL embutido ─────────────────────────────────────────
 
 const YUV_SHADER_SRC: &str = include_str!("yuv_to_rgb.wgsl");
+const NV12_SHADER_SRC: &str = include_str!("nv12_to_rgb.wgsl");
 
 // ─── Uniform GPU struct ───────────────────────────────────────────────────────
 
@@ -595,6 +597,403 @@ impl CpuRenderer {
     }
 }
 
+// ─── NV12 pipeline (Fase C zero-copy) ────────────────────────────────────────
+
+/// Dados de um frame NV12 prontos para upload à GPU.
+struct NvPendingFrame {
+    y_data: Vec<u8>,
+    uv_data: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// Espaço de cor para calcular a matriz YUV→RGB.
+    colorspace: YuvColorspace,
+    /// Color range para ajuste de range_scale.
+    color_range: YuvColorRange,
+}
+
+/// Estado interno do pipeline NV12.
+///
+/// Bindings:
+/// - 0: `tex_y`  (R8Unorm — luma)
+/// - 1: `tex_uv` (Rg8Unorm — croma UV interleaved)
+/// - 2: `samp`   (sampler linear)
+/// - 3: `params` (UBO 64 bytes — mesma `YuvParamsGpu`)
+///
+/// SPEC-AV-RENDER-NV12-001
+struct NvPipelineInner {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    uniform_buf: wgpu::Buffer,
+    tex_y: Option<wgpu::Texture>,
+    tex_uv: Option<wgpu::Texture>,
+    bind_group: Option<wgpu::BindGroup>,
+    dims: Option<(u32, u32)>,
+    pending: Option<NvPendingFrame>,
+}
+
+impl NvPipelineInner {
+    fn create(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Result<Self, AvError> {
+        let mut constants: HashMap<String, f64> = HashMap::new();
+        if target_format.is_srgb() {
+            constants.insert("DECODE_SRGB".to_string(), 1.0_f64);
+        }
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("nv12_to_rgb"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(NV12_SHADER_SRC)),
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("nv12_bgl"),
+            entries: &[
+                // binding 0 — tex_y (R8Unorm)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // binding 1 — tex_uv (Rg8Unorm)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // binding 2 — sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // binding 3 — UBO
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(64),
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("nv12_pipeline_layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+
+        let compilation_options = wgpu::PipelineCompilationOptions {
+            constants: &constants,
+            ..Default::default()
+        };
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("nv12_to_rgb_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+                compilation_options: compilation_options.clone(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options,
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("nv12_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("nv12_params_ubo"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Ok(Self {
+            pipeline,
+            bind_group_layout: bgl,
+            sampler,
+            uniform_buf,
+            tex_y: None,
+            tex_uv: None,
+            bind_group: None,
+            dims: None,
+            pending: None,
+        })
+    }
+
+    /// Faz upload dos planos NV12 para as texturas wgpu.
+    ///
+    /// SPEC-AV-RENDER-NV12-001
+    fn upload_pending(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let frame = match self.pending.take() {
+            Some(f) => f,
+            None => return,
+        };
+        if frame.width == 0 || frame.height == 0 {
+            return;
+        }
+        let w = frame.width;
+        let h = frame.height;
+        let uv_w = w.div_ceil(2);
+        let uv_h = h.div_ceil(2);
+
+        // Recria as texturas somente se as dimensões mudaram.
+        let need_new = self.dims != Some((w, h));
+        if need_new {
+            self.tex_y = Some(device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("nv12_y"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }));
+            self.tex_uv = Some(device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("nv12_uv"),
+                size: wgpu::Extent3d {
+                    width: uv_w,
+                    height: uv_h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rg8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }));
+            self.dims = Some((w, h));
+        }
+
+        let tex_y = match &self.tex_y {
+            Some(t) => t,
+            None => return,
+        };
+        let tex_uv = match &self.tex_uv {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Upload plano Y (R8Unorm — 1 byte/pixel).
+        queue.write_texture(
+            tex_y.as_image_copy(),
+            &frame.y_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(w),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Upload plano UV (Rg8Unorm — 2 bytes/pixel, U em R, V em G).
+        // Cada linha UV do NvPlanes tem `width` bytes (uv_w pares × 2 = w bytes).
+        queue.write_texture(
+            tex_uv.as_image_copy(),
+            &frame.uv_data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(w), // 2 canais × uv_w pixels = w bytes
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: uv_w,
+                height: uv_h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // Atualiza UBO com parâmetros YUV→RGB (reutiliza YuvParamsGpu).
+        let params = YuvParamsGpu::for_frame(frame.colorspace, frame.color_range);
+        queue.write_buffer(&self.uniform_buf, 0, &params.to_bytes());
+
+        // Reconstrói o bind group se as texturas foram recriadas.
+        if need_new || self.bind_group.is_none() {
+            let view_y = tex_y.create_view(&wgpu::TextureViewDescriptor::default());
+            let view_uv = tex_uv.create_view(&wgpu::TextureViewDescriptor::default());
+            self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("nv12_bind_group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view_y),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view_uv),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.uniform_buf.as_entire_binding(),
+                    },
+                ],
+            }));
+        }
+    }
+
+    fn paint(&self, info: &PaintCallbackInfo, render_pass: &mut wgpu::RenderPass<'static>) {
+        let bg = match &self.bind_group {
+            Some(bg) => bg,
+            None => return,
+        };
+        let viewport = info.viewport_in_pixels();
+        render_pass.set_viewport(
+            viewport.left_px as f32,
+            viewport.top_px as f32,
+            viewport.width_px as f32,
+            viewport.height_px as f32,
+            0.0,
+            1.0,
+        );
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, bg, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+
+    fn has_frame(&self) -> bool {
+        self.bind_group.is_some() || self.pending.is_some()
+    }
+}
+
+/// `egui_wgpu::CallbackTrait` para o pipeline NV12.
+///
+/// SPEC-AV-RENDER-NV12-001
+struct NvPaintCallback {
+    state: Arc<Mutex<NvPipelineInner>>,
+}
+
+impl CallbackTrait for NvPaintCallback {
+    fn prepare(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        _callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        if let Ok(mut inner) = self.state.lock() {
+            inner.upload_pending(device, queue);
+        }
+        Vec::new()
+    }
+
+    fn paint<'a>(
+        &'a self,
+        info: PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        _callback_resources: &'a egui_wgpu::CallbackResources,
+    ) {
+        if let Ok(inner) = self.state.lock() {
+            inner.paint(&info, render_pass);
+        }
+    }
+}
+
+/// Renderer HW NV12: extrai planos NV12 via staging D3D11 e renderiza no wgpu.
+///
+/// SPEC-AV-RENDER-NV12-001
+struct NvRenderer {
+    state: Arc<Mutex<NvPipelineInner>>,
+    d3d11_dev: Arc<D3d11Device>,
+}
+
+impl NvRenderer {
+    fn new(
+        device: &wgpu::Device,
+        d3d11_dev: Arc<D3d11Device>,
+        target_format: wgpu::TextureFormat,
+    ) -> Result<Self, AvError> {
+        let inner = NvPipelineInner::create(device, target_format)?;
+        Ok(Self {
+            state: Arc::new(Mutex::new(inner)),
+            d3d11_dev,
+        })
+    }
+
+    fn upload_hw(&self, hw: &HwVideoFrame) -> Result<(), AvError> {
+        let planes = self.d3d11_dev.extract_nv12_planes(&hw.tex)?;
+        let pending = NvPendingFrame {
+            y_data: planes.y_data,
+            uv_data: planes.uv_data,
+            width: planes.width,
+            height: planes.height,
+            colorspace: YuvColorspace::Bt709, // NV12 8-bit → BT.709 default
+            color_range: YuvColorRange::Limited,
+        };
+        if let Ok(mut inner) = self.state.lock() {
+            inner.pending = Some(pending);
+        }
+        Ok(())
+    }
+
+    fn paint_callback(&self, rect: egui::Rect) -> egui::PaintCallback {
+        egui_wgpu::Callback::new_paint_callback(
+            rect,
+            NvPaintCallback {
+                state: Arc::clone(&self.state),
+            },
+        )
+    }
+
+    fn has_frame(&self) -> bool {
+        self.state
+            .lock()
+            .map(|inner| inner.has_frame())
+            .unwrap_or(false)
+    }
+}
+
 // ─── Helpers YUV (CPU) ────────────────────────────────────────────────────────
 
 /// Converte YUV420P (8-bit ou 10-bit) para RGBA8 na CPU usando BT.709.
@@ -665,6 +1064,7 @@ fn clamp_u8(v: i32) -> u8 {
 
 enum RendererInner {
     Gpu(GpuRenderer),
+    HwGpu(NvRenderer),
     Cpu(CpuRenderer),
 }
 
@@ -695,6 +1095,74 @@ pub struct VideoRenderer {
 }
 
 impl VideoRenderer {
+    /// Cria um `VideoRenderer` em modo GPU HW NV12 zero-copy (Fase C D3D11VA).
+    ///
+    /// `device`       : dispositivo wgpu do `eframe::CreationContext::wgpu_render_state`.
+    /// `d3d11_dev`    : device D3D11 para staging copy NV12.
+    /// `target_format`: formato do framebuffer de saída.
+    ///
+    /// SPEC-AV-RENDER-NV12-001
+    pub fn new_hw_gpu(
+        device: Arc<wgpu::Device>,
+        d3d11_dev: Arc<D3d11Device>,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
+        match NvRenderer::new(&device, d3d11_dev, target_format) {
+            Ok(nv) => Self {
+                inner: RendererInner::HwGpu(nv),
+                upload_bytes_window: 0,
+                upload_window_start: std::time::Instant::now(),
+                upload_bytes_per_sec: 0,
+                last_colorspace: None,
+                last_color_range: None,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "VideoRenderer::new_hw_gpu falhou — recaindo para modo CPU"
+                );
+                let ctx = egui::Context::default();
+                Self {
+                    inner: RendererInner::Cpu(CpuRenderer { ctx, handle: None }),
+                    upload_bytes_window: 0,
+                    upload_window_start: std::time::Instant::now(),
+                    upload_bytes_per_sec: 0,
+                    last_colorspace: None,
+                    last_color_range: None,
+                }
+            }
+        }
+    }
+
+    /// Envia um `HwVideoFrame` (D3D11VA NV12) para renderização zero-copy.
+    ///
+    /// Extrai os planos NV12 via staging D3D11 e armazena pendente para upload
+    /// no `prepare()` do próximo frame egui.  Retorna erro se o renderer não
+    /// estiver no modo `HwGpu` ou se a extração D3D11 falhar.
+    ///
+    /// SPEC-AV-RENDER-NV12-001
+    pub fn upload_hw(&mut self, hw: &HwVideoFrame) -> Result<(), AvError> {
+        // Contabiliza bytes: w × h (Y) + w × h/2 (UV interleaved) = w × h × 3/2.
+        let frame_bytes =
+            hw.width as u64 * hw.height as u64 + hw.width as u64 * hw.height.div_ceil(2) as u64;
+        self.upload_bytes_window = self.upload_bytes_window.saturating_add(frame_bytes);
+
+        let elapsed = self.upload_window_start.elapsed();
+        if elapsed >= std::time::Duration::from_secs(1) {
+            let secs = elapsed.as_secs_f64().max(0.001);
+            self.upload_bytes_per_sec = (self.upload_bytes_window as f64 / secs) as u64;
+            self.upload_bytes_window = 0;
+            self.upload_window_start = std::time::Instant::now();
+        }
+
+        match &self.inner {
+            RendererInner::HwGpu(nv) => nv.upload_hw(hw),
+            _ => Err(AvError::HwInitFailed(
+                "upload_hw chamado em renderer não-HwGpu".into(),
+            )),
+        }
+    }
+
     /// Cria um `VideoRenderer` em modo GPU (wgpu/D3D11).
     ///
     /// `device`       : dispositivo wgpu do `eframe::CreationContext::wgpu_render_state`.
@@ -782,6 +1250,9 @@ impl VideoRenderer {
                 gpu.upload(frame);
                 Ok(())
             }
+            RendererInner::HwGpu(_) => Err(AvError::HwInitFailed(
+                "use upload_hw para frames HW (VideoFrame::Hw)".into(),
+            )),
             RendererInner::Cpu(cpu) => cpu.upload(frame),
         }
     }
@@ -824,6 +1295,7 @@ impl VideoRenderer {
     pub fn paint_callback(&self, rect: egui::Rect) -> Option<egui::PaintCallback> {
         match &self.inner {
             RendererInner::Gpu(gpu) => Some(gpu.paint_callback(rect)),
+            RendererInner::HwGpu(nv) => Some(nv.paint_callback(rect)),
             RendererInner::Cpu(_) => None,
         }
     }
@@ -836,7 +1308,7 @@ impl VideoRenderer {
     /// SPEC-AV-003c
     pub fn texture_id(&self) -> Option<TextureId> {
         match &self.inner {
-            RendererInner::Gpu(_) => None,
+            RendererInner::Gpu(_) | RendererInner::HwGpu(_) => None,
             RendererInner::Cpu(cpu) => cpu.texture_id(),
         }
     }
@@ -845,7 +1317,7 @@ impl VideoRenderer {
     ///
     /// SPEC-AV-003c
     pub fn is_gpu_mode(&self) -> bool {
-        matches!(&self.inner, RendererInner::Gpu(_))
+        matches!(&self.inner, RendererInner::Gpu(_) | RendererInner::HwGpu(_))
     }
 
     /// Retorna `true` se um frame já foi recebido.
@@ -854,6 +1326,7 @@ impl VideoRenderer {
     pub fn has_frame(&self) -> bool {
         match &self.inner {
             RendererInner::Gpu(gpu) => gpu.has_frame(),
+            RendererInner::HwGpu(nv) => nv.has_frame(),
             RendererInner::Cpu(cpu) => cpu.texture_id().is_some(),
         }
     }

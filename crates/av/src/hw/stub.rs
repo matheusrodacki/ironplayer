@@ -19,6 +19,16 @@ pub enum ColorSpace {
     Bt2020,
 }
 
+impl ColorSpace {
+    pub fn from_avutil(cs: i32) -> Self {
+        match cs {
+            5 | 6 => Self::Bt601,
+            9 => Self::Bt2020,
+            _ => Self::Bt709,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum TransferFunction {
@@ -47,6 +57,7 @@ impl std::fmt::Display for AdapterLuid {
 }
 
 /// Stub de `D3d11Device` para plataformas não-Windows.
+#[derive(Debug)]
 pub struct D3d11Device;
 
 impl D3d11Device {
@@ -67,13 +78,45 @@ impl D3d11Device {
     pub fn adapter_description(&self) -> &str {
         "stub"
     }
+    pub fn extract_nv12_planes(&self, _tex: &D3d11Texture) -> Result<NvPlanes, AvError> {
+        Err(AvError::HwInitFailed(
+            "D3D11 não suportado nesta plataforma".into(),
+        ))
+    }
+}
+
+/// Stub de planos NV12 extraídos via staging (plataformas não-Windows).
+pub struct NvPlanes {
+    pub y_data: Vec<u8>,
+    pub uv_data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Stub de `D3d11Texture` para plataformas não-Windows.
+#[derive(Debug)]
 pub struct D3d11Texture;
 
 impl D3d11Texture {
     pub fn into_wgpu(&self, _device: &wgpu::Device) -> Result<wgpu::Texture, AvError> {
+        Err(AvError::HwInitFailed(
+            "D3D11 não suportado nesta plataforma".into(),
+        ))
+    }
+
+    /// Stub: nunca é chamado em não-Windows (sem frames HW).
+    ///
+    /// SPEC-AV-HW-TEX-001
+    pub unsafe fn from_raw_addref(
+        _tex_ptr: *mut std::ffi::c_void,
+        _array_slice: u32,
+        _format: HwPixelFormat,
+        _width: u32,
+        _height: u32,
+        _color_space: ColorSpace,
+        _transfer: TransferFunction,
+        _full_range: bool,
+    ) -> Result<Self, AvError> {
         Err(AvError::HwInitFailed(
             "D3D11 não suportado nesta plataforma".into(),
         ))

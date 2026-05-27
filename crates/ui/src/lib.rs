@@ -23,7 +23,7 @@ use crate::panels::tables::TablesPanel;
 use crate::panels::video::VideoPanel;
 use crate::status_bar::StatusBar;
 use av::video_queue::{PopResult, VideoQueue};
-use av::{Clock, MasterClock, VideoRenderer, YuvFrame};
+use av::{Clock, MasterClock, VideoFrame, VideoRenderer};
 
 // ---------------------------------------------------------------------------
 // IronPlayerApp
@@ -65,7 +65,7 @@ pub struct IronPlayerApp {
     /// Receptor de frames de vídeo decodificados (FfmpegDecoder → UI).
     ///
     /// SPEC-AV-003
-    video_frames_rx: Option<Receiver<YuvFrame>>,
+    video_frames_rx: Option<Receiver<VideoFrame>>,
     /// Fila de frames de vídeo ordenada por PTS com políticas drop/hold/resync.
     ///
     /// Substitui o pipeline best-effort de drenagem simples.
@@ -120,7 +120,7 @@ impl IronPlayerApp {
     /// `snapshot_rx`: receptor de métricas do pipeline; `None` quando o
     /// pipeline ainda não foi iniciado (modo stand-alone / testes).
     ///
-    /// `video_frames_rx`: receptor de `YuvFrame` decodificados; `None` em
+    /// `video_frames_rx`: receptor de `VideoFrame` decodificados; `None` em
     /// modo stand-alone. Quando `Some`, o renderer é inicializado em modo GPU
     /// (D3D11 via wgpu) se disponível, ou modo CPU como fallback.
     ///
@@ -134,7 +134,7 @@ impl IronPlayerApp {
         audio_status_rx: Option<Arc<RwLock<AudioStatusSnapshot>>>,
         selected_service_rx: Option<Arc<RwLock<Option<u16>>>>,
         table_events_rx: Option<Receiver<TableEvent>>,
-        video_frames_rx: Option<Receiver<YuvFrame>>,
+        video_frames_rx: Option<Receiver<VideoFrame>>,
     ) -> Self {
         // Inicializa VideoRenderer em modo GPU (D3D11) quando wgpu disponível,
         // ou em modo CPU como fallback. SPEC-AV-003 · SPEC-AV-003c
@@ -341,7 +341,7 @@ impl IronPlayerApp {
             // Fallback: ancora o WallClock no PTS do primeiro frame caso ainda
             // não tenhamos AudioClock disponível.
             if !self.video_clock_initialized {
-                if let Some(pts) = frame.pts {
+                if let Some(pts) = frame.pts() {
                     self.video_clock.reset(pts as i64);
                     self.video_clock_initialized = true;
                 }
@@ -364,7 +364,11 @@ impl IronPlayerApp {
         // 3. Faz upload do frame ao renderer.
         if let Some(frame) = ready_frame {
             if let Some(renderer) = &mut self.video_renderer {
-                match renderer.upload(&frame) {
+                let upload_result = match &frame {
+                    VideoFrame::Sw(yuv) => renderer.upload(yuv),
+                    VideoFrame::Hw(hw) => renderer.upload_hw(hw),
+                };
+                match upload_result {
                     Ok(()) => {
                         // Atualiza métricas de GPU upload, colorspace e color_range.
                         // SPEC-METRICS-PIPELINE-001
@@ -380,13 +384,14 @@ impl IronPlayerApp {
                         // DAR = SAR * (w/h); mantemos w fixo e ajustamos h:
                         //   display_h = pixel_h * sar_den / sar_num
                         // Para 1920×540 com SAR 1:2 → display_h = 540*2/1 = 1080 → 16:9
-                        let display_h = if frame.sar_num > 1 || frame.sar_den > 1 {
-                            let h64 = frame.height as u64 * frame.sar_den as u64;
-                            (h64 / frame.sar_num.max(1) as u64) as u32
+                        let (sar_num, sar_den) = (frame.sar_num(), frame.sar_den());
+                        let display_h = if sar_num > 1 || sar_den > 1 {
+                            let h64 = frame.height() as u64 * sar_den as u64;
+                            (h64 / sar_num.max(1) as u64) as u32
                         } else {
-                            frame.height
+                            frame.height()
                         };
-                        self.video_dims = Some((frame.width, display_h.max(1)));
+                        self.video_dims = Some((frame.width(), display_h.max(1)));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "poll_video_frames: falha no upload do frame");

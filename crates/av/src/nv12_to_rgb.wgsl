@@ -132,7 +132,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let col1 = params.col1.xyz;
     let col2 = params.col2.xyz;
     var rgb = mat3x3<f32>(col0, col1, col2) * yuv;
-    rgb = decode_transfer(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), transfer);
+    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Só converte SDR para linear quando o framebuffer é sRGB. Em targets
+    // UNORM, escrever linear escurece a imagem; o swapchain espera RGB já
+    // codificado para display.
+    if DECODE_SRGB > 0.5 || hdr_clip > 0.5 {
+        rgb = decode_transfer(rgb, transfer);
+    }
 
     if hdr_clip > 0.5 || DECODE_SRGB > 0.5 {
         rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));

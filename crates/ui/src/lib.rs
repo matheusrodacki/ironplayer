@@ -237,8 +237,10 @@ impl IronPlayerApp {
             now,
         );
 
-        // Atualiza o snapshot de métricas.
+        // Atualiza o snapshot de métricas preservando campos preenchidos pela UI.
+        let pipeline = self.state.metrics.pipeline.clone();
         self.state.metrics = snapshot;
+        self.state.metrics.pipeline = pipeline;
 
         // Atualiza o estado de conexão a partir do command handler.
         if let Some(conn_rx) = &self.connection_rx {
@@ -391,6 +393,18 @@ impl IronPlayerApp {
                         }
                         if let Some(cr) = renderer.current_color_range_label() {
                             self.state.metrics.pipeline.color_range = Some(cr.to_string());
+                        }
+                        if let Some(shared) = &self.pipeline_metrics_rx {
+                            if let Ok(mut metrics) = shared.write() {
+                                metrics.gpu_upload_bytes_per_sec =
+                                    renderer.gpu_upload_bytes_per_sec();
+                                if let Some(cs) = renderer.current_colorspace_label() {
+                                    metrics.colorspace = Some(cs.to_string());
+                                }
+                                if let Some(cr) = renderer.current_color_range_label() {
+                                    metrics.color_range = Some(cr.to_string());
+                                }
+                            }
                         }
                         // Aplica o SAR para calcular as dimensões de exibição corretas.
                         // DAR = SAR * (w/h); mantemos w fixo e ajustamos h:

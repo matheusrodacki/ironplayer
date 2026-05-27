@@ -545,6 +545,7 @@ impl FfmpegDecoder {
         // Flag para acionar fallback SW após sair do loop (evita borrow duplo
         // de `self` dentro do loop onde `state` já emprestou `self.states`).
         let mut hw_download_failed = false;
+        let mut hw_interlaced_requires_sw = false;
         let mut hw_frames_ok: usize = 0;
 
         'decode_loop: loop {
@@ -554,6 +555,19 @@ impl FfmpegDecoder {
                     let decoded = if state.is_video {
                         // ── Caminho HW: frame D3D11VA — zero-copy NV12 ────────
                         if state.frame.is_hw() {
+                            let is_interlaced = unsafe {
+                                frame_flags(state.frame.as_ptr()) & AV_FRAME_FLAG_INTERLACED != 0
+                            };
+                            if is_interlaced {
+                                tracing::warn!(
+                                    pid = pid_raw,
+                                    "frame HW interlaced detectado — reabrindo decoder em SW para bwdif"
+                                );
+                                state.frame.unref();
+                                hw_interlaced_requires_sw = true;
+                                break 'decode_loop;
+                            }
+
                             // Cancela o deadline de init — recebemos o primeiro frame HW.
                             state.hw_init_deadline = None;
 
@@ -733,6 +747,11 @@ impl FfmpegDecoder {
         // SPEC-AV-HW-DEC-001
         if hw_frames_ok > 0 {
             self.record_hw_success();
+        }
+        if hw_interlaced_requires_sw {
+            self.fallback_to_sw("frame HW interlaced requer bwdif SW");
+            self.states.remove(&pid_raw);
+            return Ok(frames);
         }
         if hw_download_failed && self.record_hw_failure() {
             tracing::warn!(

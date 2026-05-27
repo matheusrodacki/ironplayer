@@ -242,6 +242,14 @@ impl IronPlayerApp {
         self.metrics_panel.set_hwaccel_choice(choice);
     }
 
+    /// Fecha o canal de comandos para permitir shutdown em cascata do backend.
+    ///
+    /// SPEC-UI-001
+    pub fn close_command_channel(&mut self) {
+        let (replacement_tx, _replacement_rx) = crossbeam_channel::bounded(0);
+        self.cmd_tx = replacement_tx;
+    }
+
     /// Retorna uma referência imutável ao estado atual da UI.
     pub fn state(&self) -> &AppState {
         &self.state

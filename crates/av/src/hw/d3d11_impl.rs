@@ -14,7 +14,7 @@ use windows::{
         Direct3D11::{
             D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
             D3D11_BIND_FLAG, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_RESOURCE_MISC_FLAG, D3D11_SDK_VERSION,
+            D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_RESOURCE_MISC_FLAG, D3D11_SDK_VERSION,
             D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
         },
         Dxgi::{
@@ -401,7 +401,9 @@ impl D3d11Texture {
         full_range: bool,
     ) -> Result<Self, AvError> {
         if tex_ptr.is_null() {
-            return Err(AvError::HwInitFailed("ponteiro de textura HW é nulo".into()));
+            return Err(AvError::HwInitFailed(
+                "ponteiro de textura HW é nulo".into(),
+            ));
         }
         // ManuallyDrop evita o Release automático do temporário criado por from_raw;
         // em seguida clone() chama AddRef e retorna nossa referência própria.
@@ -504,7 +506,11 @@ impl D3d11Device {
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: if is_p010 { DXGI_FORMAT_P010 } else { DXGI_FORMAT_NV12 },
+            Format: if is_p010 {
+                DXGI_FORMAT_P010
+            } else {
+                DXGI_FORMAT_NV12
+            },
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -520,8 +526,8 @@ impl D3d11Device {
                 .CreateTexture2D(&staging_desc, None, Some(&mut staging_opt))
                 .map_err(|e| map_d3d11_error("CreateTexture2D staging", e))?;
         }
-        let staging = staging_opt
-            .ok_or_else(|| AvError::HwInitFailed("staging texture nula".into()))?;
+        let staging =
+            staging_opt.ok_or_else(|| AvError::HwInitFailed("staging texture nula".into()))?;
 
         // ── 3. Copia Y e UV do array slice para o staging ──────────────────────
         let staging_res: ID3D11Resource = staging
@@ -534,8 +540,16 @@ impl D3d11Device {
 
         unsafe {
             // Subresource Y do array: slice_index × MipLevels (=1) + mip_level (=0)
-            self.context
-                .CopySubresourceRegion(&staging_res, 0, 0, 0, 0, &src_res, tex.array_slice, None);
+            self.context.CopySubresourceRegion(
+                &staging_res,
+                0,
+                0,
+                0,
+                0,
+                &src_res,
+                tex.array_slice,
+                None,
+            );
             // Subresource UV do array: array_size + slice_index
             self.context.CopySubresourceRegion(
                 &staging_res,

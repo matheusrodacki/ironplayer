@@ -144,6 +144,7 @@ impl eframe::App for IronPlayerAppWithPipeline {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.inner.close_command_channel();
         self.guard.shutdown();
     }
 }
@@ -990,7 +991,7 @@ fn main() -> eframe::Result<()> {
             timeout_ms: cfg.network.timeout_ms,
         };
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("cmd-handler".into())
             .spawn(move || {
                 for cmd in cmd_rx.iter() {
@@ -1160,6 +1161,7 @@ fn main() -> eframe::Result<()> {
                 }
             })
             .expect("falha ao criar thread cmd-handler");
+        handles.push(handle);
     }
 
     // Usa PowerPreference::HighPerformance para que wgpu e D3D11 selecionem

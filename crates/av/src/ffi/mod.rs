@@ -65,7 +65,7 @@ pub const AV_CODEC_ID_AAC_LATM: u32 = 0x15031;
 
 /// Formatos de pixel YUV planar suportados pelo decoder.
 pub const AV_PIX_FMT_YUV420P: c_int = 0;
-pub const AV_PIX_FMT_YUV420P10LE: c_int = 63;
+pub const AV_PIX_FMT_YUV420P10LE: c_int = 62;
 
 /// Formatos de sample de áudio.
 pub const AV_SAMPLE_FMT_FLT: c_int = 3;
@@ -88,7 +88,7 @@ pub const AV_PIX_FMT_NV12: c_int = 23;
 
 /// `AV_PIX_FMT_D3D11` — frame em textura D3D11 (hardware surface).
 /// Retornado por `avcodec_receive_frame` quando D3D11VA está ativo.
-pub const AV_PIX_FMT_D3D11: c_int = 224;
+pub const AV_PIX_FMT_D3D11: c_int = 171;
 
 /// `AV_HWDEVICE_TYPE_D3D11VA` — identificador do tipo de device hardware D3D11VA.
 pub const AV_HWDEVICE_TYPE_D3D11VA: c_int = 7;
@@ -330,6 +330,7 @@ pub(crate) unsafe fn frame_colorspace(frame: *mut c_void) -> i32 {
 ///
 /// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
 #[inline]
+#[allow(dead_code)]
 pub(crate) unsafe fn frame_color_trc(frame: *mut c_void) -> i32 {
     *((frame as *const u8).add(288) as *const i32)
 }
@@ -1372,6 +1373,7 @@ impl FfmpegFrame {
     ///
     /// SPEC-AV-HW-DEC-001
     #[allow(clippy::type_complexity)]
+    #[allow(dead_code)]
     pub(crate) fn hw_frame_info(
         &self,
     ) -> Result<(*mut c_void, u32, u32, u32, i64, (u32, u32), i32, i32, i32), crate::error::AvError>
@@ -1447,7 +1449,7 @@ impl FfmpegFrame {
 
         // Extrai planos YUV do frame SW (NV12 ou YUV420P).
         // SAFETY: av_hwframe_transfer_data preencheu sw_frame com dados válidos.
-        let result = unsafe { extract_sw_yuv_planes(sw_frame) };
+        let result = unsafe { extract_sw_yuv_planes(sw_frame, self.frame) };
 
         // Libera o sw_frame (dados já copiados para Vec<u8>).
         let mut p = sw_frame;
@@ -1476,14 +1478,29 @@ impl Drop for FfmpegFrame {
 #[allow(dead_code)]
 unsafe fn extract_sw_yuv_planes(
     frame: *mut c_void,
+    props_frame: *mut c_void,
 ) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {
     let fmt = frame_format(frame);
-    let width = frame_width(frame);
-    let height = frame_height(frame);
-    let pts = frame_pts(frame);
-    let raw_sar = frame_sar(frame);
-    let raw_colorspace = frame_colorspace(frame);
-    let raw_color_range = frame_color_range(frame);
+    let width = {
+        let transferred = frame_width(frame);
+        if transferred > 0 {
+            transferred
+        } else {
+            frame_width(props_frame)
+        }
+    };
+    let height = {
+        let transferred = frame_height(frame);
+        if transferred > 0 {
+            transferred
+        } else {
+            frame_height(props_frame)
+        }
+    };
+    let pts = frame_pts(props_frame);
+    let raw_sar = frame_sar(props_frame);
+    let raw_colorspace = frame_colorspace(props_frame);
+    let raw_color_range = frame_color_range(props_frame);
 
     if width <= 0 || height <= 0 {
         return Err(AvError::FfmpegError { code: -22 }); // EINVAL
@@ -1497,10 +1514,12 @@ unsafe fn extract_sw_yuv_planes(
         (1u32, 1u32)
     };
 
-    let planes = if fmt == AV_PIX_FMT_YUV420P {
-        extract_yuv420p_planes(frame, w, h)?
+    let (planes, ten_bit) = if fmt == AV_PIX_FMT_YUV420P {
+        (extract_yuv420p_planes(frame, w, h, 1)?, false)
+    } else if fmt == AV_PIX_FMT_YUV420P10LE {
+        (extract_yuv420p_planes(frame, w, h, 2)?, true)
     } else if fmt == AV_PIX_FMT_NV12 {
-        extract_nv12_planes(frame, w, h)?
+        (extract_nv12_planes(frame, w, h)?, false)
     } else {
         tracing::warn!(fmt, "download_to_yuv_planes: formato SW inesperado");
         return Err(AvError::FfmpegError { code: -22 });
@@ -1514,7 +1533,7 @@ unsafe fn extract_sw_yuv_planes(
         sar,
         raw_colorspace,
         raw_color_range,
-        false, // Fase B: apenas 8-bit via D3D11VA
+        ten_bit,
     ))
 }
 
@@ -1526,6 +1545,7 @@ unsafe fn extract_yuv420p_planes(
     frame: *mut c_void,
     w: usize,
     h: usize,
+    bytes_per_sample: usize,
 ) -> Result<[Vec<u8>; 3], AvError> {
     let w_uv = w / 2;
     let h_uv = h / 2;
@@ -1533,19 +1553,21 @@ unsafe fn extract_yuv420p_planes(
     let ls_u = frame_linesize(frame, 1) as usize;
     let ls_v = frame_linesize(frame, 2) as usize;
 
-    let mut y = vec![0u8; w * h];
-    let mut u = vec![0u8; w_uv * h_uv];
-    let mut v = vec![0u8; w_uv * h_uv];
+    let row_y = w * bytes_per_sample;
+    let row_uv = w_uv * bytes_per_sample;
+    let mut y = vec![0u8; row_y * h];
+    let mut u = vec![0u8; row_uv * h_uv];
+    let mut v = vec![0u8; row_uv * h_uv];
 
     for row in 0..h {
         let src = frame_data_ptr(frame, 0).add(row * ls_y);
-        std::ptr::copy_nonoverlapping(src, y[row * w..].as_mut_ptr(), w);
+        std::ptr::copy_nonoverlapping(src, y[row * row_y..].as_mut_ptr(), row_y);
     }
     for row in 0..h_uv {
         let src_u = frame_data_ptr(frame, 1).add(row * ls_u);
         let src_v = frame_data_ptr(frame, 2).add(row * ls_v);
-        std::ptr::copy_nonoverlapping(src_u, u[row * w_uv..].as_mut_ptr(), w_uv);
-        std::ptr::copy_nonoverlapping(src_v, v[row * w_uv..].as_mut_ptr(), w_uv);
+        std::ptr::copy_nonoverlapping(src_u, u[row * row_uv..].as_mut_ptr(), row_uv);
+        std::ptr::copy_nonoverlapping(src_v, v[row * row_uv..].as_mut_ptr(), row_uv);
     }
 
     Ok([y, u, v])

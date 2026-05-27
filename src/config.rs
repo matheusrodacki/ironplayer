@@ -72,6 +72,29 @@ impl HwAccelChoice {
     }
 }
 
+// Conversões com a variante UI (sem dependência de serde/TOML).
+//
+// SPEC-CFG-HW-001
+impl From<ui::HwAccelChoice> for HwAccelChoice {
+    fn from(value: ui::HwAccelChoice) -> Self {
+        match value {
+            ui::HwAccelChoice::Auto => Self::Auto,
+            ui::HwAccelChoice::D3d11va => Self::D3d11va,
+            ui::HwAccelChoice::None => Self::None,
+        }
+    }
+}
+
+impl From<HwAccelChoice> for ui::HwAccelChoice {
+    fn from(value: HwAccelChoice) -> Self {
+        match value {
+            HwAccelChoice::Auto => Self::Auto,
+            HwAccelChoice::D3d11va => Self::D3d11va,
+            HwAccelChoice::None => Self::None,
+        }
+    }
+}
+
 /// Configurações do player.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]

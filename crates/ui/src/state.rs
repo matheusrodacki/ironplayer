@@ -344,6 +344,43 @@ pub enum AppCommand {
     ResetErrors,
     /// Alterna entre tema escuro e claro.
     ChangeTheme { dark: bool },
+    /// Solicita ao backend que troque o modo de aceleração de hardware do
+    /// decoder de vídeo em runtime.
+    ///
+    /// SPEC-CFG-HW-001
+    SetHwAccel { choice: HwAccelChoice },
+}
+
+// ---------------------------------------------------------------------------
+// HwAccelChoice — seleção de hwaccel acessível pela UI
+// ---------------------------------------------------------------------------
+
+/// Seleção de hardware acceleration exposta para a UI (sem dependência de
+/// `serde`/TOML).  Espelha as três opções aceitas pelo CLI e pelo
+/// `ironstream.toml`; o binário converte para a sua própria
+/// `config::HwAccelChoice` antes de aplicar no decoder.
+///
+/// SPEC-CFG-HW-001
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HwAccelChoice {
+    /// Tenta D3D11VA quando o sistema suporta; cai em CPU caso contrário.
+    #[default]
+    Auto,
+    /// Força D3D11VA; se não disponível, fica em CPU mas registra fallback.
+    D3d11va,
+    /// Desativa qualquer hwaccel; decode 100 % CPU.
+    None,
+}
+
+impl HwAccelChoice {
+    /// Identificador estável para logs e telemetria.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::D3d11va => "d3d11va",
+            Self::None => "none",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +402,31 @@ mod tests {
         assert!(state.selected_service.is_none());
         assert!(state.bitrate_history.is_empty());
         assert!(state.pcr_history.is_empty());
+    }
+
+    /// `HwAccelChoice` expõe labels estáveis e default = Auto.
+    ///
+    /// SPEC-CFG-HW-001
+    #[test]
+    fn spec_cfg_hw_001_hwaccel_choice_labels() {
+        assert_eq!(HwAccelChoice::default(), HwAccelChoice::Auto);
+        assert_eq!(HwAccelChoice::Auto.label(), "auto");
+        assert_eq!(HwAccelChoice::D3d11va.label(), "d3d11va");
+        assert_eq!(HwAccelChoice::None.label(), "none");
+    }
+
+    /// `AppCommand::SetHwAccel` carrega o choice transportando-o intacto.
+    ///
+    /// SPEC-CFG-HW-001
+    #[test]
+    fn spec_cfg_hw_001_set_hwaccel_command_payload() {
+        let cmd = AppCommand::SetHwAccel { choice: HwAccelChoice::D3d11va };
+        match cmd {
+            AppCommand::SetHwAccel { choice } => {
+                assert_eq!(choice, HwAccelChoice::D3d11va);
+            }
+            _ => panic!("variante incorreta"),
+        }
     }
 
     #[test]

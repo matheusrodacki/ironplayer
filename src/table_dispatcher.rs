@@ -53,6 +53,12 @@ pub enum PesCommand {
 pub enum DecodeCommand {
     /// Reinicia todos os contextos de decodificação (ao trocar de serviço).
     Reset,
+    /// Aplica um novo modo de aceleração de hardware no decoder.
+    ///
+    /// SPEC-CFG-HW-001
+    SetHwAccel {
+        choice: crate::config::HwAccelChoice,
+    },
 }
 
 /// SPEC-TABLE

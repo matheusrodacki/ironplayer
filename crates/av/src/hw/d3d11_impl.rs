@@ -10,7 +10,7 @@ use tracing::{debug, info};
 use windows::{
     core::Interface,
     Win32::Graphics::{
-        Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+        Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
         Direct3D11::{
             D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
@@ -142,7 +142,9 @@ impl D3d11Device {
         unsafe {
             D3D11CreateDevice(
                 Some(&adapter),
-                D3D_DRIVER_TYPE_HARDWARE,
+                // Microsoft requer DRIVER_TYPE_UNKNOWN quando o adapter é
+                // passado explicitamente; HARDWARE+adapter causa E_INVALIDARG.
+                D3D_DRIVER_TYPE_UNKNOWN,
                 None, // software rasterizer module (não usado com adapter explícito)
                 flags,
                 None, // feature levels (usa default D3D11_0+)

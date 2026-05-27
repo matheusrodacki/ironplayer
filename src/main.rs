@@ -67,8 +67,6 @@ impl CliArgs {
     }
 }
 
-
-
 /// Mantém os senders do pipeline vivos até o shutdown limpo.
 ///
 /// Enquanto este guard existir, os canais permanecem abertos.  Ao ser dropado
@@ -277,10 +275,7 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    tracing::info!(
-        hwaccel = cfg.player.hwaccel.label(),
-        "IronPlayer iniciado"
-    );
+    tracing::info!(hwaccel = cfg.player.hwaccel.label(), "IronPlayer iniciado");
 
     // 4. Cria todos os canais bounded do pipeline
     let ch = channels::AppChannels::create();
@@ -612,6 +607,33 @@ fn main() -> eframe::Result<()> {
                                     tracing::info!(
                                         "av-decode: contextos resetados (troca de serviço)"
                                     );
+                                }
+                                DecodeCommand::SetHwAccel { choice } => {
+                                    // Aplica modo de hwaccel no decoder.  Em
+                                    // Sprint 2 (escopo CI-testável), apenas a
+                                    // transição para `Off` é totalmente
+                                    // suportada em runtime; promoções para
+                                    // D3D11VA exigem reabertura do stream
+                                    // (o `Arc<D3d11Device>` só existe após o
+                                    // bootstrap, fora do escopo desta thread).
+                                    //
+                                    // SPEC-CFG-HW-001
+                                    match choice {
+                                        config::HwAccelChoice::None => {
+                                            let _ = decoder.enable_hwaccel(av::HwAccelMode::Off);
+                                            tracing::info!(
+                                                hwaccel = choice.label(),
+                                                "av-decode: hwaccel desativado em runtime"
+                                            );
+                                        }
+                                        config::HwAccelChoice::Auto
+                                        | config::HwAccelChoice::D3d11va => {
+                                            tracing::info!(
+                                                hwaccel = choice.label(),
+                                                "av-decode: ativação de hwaccel adiada até a próxima reabertura de stream"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1025,6 +1047,28 @@ fn main() -> eframe::Result<()> {
                             *selected_audio_pid.write().unwrap() = Some(pid);
                             tracing::info!(service_id, pid, "trilha de áudio selecionada pelo usuário");
                         }
+                        ui::AppCommand::SetHwAccel { choice } => {
+                            // SPEC-CFG-HW-001: traduz a escolha UI para a variante
+                            // de `config` (que o decoder/bootstrap entendem) e
+                            // propaga para a thread `av-decode`.  Em Sprint 2 a
+                            // troca efetiva só ocorre na próxima reinit do
+                            // decoder; aqui apenas registramos.
+                            let cfg_choice: config::HwAccelChoice = choice.into();
+                            if decode_cmd_tx
+                                .try_send(DecodeCommand::SetHwAccel { choice: cfg_choice })
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    hwaccel = cfg_choice.label(),
+                                    "cmd-handler: canal decode_cmd cheio; SetHwAccel descartado"
+                                );
+                            } else {
+                                tracing::info!(
+                                    hwaccel = cfg_choice.label(),
+                                    "cmd-handler: SetHwAccel enviado ao decoder"
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1056,6 +1100,10 @@ fn main() -> eframe::Result<()> {
                     hwaccel_choice = cfg.player.hwaccel.label(),
                     "hw: D3d11Device bootstrap OK (Fase A)"
                 );
+                // SPEC-METRICS-HW-001: publica nome/LUID do adapter na telemetria.
+                if let Ok(mut m) = pipeline_metrics_shared.write() {
+                    av::AdapterInfo::from_device(&dev).apply_to_metrics(&mut m);
+                }
                 Some(dev)
             }
             Err(e) => {
@@ -1068,9 +1116,7 @@ fn main() -> eframe::Result<()> {
             }
         }
     } else {
-        tracing::info!(
-            "hw: --hwaccel=none — bootstrap D3D11 ignorado; decode 100% CPU"
-        );
+        tracing::info!("hw: --hwaccel=none — bootstrap D3D11 ignorado; decode 100% CPU");
         None
     };
     #[cfg(not(windows))]

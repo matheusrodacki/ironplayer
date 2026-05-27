@@ -1161,6 +1161,10 @@ impl Drop for FfmpegFrame {
 /// 1. Variável de ambiente `FFMPEG_DLL_DIR`
 /// 2. `{exe_dir}/ffmpeg/`
 /// 3. `{exe_dir}/`
+/// 4. `{cwd}/ffmpeg/` e `{cwd}/` (útil em `cargo run` a partir da raiz do
+///    workspace, onde o DLL bundle vive em `ffmpeg/` ao lado de `Cargo.toml`)
+/// 5. Ancestrais de `exe_dir` contendo subpasta `ffmpeg/` com `DLL_AVCODEC`
+///    (cobre `target/debug` → workspace root)
 ///
 /// SPEC-AV-002b
 pub fn find_ffmpeg_dll_dir() -> Option<std::path::PathBuf> {
@@ -1183,6 +1187,27 @@ pub fn find_ffmpeg_dll_dir() -> Option<std::path::PathBuf> {
             if exe_dir.join(DLL_AVCODEC).exists() {
                 return Some(exe_dir.to_path_buf());
             }
+
+            // 5. Ancestrais do exe_dir (cobre target/debug/<bin>.exe →
+            // <workspace>/ffmpeg/).  Limite de 5 níveis para evitar varredura
+            // patológica em layouts inesperados.
+            for ancestor in exe_dir.ancestors().take(5) {
+                let sub = ancestor.join("ffmpeg");
+                if sub.join(DLL_AVCODEC).exists() {
+                    return Some(sub);
+                }
+            }
+        }
+    }
+
+    // 4. Diretório de trabalho corrente
+    if let Ok(cwd) = std::env::current_dir() {
+        let sub = cwd.join("ffmpeg");
+        if sub.join(DLL_AVCODEC).exists() {
+            return Some(sub);
+        }
+        if cwd.join(DLL_AVCODEC).exists() {
+            return Some(cwd);
         }
     }
 

@@ -36,8 +36,9 @@ pub use codec::{AudioCodec, CodecConfig, MediaCodec, ThreadType, VideoCodec};
 pub use decoder::{DecodedFrame, FfmpegDecoder};
 pub use error::AvError;
 pub use hw::{
-    AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwAccelMode, HwAccelState, HwPixelFormat,
-    TransferFunction,
+    AdapterInfo, AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwAccelMode, HwAccelState,
+    HwPixelFormat, TdrState, TransferFunction, HW_FALLBACK_THRESHOLD, TDR_MAX_ATTEMPTS,
+    TDR_RETRY_COOLDOWN,
 };
 pub use pes::{PesAssembler, PesPacket};
 pub use renderer::VideoRenderer;

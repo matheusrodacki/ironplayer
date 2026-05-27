@@ -8,7 +8,8 @@ pub mod status_bar;
 
 pub use state::{
     AppCommand, AppState, AspectRatioMode, AudioErrorSnapshot, AudioOperationalState,
-    AudioStatusSnapshot, AudioTrackInfo, ConnectionState, TableEvent, TablesSnapshot,
+    AudioStatusSnapshot, AudioTrackInfo, ConnectionState, HwAccelChoice, TableEvent,
+    TablesSnapshot,
 };
 
 use std::sync::{Arc, RwLock};

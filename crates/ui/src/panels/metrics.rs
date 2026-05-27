@@ -8,7 +8,7 @@ use crossbeam_channel::Sender;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
-use crate::state::{AppState, AudioOperationalState};
+use crate::state::{AppState, AudioOperationalState, HwAccelChoice};
 use crate::AppCommand;
 
 // ---------------------------------------------------------------------------
@@ -40,6 +40,10 @@ pub struct MetricsPanel {
     seen_jitter: usize,
     /// Número de eventos de descontinuidade PCR já absorvidos do snapshot atual.
     seen_discontinuity: usize,
+    /// Seleção corrente de hwaccel no painel "Debug A/V" (espelha o backend).
+    ///
+    /// SPEC-CFG-HW-001
+    hwaccel_choice: HwAccelChoice,
 }
 
 impl MetricsPanel {
@@ -82,6 +86,10 @@ impl MetricsPanel {
 
         // ── Pipeline de decodificação ──────────────────────────────────────
         self.show_pipeline_panel(ui, state);
+        ui.add_space(6.0);
+
+        // ── Debug A/V (hwaccel) ────────────────────────────────────────────
+        self.show_debug_av_panel(ui, state, cmd_tx);
         ui.add_space(6.0);
 
         // ── Log de erros ───────────────────────────────────────────────────
@@ -145,6 +153,85 @@ impl MetricsPanel {
                     ui.end_row();
                 }
             });
+    }
+
+    // -----------------------------------------------------------------------
+    // Painel Debug A/V — SPEC-METRICS-HW-001 · SPEC-CFG-HW-001
+    // -----------------------------------------------------------------------
+
+    /// Exibe o painel "Debug A/V": estado da aceleração de hardware do decoder
+    /// (D3D11VA), adapter GPU em uso, contadores TDR e seletor runtime de
+    /// hwaccel (Auto / D3D11VA / Off).
+    ///
+    /// O seletor envia `AppCommand::SetHwAccel` quando o usuário muda a opção;
+    /// o backend é responsável por aplicar o modo ao `FfmpegDecoder` na
+    /// próxima reabertura de stream.
+    ///
+    /// SPEC-METRICS-HW-001 · SPEC-CFG-HW-001
+    fn show_debug_av_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        state: &AppState,
+        cmd_tx: &Sender<AppCommand>,
+    ) {
+        let p = &state.metrics.pipeline;
+        ui.label("Debug A/V");
+        egui::Grid::new("debug_av_grid")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Hwaccel");
+                let badge = if p.hw_decode_active {
+                    format!(
+                        "GPU ({})",
+                        p.hw_decode_codec.as_deref().unwrap_or("d3d11va")
+                    )
+                } else if let Some(reason) = p.hw_decode_fallback_reason.as_deref() {
+                    format!("CPU fallback: {reason}")
+                } else {
+                    "CPU".to_string()
+                };
+                ui.label(badge);
+                ui.end_row();
+
+                ui.label("Adapter");
+                ui.label(p.gpu_adapter_name.as_deref().unwrap_or("-"));
+                ui.end_row();
+
+                ui.label("Adapter LUID");
+                if p.gpu_adapter_luid != 0 {
+                    ui.label(format!("{:#018x}", p.gpu_adapter_luid));
+                } else {
+                    ui.label("-");
+                }
+                ui.end_row();
+
+                ui.label("Pool frames");
+                ui.label(p.hw_frame_pool_in_use.to_string());
+                ui.end_row();
+
+                ui.label("TDR recoveries");
+                ui.label(p.tdr_recoveries.to_string());
+                ui.end_row();
+            });
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Modo:");
+            let mut choice = self.hwaccel_choice;
+            egui::ComboBox::from_id_salt("hwaccel_choice_combo")
+                .selected_text(choice.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut choice, HwAccelChoice::Auto, "auto");
+                    ui.selectable_value(&mut choice, HwAccelChoice::D3d11va, "d3d11va");
+                    ui.selectable_value(&mut choice, HwAccelChoice::None, "none");
+                });
+            if choice != self.hwaccel_choice {
+                self.hwaccel_choice = choice;
+                let _ = cmd_tx.try_send(AppCommand::SetHwAccel { choice });
+            }
+        });
     }
 
     // -----------------------------------------------------------------------

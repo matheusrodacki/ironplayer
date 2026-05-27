@@ -25,6 +25,36 @@ use crate::status_bar::StatusBar;
 use av::video_queue::{PopResult, VideoQueue};
 use av::{Clock, MasterClock, VideoFrame, VideoRenderer};
 
+const PRIMARY_CONTENT_RATIO: f32 = 0.85;
+const TABLES_WIDTH_RATIO: f32 = 0.30;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DashboardLayout {
+    top_height: f32,
+    bottom_height: f32,
+    left_width: f32,
+    right_width: f32,
+}
+
+fn compute_dashboard_layout(available: egui::Vec2, spacing: egui::Vec2) -> DashboardLayout {
+    let total_width = available.x.max(0.0);
+    let total_height = available.y.max(0.0);
+
+    let top_height = total_height * PRIMARY_CONTENT_RATIO;
+    let bottom_height = (total_height - top_height).max(0.0);
+
+    let row_width = (total_width - spacing.x).max(0.0);
+    let left_width = row_width * TABLES_WIDTH_RATIO;
+    let right_width = (row_width - left_width).max(0.0);
+
+    DashboardLayout {
+        top_height,
+        bottom_height,
+        left_width,
+        right_width,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IronPlayerApp
 // ---------------------------------------------------------------------------
@@ -626,32 +656,48 @@ impl eframe::App for IronPlayerApp {
             StatusBar::show(ui, &self.state);
         });
 
-        // ── Painel esquerdo: VideoPanel (≈40%) ───────────────────────────────
-        egui::SidePanel::left("video_panel")
-            .resizable(true)
-            .default_width(400.0)
-            .show(ctx, |ui| {
-                VideoPanel::show(
-                    ui,
-                    &self.state,
-                    self.video_renderer.as_ref(),
-                    self.video_dims,
-                    &self.cmd_tx,
-                    &mut self.aspect_ratio_mode,
-                );
-            });
-
-        // ── Painel direito: MetricsPanel (≈25%) ──────────────────────────────
-        egui::SidePanel::right("metrics_panel")
-            .resizable(true)
-            .default_width(280.0)
-            .show(ctx, |ui| {
-                self.metrics_panel.show(ui, &self.state, &self.cmd_tx);
-            });
-
-        // ── Painel central: PIDs / Tables / Serviços (≈35%) ──────────────────
+        // ── Dashboard principal: topo 90% (tabelas 30% + vídeo 70%),
+        //    rodapé 10% com métricas em colunas ──────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.tables_panel.show(ui, &self.state, &self.cmd_tx);
+            let layout = compute_dashboard_layout(ui.available_size(), ui.spacing().item_spacing);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), layout.top_height),
+                egui::Layout::left_to_right(egui::Align::Min),
+                |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(layout.left_width, layout.top_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.tables_panel.show(ui, &self.state, &self.cmd_tx);
+                        },
+                    );
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(layout.right_width, layout.top_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            VideoPanel::show(
+                                ui,
+                                &self.state,
+                                self.video_renderer.as_ref(),
+                                self.video_dims,
+                                &self.cmd_tx,
+                                &mut self.aspect_ratio_mode,
+                            );
+                        },
+                    );
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), layout.bottom_height),
+                egui::Layout::left_to_right(egui::Align::Min),
+                |ui| {
+                    self.metrics_panel
+                        .show_columnar_strip(ui, &self.state, &self.cmd_tx);
+                },
+            );
         });
     }
 }
@@ -695,6 +741,16 @@ pub fn run(title: &str) -> eframe::Result {
 mod tests {
     use super::*;
     use ts::metrics::{ErrorSnapshot, MetricsSnapshot, PcrJitterRecord};
+
+    #[test]
+    fn spec_ui_001_dashboard_layout_uses_requested_ratios() {
+        let layout = compute_dashboard_layout(egui::vec2(1000.0, 800.0), egui::vec2(8.0, 8.0));
+
+        assert_eq!(layout.top_height, 680.0);
+        assert_eq!(layout.bottom_height, 120.0);
+        assert_eq!(layout.left_width, 297.6);
+        assert_eq!(layout.right_width, 694.4);
+    }
 
     #[test]
     fn spec_ui_008_metric_histories_ignore_repainted_snapshot() {

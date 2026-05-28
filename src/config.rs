@@ -211,7 +211,10 @@ impl Default for DecoderConfig {
         Self {
             thread_count: 0, // 0 = detectar em runtime via available_parallelism
             thread_type: DecoderThreadType::Auto,
-            skip_loop_filter: false,
+            // skip_loop_filter habilitado por padrão: para uso de monitoramento
+            // broadcast, pular o filtro de deblocking em frames não-referência
+            // economiza ~15–25 % de CPU em HEVC com impacto mínimo na imagem.
+            skip_loop_filter: true,
             flag2_fast: false,
             profile: DecoderProfile::Default,
         }

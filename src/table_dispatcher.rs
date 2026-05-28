@@ -460,8 +460,13 @@ impl TableDispatcher {
             "serviço alterado — re-roteando PIDs A/V"
         );
 
-        let should_reset_decoder =
-            self.last_selected_service.is_some() && self.last_selected_service != new_service;
+        let initial_auto_play_selection = self.last_selected_service.is_none()
+            && new_service.is_some()
+            && self.auto_play
+            && self.auto_play_triggered;
+        let should_reset_decoder = self.last_selected_service != new_service
+            && !self.active_av_pids.is_empty()
+            && !initial_auto_play_selection;
 
         if new_service.is_none() {
             self.auto_play_triggered = false;

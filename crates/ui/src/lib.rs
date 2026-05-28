@@ -403,11 +403,17 @@ impl IronPlayerApp {
 
         // 2. Extrai o próximo frame pronto para exibição.
         let clock_pts = self.video_clock.now_pts90();
-        let ready_frame = match self.video_queue.pop_ready(clock_pts) {
+        let allow_clock_resync = self.video_clock.audio_handle().is_none();
+        let ready_frame = match self
+            .video_queue
+            .pop_ready_with_resync(clock_pts, allow_clock_resync)
+        {
             PopResult::Ready(f) => Some(f),
             PopResult::Resync { frame, new_anchor } => {
                 // Resincroniza o clock ao novo âncora de PTS.
-                self.video_clock.reset(new_anchor);
+                if allow_clock_resync {
+                    self.video_clock.reset(new_anchor);
+                }
                 Some(frame)
             }
             PopResult::TooEarly | PopResult::Empty => None,

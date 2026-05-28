@@ -116,6 +116,8 @@ pub struct AudioStatusSnapshot {
     pub channels: Option<u16>,
     /// Nível atual do jitter buffer em `[0.0, 1.0]`.
     pub buffer_level: f32,
+    /// Latência estimada entre callback de áudio e playback audível.
+    pub output_latency_ms: u64,
     /// Estado operacional do pipeline.
     pub state: AudioOperationalState,
     /// Contadores de erro acumulados.
@@ -131,6 +133,7 @@ impl Default for AudioStatusSnapshot {
             sample_rate_hz: None,
             channels: None,
             buffer_level: 0.0,
+            output_latency_ms: 0,
             state: AudioOperationalState::Idle,
             errors: AudioErrorSnapshot::default(),
         }
@@ -150,6 +153,7 @@ impl AudioStatusSnapshot {
         self.sample_rate_hz = None;
         self.channels = None;
         self.buffer_level = 0.0;
+        self.output_latency_ms = 0;
         self.state = state;
         self.errors = AudioErrorSnapshot::default();
     }
@@ -442,6 +446,7 @@ mod tests {
         assert_eq!(audio.sample_rate_hz, None);
         assert_eq!(audio.channels, None);
         assert_eq!(audio.buffer_level, 0.0);
+        assert_eq!(audio.output_latency_ms, 0);
         assert_eq!(audio.state, AudioOperationalState::Idle);
         assert_eq!(audio.errors, AudioErrorSnapshot::default());
     }

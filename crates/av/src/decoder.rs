@@ -510,6 +510,7 @@ impl FfmpegDecoder {
                             let (pts_raw, out_sr, out_ch, samples) =
                                 state.frame.to_pcm_f32(sr, ch)?;
                             frames.push(DecodedFrame::Audio(AudioFrame::new(
+                                pid_raw,
                                 out_sr,
                                 out_ch,
                                 pts_raw_to_option(pts_raw),
@@ -668,7 +669,7 @@ impl FfmpegDecoder {
                         let (pts_raw, out_sr, out_ch, samples) = state.frame.to_pcm_f32(sr, ch)?;
                         let pts = pts_raw_to_option(pts_raw);
                         Some(DecodedFrame::Audio(AudioFrame::new(
-                            out_sr, out_ch, pts, samples,
+                            pid_raw, out_sr, out_ch, pts, samples,
                         )))
                     };
                     if let Some(f) = decoded {

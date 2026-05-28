@@ -5,8 +5,10 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ts::Pid;
 
 use crate::clock::{AudioClockHandle, Pts90};
 use crate::error::AvError;
@@ -21,6 +23,8 @@ use crate::error::AvError;
 /// SPEC-AV-004
 #[derive(Debug, Clone)]
 pub struct AudioFrame {
+    /// PID do elementary stream de origem.
+    pub pid: Pid,
     /// Taxa de amostragem em Hz (e.g. 48000, 44100).
     pub sample_rate: u32,
     /// Número de canais (1 = mono, 2 = estéreo, …).
@@ -35,8 +39,15 @@ impl AudioFrame {
     /// Cria um `AudioFrame` a partir de amostras PCM f32 interleaved.
     ///
     /// SPEC-AV-004
-    pub fn new(sample_rate: u32, channels: u16, pts: Option<u64>, samples: Vec<f32>) -> Self {
+    pub fn new(
+        pid: Pid,
+        sample_rate: u32,
+        channels: u16,
+        pts: Option<u64>,
+        samples: Vec<f32>,
+    ) -> Self {
         Self {
+            pid,
             sample_rate,
             channels,
             pts,
@@ -199,6 +210,31 @@ fn buffer_capacity_samples(sample_rate: u32, channels: u16, buffer_ms: u32) -> u
     samples.max(channels.max(1) as u64) as usize
 }
 
+fn duration_to_interleaved_samples(duration: Duration, sample_rate: u32, channels: u16) -> u64 {
+    if sample_rate == 0 || channels == 0 {
+        return 0;
+    }
+
+    let frames = duration
+        .as_nanos()
+        .saturating_mul(sample_rate as u128)
+        .saturating_div(1_000_000_000);
+    let samples = frames.saturating_mul(channels as u128);
+    samples.min(u64::MAX as u128) as u64
+}
+
+fn interleaved_samples_to_ms(samples: u64, sample_rate: u32, channels: u16) -> u64 {
+    if sample_rate == 0 || channels == 0 {
+        return 0;
+    }
+
+    let denominator = sample_rate as u128 * channels as u128;
+    let ms = (samples as u128)
+        .saturating_mul(1000)
+        .saturating_div(denominator);
+    ms.min(u64::MAX as u128) as u64
+}
+
 fn prime_threshold_samples(capacity_samples: usize, channels: u16) -> usize {
     if capacity_samples == 0 {
         return 0;
@@ -256,26 +292,36 @@ impl AudioPlaybackState {
 
 struct AudioSharedState {
     playback: Mutex<AudioPlaybackState>,
+    sample_rate: u32,
+    channels: u16,
     volume: AtomicU32,
     restart_requested: AtomicBool,
     underruns: AtomicU64,
     overruns: AtomicU64,
-    /// Contador atômico de samples interleaved consumidos pelo driver WASAPI.
+    /// Contador atômico de samples interleaved entregues ao driver WASAPI.
     /// Incrementado pela callback cpal; compartilhado com `AudioClockHandle`.
     ///
     /// SPEC-AV-CLOCK-002
     samples_played: Arc<AtomicU64>,
+    /// Latência estimada entre o callback cpal e o momento audível no dispositivo.
+    /// Compartilhada com `AudioClockHandle` para compensar o master clock.
+    ///
+    /// SPEC-AV-CLOCK-002
+    playback_latency_samples: Arc<AtomicU64>,
 }
 
 impl AudioSharedState {
-    fn new(capacity_samples: usize, channels: u16) -> Self {
+    fn new(capacity_samples: usize, sample_rate: u32, channels: u16) -> Self {
         Self {
             playback: Mutex::new(AudioPlaybackState::new(capacity_samples, channels)),
+            sample_rate,
+            channels,
             volume: AtomicU32::new(1.0f32.to_bits()),
             restart_requested: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
             samples_played: Arc::new(AtomicU64::new(0)),
+            playback_latency_samples: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -285,6 +331,35 @@ impl AudioSharedState {
 
     fn take_restart_request(&self) {
         self.restart_requested.store(false, Ordering::Relaxed);
+    }
+
+    fn advance_media_clock(&self, samples: usize) {
+        if samples > 0 {
+            self.samples_played
+                .fetch_add(samples as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn update_playback_latency_from_info(&self, info: &cpal::OutputCallbackInfo) {
+        let timestamp = info.timestamp();
+        if let Some(latency) = timestamp.playback.duration_since(&timestamp.callback) {
+            self.set_playback_latency_duration(latency);
+        }
+    }
+
+    fn set_playback_latency_duration(&self, latency: Duration) {
+        let latency_samples =
+            duration_to_interleaved_samples(latency, self.sample_rate, self.channels);
+        self.playback_latency_samples
+            .store(latency_samples, Ordering::Relaxed);
+    }
+
+    fn output_latency_ms(&self) -> u64 {
+        interleaved_samples_to_ms(
+            self.playback_latency_samples.load(Ordering::Relaxed),
+            self.sample_rate,
+            self.channels,
+        )
     }
 }
 
@@ -333,7 +408,7 @@ impl AudioOutput {
         let stream = device
             .build_output_stream::<f32, _, _>(
                 &config,
-                move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                move |output: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     let volume = f32::from_bits(callback_state.volume.load(Ordering::Relaxed));
 
                     let report = match callback_state.playback.try_lock() {
@@ -351,12 +426,11 @@ impl AudioOutput {
                         callback_state.underruns.fetch_add(1, Ordering::Relaxed);
                     }
 
-                    // Incrementa o contador de samples consumidos pelo driver.
-                    // Usado pelo `AudioClockHandle` para calcular o PTS atual.
+                    // Incrementa o clock apenas com amostras reais de mídia.
+                    // Silêncio de priming/underrun não deve avançar o PTS de áudio.
                     // SPEC-AV-CLOCK-002
-                    callback_state
-                        .samples_played
-                        .fetch_add(output.len() as u64, Ordering::Relaxed);
+                    callback_state.update_playback_latency_from_info(info);
+                    callback_state.advance_media_clock(report.copied_samples);
 
                     apply_volume(output, volume);
                 },
@@ -391,7 +465,7 @@ impl AudioOutput {
     pub fn new(sample_rate: u32, channels: u16, buffer_ms: u32) -> Result<Self, AvError> {
         let buffer_ms = sanitize_buffer_ms(buffer_ms);
         let capacity = buffer_capacity_samples(sample_rate, channels, buffer_ms);
-        let shared = Arc::new(AudioSharedState::new(capacity, channels));
+        let shared = Arc::new(AudioSharedState::new(capacity, sample_rate, channels));
         let stream = Self::build_stream(sample_rate, channels, Arc::clone(&shared))?;
 
         tracing::info!(
@@ -421,6 +495,7 @@ impl AudioOutput {
             Ok(mut playback) => {
                 let dropped_samples = playback.push_samples(&frame.samples);
                 if dropped_samples > 0 {
+                    self.shared.advance_media_clock(dropped_samples);
                     let overruns = self.shared.overruns.fetch_add(1, Ordering::Relaxed) + 1;
                     if overruns == 1 || overruns % 50 == 0 {
                         tracing::warn!(
@@ -476,8 +551,9 @@ impl AudioOutput {
     ///
     /// SPEC-AV-CLOCK-002
     pub fn clock_handle(&self, anchor_pts: Pts90) -> AudioClockHandle {
-        AudioClockHandle::with_counter(
+        AudioClockHandle::with_counter_and_latency(
             Arc::clone(&self.shared.samples_played),
+            Arc::clone(&self.shared.playback_latency_samples),
             self.sample_rate,
             self.channels,
             anchor_pts,
@@ -520,6 +596,13 @@ impl AudioOutput {
     /// SPEC-AV-004c
     pub fn overrun_count(&self) -> u64 {
         self.shared.overruns.load(Ordering::Relaxed)
+    }
+
+    /// Retorna a latência de playback estimada pelo backend de áudio em milissegundos.
+    ///
+    /// SPEC-AV-004c
+    pub fn output_latency_ms(&self) -> u64 {
+        self.shared.output_latency_ms()
     }
 }
 
@@ -795,6 +878,90 @@ mod tests {
         assert_eq!(underrun.copied_samples, 0);
         assert_eq!(underrun.missing_samples, 4);
         assert!(!state.primed);
+    }
+
+    /// Silencio de priming nao deve avancar o clock de midia.
+    ///
+    /// SPEC-AV-CLOCK-002
+    #[test]
+    fn spec_av_clock_002_audio_clock_ignores_priming_silence() {
+        let shared = AudioSharedState::new(8, 48_000, 2);
+        let mut output = [1.0f32; 4];
+        let report = shared.playback.lock().unwrap().pop_for_output(&mut output);
+
+        shared.advance_media_clock(report.copied_samples);
+
+        assert_eq!(report.copied_samples, 0);
+        assert_eq!(report.missing_samples, 4);
+        assert_eq!(shared.samples_played.load(Ordering::Relaxed), 0);
+    }
+
+    /// Apenas amostras de audio copiadas para o callback avancam o clock.
+    ///
+    /// SPEC-AV-CLOCK-002
+    #[test]
+    fn spec_av_clock_002_audio_clock_counts_copied_samples() {
+        let shared = AudioSharedState::new(8, 48_000, 2);
+        {
+            let mut playback = shared.playback.lock().unwrap();
+            let _ = playback.push_samples(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        }
+
+        let mut output = [0.0f32; 4];
+        let report = shared.playback.lock().unwrap().pop_for_output(&mut output);
+
+        shared.advance_media_clock(report.copied_samples);
+
+        assert_eq!(report.copied_samples, 4);
+        assert_eq!(report.missing_samples, 0);
+        assert_eq!(shared.samples_played.load(Ordering::Relaxed), 4);
+    }
+
+    /// Amostras descartadas por overrun saem da timeline e tambem avancam o clock.
+    ///
+    /// SPEC-AV-CLOCK-002
+    #[test]
+    fn spec_av_clock_002_audio_clock_skips_overrun_samples() {
+        let shared = AudioSharedState::new(4, 48_000, 2);
+        let dropped = shared.playback.lock().unwrap().push_samples(&[0.0f32; 10]);
+
+        shared.advance_media_clock(dropped);
+
+        assert_eq!(dropped, 6);
+        assert_eq!(shared.samples_played.load(Ordering::Relaxed), 6);
+    }
+
+    /// A latência de playback informada pelo backend é convertida para samples interleaved.
+    ///
+    /// SPEC-AV-CLOCK-002
+    #[test]
+    fn spec_av_clock_002_playback_latency_duration_to_samples() {
+        let shared = AudioSharedState::new(4, 48_000, 2);
+
+        shared.set_playback_latency_duration(Duration::from_millis(500));
+
+        assert_eq!(
+            shared.playback_latency_samples.load(Ordering::Relaxed),
+            48_000
+        );
+        assert_eq!(shared.output_latency_ms(), 500);
+    }
+
+    /// Conversões de latência ignoram parâmetros inválidos sem pânico.
+    ///
+    /// SPEC-AV-CLOCK-002
+    #[test]
+    fn spec_av_clock_002_playback_latency_invalid_params_are_zero() {
+        assert_eq!(
+            duration_to_interleaved_samples(Duration::from_secs(1), 0, 2),
+            0
+        );
+        assert_eq!(
+            duration_to_interleaved_samples(Duration::from_secs(1), 48_000, 0),
+            0
+        );
+        assert_eq!(interleaved_samples_to_ms(96_000, 0, 2), 0);
+        assert_eq!(interleaved_samples_to_ms(96_000, 48_000, 0), 0);
     }
 
     /// Apenas 50, 100, 200 e 500 ms sao aceitos como jitter buffer configuravel.

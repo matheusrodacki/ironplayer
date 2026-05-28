@@ -84,6 +84,11 @@ struct SenderGuard {
     ts_events_tx: BoundedSender<ts::TsEvent>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioCommand {
+    Reset,
+}
+
 // ── PipelineGuard ─────────────────────────────────────────────────────────────
 
 /// Encapsula handles e recursos do pipeline para shutdown limpo.
@@ -195,35 +200,49 @@ fn refresh_audio_status_from_output(
     }
 }
 
-fn reset_stream_routing(
-    selected_service: &Arc<std::sync::RwLock<Option<u16>>>,
-    selected_audio_pid: &Arc<std::sync::RwLock<Option<u16>>>,
-    table_cmd_tx: &crossbeam_channel::Sender<TableCommand>,
-    agg_net_tx: &crossbeam_channel::Sender<AggregatorNetEvent>,
-    demux_cmd_tx: &crossbeam_channel::Sender<DemuxCommand>,
-    pes_cmd_tx: &crossbeam_channel::Sender<PesCommand>,
-    decode_cmd_tx: &crossbeam_channel::Sender<DecodeCommand>,
-) {
-    if let Ok(mut service) = selected_service.write() {
+struct StreamResetTargets<'a> {
+    selected_service: &'a Arc<std::sync::RwLock<Option<u16>>>,
+    selected_audio_pid: &'a Arc<std::sync::RwLock<Option<u16>>>,
+    table_cmd_tx: &'a crossbeam_channel::Sender<TableCommand>,
+    agg_net_tx: &'a crossbeam_channel::Sender<AggregatorNetEvent>,
+    demux_cmd_tx: &'a crossbeam_channel::Sender<DemuxCommand>,
+    pes_cmd_tx: &'a crossbeam_channel::Sender<PesCommand>,
+    decode_cmd_tx: &'a crossbeam_channel::Sender<DecodeCommand>,
+    audio_cmd_tx: &'a crossbeam_channel::Sender<AudioCommand>,
+}
+
+fn reset_stream_routing(targets: StreamResetTargets<'_>) {
+    if let Ok(mut service) = targets.selected_service.write() {
         *service = None;
     }
-    if let Ok(mut audio_pid) = selected_audio_pid.write() {
+    if let Ok(mut audio_pid) = targets.selected_audio_pid.write() {
         *audio_pid = None;
     }
-    if table_cmd_tx.try_send(TableCommand::Reset).is_err() {
+    if targets.table_cmd_tx.try_send(TableCommand::Reset).is_err() {
         tracing::warn!("canal table-control cheio — Reset descartado");
     }
-    if agg_net_tx.try_send(AggregatorNetEvent::Reset).is_err() {
+    if targets
+        .agg_net_tx
+        .try_send(AggregatorNetEvent::Reset)
+        .is_err()
+    {
         tracing::warn!("canal metrics-control cheio — Reset descartado");
     }
-    if demux_cmd_tx.try_send(DemuxCommand::Reset).is_err() {
+    if targets.demux_cmd_tx.try_send(DemuxCommand::Reset).is_err() {
         tracing::warn!("canal demux-control cheio — Reset descartado");
     }
-    if pes_cmd_tx.try_send(PesCommand::Reset).is_err() {
+    if targets.pes_cmd_tx.try_send(PesCommand::Reset).is_err() {
         tracing::warn!("canal pes-control cheio — Reset descartado");
     }
-    if decode_cmd_tx.try_send(DecodeCommand::Reset).is_err() {
+    if targets
+        .decode_cmd_tx
+        .try_send(DecodeCommand::Reset)
+        .is_err()
+    {
         tracing::warn!("canal decode-control cheio — Reset descartado");
+    }
+    if targets.audio_cmd_tx.try_send(AudioCommand::Reset).is_err() {
+        tracing::warn!("canal audio-control cheio — Reset descartado");
     }
 }
 
@@ -333,6 +352,7 @@ fn main() -> eframe::Result<()> {
     let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded::<DemuxCommand>(64);
     let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded::<PesCommand>(64);
     let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded::<DecodeCommand>(16);
+    let (audio_cmd_tx, audio_cmd_rx) = crossbeam_channel::bounded::<AudioCommand>(16);
 
     // 6. Token de parada do MetricsAggregator
     let (metrics_stop_token, metrics_stop_handle): (MetricsStopToken, MetricsStopHandle) =
@@ -835,14 +855,31 @@ fn main() -> eframe::Result<()> {
         let initial_volume = cfg.player.volume;
         let audio_status = audio_status.clone();
         let audio_clock_tx = audio_clock_for_audio_out;
+        let selected_audio_pid_rx = selected_audio_pid.clone();
         handles.push(
             std::thread::Builder::new()
                 .name("audio-out".into())
                 .spawn(move || {
                     let mut audio_out: Option<av::AudioOutput> = None;
+                    let mut active_audio_pid: Option<u16> = None;
                     let mut rebuild_failures = 0u64;
 
                     loop {
+                        while let Ok(command) = audio_cmd_rx.try_recv() {
+                            match command {
+                                AudioCommand::Reset => {
+                                    audio_out = None;
+                                    active_audio_pid = None;
+                                    rebuild_failures = 0;
+                                    while audio_frames_rx.try_recv().is_ok() {}
+                                    if let Ok(mut guard) = audio_clock_tx.write() {
+                                        *guard = None;
+                                    }
+                                    tracing::info!("audio-out: estado resetado e fila drenada");
+                                }
+                            }
+                        }
+
                         if let Some(out) = audio_out.as_mut() {
                             if out.needs_rebuild() {
                                 if let Ok(mut status) = audio_status.write() {
@@ -885,13 +922,38 @@ fn main() -> eframe::Result<()> {
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         };
 
+                        let selected_audio_pid = selected_audio_pid_rx
+                            .read()
+                            .map(|g| *g)
+                            .unwrap_or(None);
+                        if selected_audio_pid.is_some_and(|pid| pid != frame.pid) {
+                            tracing::debug!(
+                                frame_pid = frame.pid,
+                                selected_pid = ?selected_audio_pid,
+                                "audio-out: frame de áudio obsoleto descartado"
+                            );
+                            continue;
+                        }
+
                         // Lazy-init: cria AudioOutput na primeira frame (ou quando
                         // sample_rate/channels mudam, reiniciando o stream).
+                        let pid_changed = active_audio_pid.is_some_and(|pid| pid != frame.pid);
                         let needs_reinit = audio_out.as_ref().is_none_or(|out| {
                             out.sample_rate != frame.sample_rate || out.channels != frame.channels
-                        });
+                        }) || pid_changed;
 
                         if needs_reinit {
+                            if pid_changed {
+                                audio_out = None;
+                                if let Ok(mut guard) = audio_clock_tx.write() {
+                                    *guard = None;
+                                }
+                                tracing::info!(
+                                    old_pid = ?active_audio_pid,
+                                    new_pid = frame.pid,
+                                    "audio-out: trilha de áudio mudou; recriando saída e clock"
+                                );
+                            }
                             match av::AudioOutput::new(
                                 frame.sample_rate,
                                 frame.channels,
@@ -924,6 +986,7 @@ fn main() -> eframe::Result<()> {
                                             "audio-out: AudioClockHandle publicado"
                                         );
                                     }
+                                    active_audio_pid = Some(frame.pid);
                                     audio_out = Some(out);
                                 }
                                 Err(e) => {
@@ -1001,15 +1064,16 @@ fn main() -> eframe::Result<()> {
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
                                 h.stop();
                             }
-                            reset_stream_routing(
-                                &selected_service,
-                                &selected_audio_pid,
-                                &table_cmd_tx,
-                                &agg_net_tx,
-                                &demux_cmd_tx,
-                                &pes_cmd_tx,
-                                &decode_cmd_tx,
-                            );
+                            reset_stream_routing(StreamResetTargets {
+                                selected_service: &selected_service,
+                                selected_audio_pid: &selected_audio_pid,
+                                table_cmd_tx: &table_cmd_tx,
+                                agg_net_tx: &agg_net_tx,
+                                demux_cmd_tx: &demux_cmd_tx,
+                                pes_cmd_tx: &pes_cmd_tx,
+                                decode_cmd_tx: &decode_cmd_tx,
+                                audio_cmd_tx: &audio_cmd_tx,
+                            });
 
                             match StreamUrl::parse(&url) {
                                 Err(e) => {
@@ -1084,15 +1148,16 @@ fn main() -> eframe::Result<()> {
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
                                 h.stop();
                             }
-                            reset_stream_routing(
-                                &selected_service,
-                                &selected_audio_pid,
-                                &table_cmd_tx,
-                                &agg_net_tx,
-                                &demux_cmd_tx,
-                                &pes_cmd_tx,
-                                &decode_cmd_tx,
-                            );
+                            reset_stream_routing(StreamResetTargets {
+                                selected_service: &selected_service,
+                                selected_audio_pid: &selected_audio_pid,
+                                table_cmd_tx: &table_cmd_tx,
+                                agg_net_tx: &agg_net_tx,
+                                demux_cmd_tx: &demux_cmd_tx,
+                                pes_cmd_tx: &pes_cmd_tx,
+                                decode_cmd_tx: &decode_cmd_tx,
+                                audio_cmd_tx: &audio_cmd_tx,
+                            });
                             if let Ok(mut status) = audio_status.write() {
                                 status.reset_stream_runtime(ui::AudioOperationalState::Idle);
                             }
@@ -1110,6 +1175,9 @@ fn main() -> eframe::Result<()> {
                             if let Ok(mut audio_pid) = selected_audio_pid.write() {
                                 *audio_pid = None;
                             }
+                            if audio_cmd_tx.try_send(AudioCommand::Reset).is_err() {
+                                tracing::warn!("canal audio-control cheio — Reset descartado");
+                            }
                             *selected_service.write().unwrap() = Some(service_id);
                             tracing::info!(service_id, "serviço selecionado pelo usuário");
                         }
@@ -1123,6 +1191,9 @@ fn main() -> eframe::Result<()> {
                             }
                             *selected_service.write().unwrap() = Some(service_id);
                             *selected_audio_pid.write().unwrap() = Some(pid);
+                            if audio_cmd_tx.try_send(AudioCommand::Reset).is_err() {
+                                tracing::warn!("canal audio-control cheio — Reset descartado");
+                            }
                             tracing::info!(service_id, pid, "trilha de áudio selecionada pelo usuário");
                         }
                         ui::AppCommand::SetHwAccel { choice } => {

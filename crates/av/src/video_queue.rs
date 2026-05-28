@@ -479,6 +479,17 @@ impl VideoQueue {
     ///
     /// SPEC-AV-VQ-001
     pub fn pop_ready(&mut self, clock_pts: Pts90) -> PopResult {
+        self.pop_ready_with_resync(clock_pts, true)
+    }
+
+    /// Tenta extrair o próximo frame pronto, com controle explícito de resync.
+    ///
+    /// Quando `allow_resync` é `false`, frames muito à frente do clock são
+    /// retidos em vez de solicitar `Clock::reset()`. Use com clocks externos
+    /// que não devem ser movidos pelo vídeo, como o clock de áudio WASAPI.
+    ///
+    /// SPEC-AV-VQ-001
+    pub fn pop_ready_with_resync(&mut self, clock_pts: Pts90, allow_resync: bool) -> PopResult {
         loop {
             let frame_pts = match self.frames.front() {
                 Some((pts, _)) => *pts,
@@ -502,6 +513,11 @@ impl VideoQueue {
 
             // Resync: salto muito grande (descontinuidade ou seek)
             if diff.abs() > RESYNC_PTS {
+                if !allow_resync && diff > 0 {
+                    self.held_early += 1;
+                    return PopResult::TooEarly;
+                }
+
                 let (_, frame) = match self.frames.pop_front() {
                     Some(item) => item,
                     None => return PopResult::Empty,
@@ -754,6 +770,23 @@ mod tests {
             other => panic!("esperava Resync, obteve {:?}", other),
         }
         assert_eq!(q.discontinuities, 1);
+    }
+
+    /// Salto positivo grande sem permissao de resync deve reter o frame.
+    ///
+    /// SPEC-AV-VQ-001
+    #[test]
+    fn spec_av_vq_001_pop_large_jump_without_resync_holds() {
+        let mut q = VideoQueue::new(4);
+        q.push(make_frame(Some(500_000)));
+
+        assert!(matches!(
+            q.pop_ready_with_resync(0, false),
+            PopResult::TooEarly
+        ));
+        assert_eq!(q.held_early, 1);
+        assert_eq!(q.discontinuities, 0);
+        assert_eq!(q.len(), 1);
     }
 
     // ── wrap 33-bit ───────────────────────────────────────────────────────────

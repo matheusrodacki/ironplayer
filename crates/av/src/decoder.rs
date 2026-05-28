@@ -15,9 +15,9 @@ use crate::deinterlace::Deinterlacer;
 use crate::error::AvError;
 use crate::ffi::{
     find_ffmpeg_dll_dir, frame_flags, FfmpegCodecContext, FfmpegFrame, FfmpegLib, FfmpegPacket,
-    FilterLib, AV_CODEC_ID_AAC, AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3,
-    AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
-    AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
+    FfmpegParser, FilterLib, AV_CODEC_ID_AAC, AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3,
+    AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2,
+    AV_CODEC_ID_MPEG2VIDEO, AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
 };
 use crate::hw::{HwAccelMode, HwAccelState};
 use crate::pes::PesPacket;
@@ -88,6 +88,10 @@ struct CodecState {
     /// Frame AVFrame reutilizado entre chamadas para evitar alloc/free por frame.
     frame: FfmpegFrame,
     is_video: bool,
+    /// Parser FFmpeg para realinhar PES em frames/access units completos.
+    /// `None` quando o codec não tem parser registrado (AAC LATM usa split
+    /// manual via sync word; ver `split_loas_frames`).
+    parser: Option<FfmpegParser>,
     /// Deinterlacador bwdif, criado lazily na primeira aparição de frame
     /// interlaced. `None` se o stream não for interlaced ou se `FilterLib`
     /// não estiver disponível.
@@ -430,12 +434,20 @@ impl FfmpegDecoder {
             };
 
             let frame = FfmpegFrame::alloc(Arc::clone(&self.lib))?;
+            // Parser para realinhar PES em frames/access units (HEVC/H264/AC3/EAC3/MP2).
+            // AAC LATM tem seu próprio splitter manual (split_loas_frames).
+            let parser = if matches!(pes.codec, MediaCodec::Audio(AudioCodec::AacLatm)) {
+                None
+            } else {
+                FfmpegParser::try_init(Arc::clone(&self.lib), avid)
+            };
             self.states.insert(
                 pid_raw,
                 CodecState {
                     codec_ctx,
                     frame,
                     is_video,
+                    parser,
                     deinterlacer: None,
                     hw_init_deadline,
                 },
@@ -537,14 +549,19 @@ impl FfmpegDecoder {
         // aqui seria correto para erros fatais, mas para o caso mid-stream o
         // decoder se recupera sozinho no próximo IDR — portanto loga e continua.
 
-        // Cria o AVPacket com o payload PES.
-        let pkt = FfmpegPacket::from_bytes(Arc::clone(&self.lib), &pes.payload, pes.pts)?;
-
-        // Envia o pacote ao decodificador.
-        if let Err(e) = state.codec_ctx.send_packet(&pkt) {
-            tracing::debug!(%e, pid = pid_raw, "send_packet: erro transitório (aguardando IDR?)");
-            return Ok(frames);
-        }
+        // Usa o parser FFmpeg para realinhar o payload PES em frames/access
+        // units completos antes de enviar ao decoder. PES não está garantido
+        // a alinhar-se com fronteiras de codec (especialmente HEVC com PES
+        // longos atravessando múltiplos AUs, e AC-3 com vários frames por PES).
+        //
+        // Quando o parser não está disponível (codec sem parser registrado),
+        // cai para o comportamento legado de enviar o payload completo de uma vez.
+        let parsed_packets: Vec<(Vec<u8>, Option<u64>)> = if let Some(parser) = state.parser.as_mut()
+        {
+            parser.parse(&state.codec_ctx, &pes.payload, pes.pts)
+        } else {
+            vec![(pes.payload.to_vec(), pes.pts)]
+        };
 
         // Flag para acionar fallback SW após sair do loop (evita borrow duplo
         // de `self` dentro do loop onde `state` já emprestou `self.states`).
@@ -552,7 +569,17 @@ impl FfmpegDecoder {
         let mut hw_interlaced_requires_sw = false;
         let mut hw_frames_ok: usize = 0;
 
-        'decode_loop: loop {
+        'pkt_loop: for (pkt_bytes, pkt_pts) in parsed_packets {
+            if pkt_bytes.is_empty() {
+                continue;
+            }
+            let pkt = FfmpegPacket::from_bytes(Arc::clone(&self.lib), &pkt_bytes, pkt_pts)?;
+            if let Err(e) = state.codec_ctx.send_packet(&pkt) {
+                tracing::debug!(%e, pid = pid_raw, "send_packet: erro transitório (aguardando IDR?)");
+                continue;
+            }
+
+            loop {
             match state.codec_ctx.receive_frame(&mut state.frame) {
                 Ok(true) => {
                     // Frame pronto — converte para tipo Rust.
@@ -569,7 +596,7 @@ impl FfmpegDecoder {
                                 );
                                 state.frame.unref();
                                 hw_interlaced_requires_sw = true;
-                                break 'decode_loop;
+                                break 'pkt_loop;
                             }
 
                             // Cancela o deadline de init — recebemos o primeiro frame HW.
@@ -692,6 +719,7 @@ impl FfmpegDecoder {
                 }
             }
         }
+        } // fim 'pkt_loop
 
         // Pós-loop: atualiza estado HW (fora do borrow de `state`).
         // SPEC-AV-HW-DEC-001

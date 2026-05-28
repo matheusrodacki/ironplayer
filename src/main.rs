@@ -1189,6 +1189,30 @@ fn main() -> eframe::Result<()> {
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             present_mode: eframe::wgpu::PresentMode::Fifo,
             power_preference: wgpu_power_pref,
+            // Pede TEXTURE_FORMAT_16BIT_NORM para suportar upload R16Unorm dos
+            // planos YUV 10-bit (HEVC Main10/Rext, comum em broadcast). Quando
+            // o adapter não expõe a feature, cai silenciosamente para o default
+            // — o renderer ainda funciona em streams 8-bit.
+            device_descriptor: std::sync::Arc::new(|adapter| {
+                let base_limits = if adapter.get_info().backend == eframe::wgpu::Backend::Gl {
+                    eframe::wgpu::Limits::downlevel_webgl2_defaults()
+                } else {
+                    eframe::wgpu::Limits::default()
+                };
+
+                let wanted = eframe::wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+                let required_features = wanted & adapter.features();
+
+                eframe::wgpu::DeviceDescriptor {
+                    label: Some("ironplayer wgpu device"),
+                    required_features,
+                    required_limits: eframe::wgpu::Limits {
+                        max_texture_dimension_2d: 8192,
+                        ..base_limits
+                    },
+                    memory_hints: eframe::wgpu::MemoryHints::default(),
+                }
+            }),
             ..Default::default()
         },
         ..Default::default()

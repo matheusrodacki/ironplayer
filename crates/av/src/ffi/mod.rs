@@ -65,7 +65,9 @@ pub const AV_CODEC_ID_AAC_LATM: u32 = 0x15031;
 
 /// Formatos de pixel YUV planar suportados pelo decoder.
 pub const AV_PIX_FMT_YUV420P: c_int = 0;
+pub const AV_PIX_FMT_YUV422P: c_int = 4;
 pub const AV_PIX_FMT_YUV420P10LE: c_int = 62;
+pub const AV_PIX_FMT_YUV422P10LE: c_int = 64;
 
 /// Formatos de sample de áudio.
 pub const AV_SAMPLE_FMT_FLT: c_int = 3;
@@ -366,6 +368,37 @@ type FnAvcodecReceiveFrame =
 
 type FnAvPacketAlloc = unsafe extern "C" fn() -> *mut AvPacket;
 type FnAvPacketFree = unsafe extern "C" fn(pkt: *mut *mut AvPacket);
+
+/// Opaco — `AVCodecParserContext` do FFmpeg.
+#[repr(C)]
+pub struct AvCodecParserContext {
+    _opaque: [u8; 0],
+}
+
+/// `av_parser_init(codec_id)` — abre um parser para o codec_id especificado.
+/// Retorna NULL se não houver parser disponível para o codec.
+type FnAvParserInit = unsafe extern "C" fn(codec_id: c_int) -> *mut AvCodecParserContext;
+
+/// `av_parser_parse2(s, avctx, poutbuf, poutbuf_size, buf, buf_size, pts, dts, pos)`.
+///
+/// Retorna o número de bytes consumidos de `buf`. Quando `*poutbuf_size > 0`,
+/// um pacote completo está disponível em `*poutbuf` (referência ao buffer
+/// interno do parser — não deve ser liberado).
+#[allow(clippy::type_complexity)]
+type FnAvParserParse2 = unsafe extern "C" fn(
+    s: *mut AvCodecParserContext,
+    avctx: *mut AvCodecContext,
+    poutbuf: *mut *mut u8,
+    poutbuf_size: *mut c_int,
+    buf: *const u8,
+    buf_size: c_int,
+    pts: i64,
+    dts: i64,
+    pos: i64,
+) -> c_int;
+
+/// `av_parser_close(s)` — libera o parser.
+type FnAvParserClose = unsafe extern "C" fn(s: *mut AvCodecParserContext);
 type FnAvNewPacket = unsafe extern "C" fn(pkt: *mut AvPacket, size: c_int) -> c_int;
 type FnAvFrameAlloc = unsafe extern "C" fn() -> *mut c_void;
 type FnAvFrameFree = unsafe extern "C" fn(frame: *mut *mut c_void);
@@ -451,6 +484,11 @@ pub struct FfmpegLib {
     pub(crate) avcodec_open2: FnAvcodecOpen2,
     pub(crate) avcodec_send_packet: FnAvcodecSendPacket,
     pub(crate) avcodec_receive_frame: FnAvcodecReceiveFrame,
+
+    // Parser de bitstream (av_parser_*)
+    pub(crate) av_parser_init: FnAvParserInit,
+    pub(crate) av_parser_parse2: FnAvParserParse2,
+    pub(crate) av_parser_close: FnAvParserClose,
 
     // Funções avutil
     pub(crate) av_packet_alloc: FnAvPacketAlloc,
@@ -553,6 +591,10 @@ impl FfmpegLib {
         let avcodec_receive_frame =
             sym!(avcodec, b"avcodec_receive_frame\0", FnAvcodecReceiveFrame);
 
+        let av_parser_init = sym!(avcodec, b"av_parser_init\0", FnAvParserInit);
+        let av_parser_parse2 = sym!(avcodec, b"av_parser_parse2\0", FnAvParserParse2);
+        let av_parser_close = sym!(avcodec, b"av_parser_close\0", FnAvParserClose);
+
         let av_packet_alloc = sym!(avcodec, b"av_packet_alloc\0", FnAvPacketAlloc);
         let av_packet_free = sym!(avcodec, b"av_packet_free\0", FnAvPacketFree);
         let av_new_packet = sym!(avcodec, b"av_new_packet\0", FnAvNewPacket);
@@ -600,6 +642,9 @@ impl FfmpegLib {
             avcodec_open2,
             avcodec_send_packet,
             avcodec_receive_frame,
+            av_parser_init,
+            av_parser_parse2,
+            av_parser_close,
             av_packet_alloc,
             av_packet_free,
             av_new_packet,
@@ -909,6 +954,13 @@ impl FfmpegCodecContext {
         Ok(())
     }
 
+    /// Ponteiro bruto para o `AVCodecContext`, para uso por funções FFI
+    /// auxiliares (ex.: `av_parser_parse2`).
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *mut AvCodecContext {
+        self.ctx
+    }
+
     /// Recebe um frame decodificado do contexto.
     ///
     /// Retorna `None` quando o decoder precisa de mais dados (EAGAIN ou EOF).
@@ -997,6 +1049,146 @@ impl Drop for FfmpegPacket {
     }
 }
 
+// ─── RAII: FfmpegParser ───────────────────────────────────────────────────────
+
+/// Wrapper RAII para `AVCodecParserContext*`.
+///
+/// Re-empacota bytes brutos de bitstream em access units / frames completos
+/// antes de enviar ao decoder.  Necessário porque os payloads PES do TS não
+/// estão garantidamente alinhados com os limites de frame de codecs como
+/// HEVC, H.264, AC-3, E-AC-3 e MP2.
+///
+/// SPEC-AV-002b
+pub struct FfmpegParser {
+    parser: *mut AvCodecParserContext,
+    lib: Arc<FfmpegLib>,
+}
+
+// SAFETY: AVCodecParserContext é usado por uma única thread (a do decoder).
+unsafe impl Send for FfmpegParser {}
+
+impl FfmpegParser {
+    /// Inicializa um parser para `codec_id`.  Retorna `None` se o FFmpeg não
+    /// tiver parser registrado para esse codec — caller deve aceitar fallback
+    /// de envio direto do payload.
+    ///
+    /// SPEC-AV-002b
+    pub(crate) fn try_init(lib: Arc<FfmpegLib>, codec_id: u32) -> Option<Self> {
+        // SAFETY: av_parser_init recebe codec_id por valor; retorno NULL é
+        // tratado como ausência de parser.
+        let parser = unsafe { (lib.av_parser_init)(codec_id as c_int) };
+        if parser.is_null() {
+            None
+        } else {
+            Some(Self { parser, lib })
+        }
+    }
+
+    /// Alimenta `buf` no parser e devolve a lista de pacotes completos
+    /// extraídos, cada um com seu próprio payload (cópia) e PTS.
+    ///
+    /// `pts` é aplicado apenas ao primeiro pacote emitido neste lote — chamadas
+    /// subsequentes propagam o estado interno do parser para os frames seguintes.
+    ///
+    /// SPEC-AV-002b
+    pub(crate) fn parse(
+        &mut self,
+        codec_ctx: &FfmpegCodecContext,
+        buf: &[u8],
+        pts: Option<u64>,
+    ) -> Vec<(Vec<u8>, Option<u64>)> {
+        let mut out: Vec<(Vec<u8>, Option<u64>)> = Vec::new();
+        if buf.is_empty() {
+            return out;
+        }
+
+        let mut consumed: usize = 0;
+        let mut input_pts = pts.map(|v| v as i64).unwrap_or(i64::MIN);
+        let avctx = codec_ctx.as_ptr();
+
+        while consumed < buf.len() {
+            let remaining = &buf[consumed..];
+            let mut out_buf: *mut u8 = std::ptr::null_mut();
+            let mut out_size: c_int = 0;
+
+            // SAFETY: parser, avctx, out_buf/out_size pointers e remaining
+            // são todos válidos. av_parser_parse2 é robusto a entradas
+            // arbitrárias (não pode panicar) e retorna ≤ remaining.len().
+            let used = unsafe {
+                (self.lib.av_parser_parse2)(
+                    self.parser,
+                    avctx,
+                    &mut out_buf,
+                    &mut out_size,
+                    remaining.as_ptr(),
+                    remaining.len() as c_int,
+                    input_pts,
+                    i64::MIN,
+                    -1,
+                )
+            };
+
+            if used < 0 {
+                tracing::debug!(used, "av_parser_parse2 retornou erro");
+                break;
+            }
+            let used_usize = used as usize;
+            consumed += used_usize;
+
+            // PTS só se aplica ao primeiro byte de input; iterações subsequentes
+            // dentro do mesmo PES devem passar AV_NOPTS_VALUE.
+            input_pts = i64::MIN;
+
+            if out_size > 0 && !out_buf.is_null() {
+                // SAFETY: out_buf é um buffer interno do parser válido até a
+                // próxima chamada de av_parser_parse2; copiamos imediatamente.
+                let slice = unsafe { std::slice::from_raw_parts(out_buf, out_size as usize) };
+                out.push((slice.to_vec(), pts_for_output(self.parser)));
+            }
+
+            if used == 0 && out_size == 0 {
+                // Parser não progrediu — evita loop infinito.
+                break;
+            }
+        }
+
+        out
+    }
+}
+
+/// Lê o PTS do output mais recente do parser (offset 48 em
+/// `AVCodecParserContext` x86-64, FFmpeg 7.x/8.x).
+///
+/// Layout relevante:
+///   priv_data (8) + parser_ptr (8) + frame_offset (8) + cur_offset (8)
+///   + next_frame_offset (8) = 40; pict_type (4) + repeat_pict (4) = 48; pts i64 = 48.
+///
+/// Retorna `None` para `AV_NOPTS_VALUE` (i64::MIN).
+///
+/// SAFETY: caller deve garantir que `parser` é um `AVCodecParserContext*` válido.
+#[inline]
+fn pts_for_output(parser: *mut AvCodecParserContext) -> Option<u64> {
+    if parser.is_null() {
+        return None;
+    }
+    // SAFETY: offset 48 corresponde a `pts: int64_t` no layout x86-64.
+    let raw = unsafe { *((parser as *const u8).add(48) as *const i64) };
+    if raw == i64::MIN {
+        None
+    } else {
+        Some(raw as u64)
+    }
+}
+
+impl Drop for FfmpegParser {
+    fn drop(&mut self) {
+        // SAFETY: parser foi alocado por av_parser_init; é o único dono.
+        if !self.parser.is_null() {
+            unsafe { (self.lib.av_parser_close)(self.parser) };
+        }
+    }
+}
+
 // ─── RAII: FfmpegFrame ────────────────────────────────────────────────────────
 
 /// Wrapper RAII para `AVFrame*`.
@@ -1034,7 +1226,12 @@ impl FfmpegFrame {
 
     /// Extrai os planos YUV de um frame de vídeo decodificado.
     ///
-    /// Suporta `YUV420P` (8-bit, `fmt == 0`) e `YUV420P10LE` (10-bit, `fmt == 63`).
+    /// Suporta:
+    /// - `YUV420P` (`fmt == 0`) — 4:2:0 8-bit
+    /// - `YUV420P10LE` (`fmt == 62`) — 4:2:0 10-bit little-endian
+    /// - `YUV422P` (`fmt == 4`) — 4:2:2 8-bit (chroma subsamplada verticalmente
+    ///   para encaixar no layout 4:2:0 do renderer)
+    /// - `YUV422P10LE` (`fmt == 64`) — 4:2:2 10-bit (idem)
     ///
     /// Retorna `(width, height, pts, [y_plane, u_plane, v_plane], (sar_num, sar_den),
     ///           raw_colorspace, raw_color_range, ten_bit)`.
@@ -1066,8 +1263,13 @@ impl FfmpegFrame {
             return Err(AvError::FfmpegError { code: -22 }); // EINVAL
         }
 
-        let ten_bit = fmt == AV_PIX_FMT_YUV420P10LE;
-        if fmt != AV_PIX_FMT_YUV420P && fmt != AV_PIX_FMT_YUV420P10LE {
+        let ten_bit = fmt == AV_PIX_FMT_YUV420P10LE || fmt == AV_PIX_FMT_YUV422P10LE;
+        let is_422 = fmt == AV_PIX_FMT_YUV422P || fmt == AV_PIX_FMT_YUV422P10LE;
+        if fmt != AV_PIX_FMT_YUV420P
+            && fmt != AV_PIX_FMT_YUV420P10LE
+            && fmt != AV_PIX_FMT_YUV422P
+            && fmt != AV_PIX_FMT_YUV422P10LE
+        {
             tracing::warn!(fmt, "to_yuv_planes: formato de pixel inesperado");
             return Err(AvError::FfmpegError { code: -22 });
         }
@@ -1077,6 +1279,10 @@ impl FfmpegFrame {
         let h = height as usize;
         let w_uv = w / 2;
         let h_uv = h / 2;
+        // Em 4:2:2, planos U/V têm altura igual a `h`; subsamplamos verticalmente
+        // pulando uma linha sim, uma não (`chroma_row_stride = 2`) para encaixar
+        // no layout 4:2:0 esperado pelo renderer. Em 4:2:0 a leitura é sequencial.
+        let chroma_row_stride = if is_422 { 2 } else { 1 };
 
         // ── Plano Y ──────────────────────────────────────────────────────────
         let ls_y = unsafe { frame_linesize(self.frame, 0) } as usize;
@@ -1096,8 +1302,9 @@ impl FfmpegFrame {
         let mut u_plane = vec![0u8; row_uv * h_uv];
         for row in 0..h_uv {
             // SAFETY: frame->data[1] aponta para plano U válido após receive_frame.
+            // Em 4:2:2, `chroma_row_stride == 2` salta uma linha (subsampling vertical).
             unsafe {
-                let src = frame_data_ptr(self.frame, 1).add(row * ls_u);
+                let src = frame_data_ptr(self.frame, 1).add(row * chroma_row_stride * ls_u);
                 std::ptr::copy_nonoverlapping(src, u_plane[row * row_uv..].as_mut_ptr(), row_uv);
             }
         }
@@ -1107,8 +1314,9 @@ impl FfmpegFrame {
         let mut v_plane = vec![0u8; row_uv * h_uv];
         for row in 0..h_uv {
             // SAFETY: frame->data[2] aponta para plano V válido após receive_frame.
+            // Em 4:2:2, `chroma_row_stride == 2` salta uma linha (subsampling vertical).
             unsafe {
-                let src = frame_data_ptr(self.frame, 2).add(row * ls_v);
+                let src = frame_data_ptr(self.frame, 2).add(row * chroma_row_stride * ls_v);
                 std::ptr::copy_nonoverlapping(src, v_plane[row * row_uv..].as_mut_ptr(), row_uv);
             }
         }

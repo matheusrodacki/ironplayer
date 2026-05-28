@@ -509,15 +509,20 @@ fn prepare_plane_data(plane: &[u8], ten_bit: bool) -> std::borrow::Cow<'_, [u8]>
     }
 }
 
-/// Escala cada amostra de 10-bit (armazenada em u16 LE com valor em bits [9:0],
-/// i.e. `raw = value << 2`) para o range completo R16Unorm (×16 → ≈ 0..65472).
+/// Escala cada amostra de 10-bit (armazenada em u16 LE no range [0..1023],
+/// nos 10 bits inferiores) para ocupar todo o range R16Unorm.
+///
+/// O shader normaliza dividindo por 65535.0 e espera o valor em [0..1].
+/// 10-bit → 16-bit equivale a `value << 6` (×64). Ex.: 1023 × 64 = 65472.
+/// Usar um multiplicador menor (ex.: 16) deixa o chroma neutro em ~0.125
+/// em vez de 0.5, e o YUV→RGB produz tela verde com R e B negativos.
 ///
 /// SPEC-AV-003
 fn scale_10bit_plane(plane: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; plane.len()];
     for (i, chunk) in plane.chunks_exact(2).enumerate() {
         let raw = u16::from_le_bytes([chunk[0], chunk[1]]);
-        let scaled = raw.saturating_mul(16);
+        let scaled = raw.saturating_mul(64);
         let bytes = scaled.to_le_bytes();
         out[i * 2] = bytes[0];
         out[i * 2 + 1] = bytes[1];
@@ -1696,12 +1701,12 @@ mod tests {
 
     // ── scale_10bit_plane ───────────────────────────────────────────────────
 
-    /// Máximo 10-bit (raw = 1023 << 2 = 4092) deve escalar para 65472 (= 4092 × 16).
+    /// Máximo 10-bit (raw = 1023, valor direto nos bits [9:0]) deve escalar
+    /// para 65472 (= 1023 × 64).
     #[test]
     fn spec_av_003_scale_10bit_max() {
         let max_10bit: u16 = 1023;
-        let raw: u16 = max_10bit << 2; // = 4092 (decoder armazena value<<2)
-        let input = raw.to_le_bytes();
+        let input = max_10bit.to_le_bytes();
         let out = scale_10bit_plane(&input);
         let result = u16::from_le_bytes([out[0], out[1]]);
         assert_eq!(result, 65472, "10-bit max deve escalar para 65472");

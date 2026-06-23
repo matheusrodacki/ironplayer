@@ -16,7 +16,7 @@ use egui::{ColorImage, TextureHandle, TextureId, TextureOptions};
 use egui_wgpu::CallbackTrait;
 
 use crate::error::AvError;
-use crate::hw::{ColorSpace, D3d11Device, HwPixelFormat, TransferFunction};
+use crate::hw::TransferFunction;
 use crate::video_queue::{HwVideoFrame, YuvColorRange, YuvColorspace, YuvFrame};
 
 // ─── Constante: shader WGSL embutido ─────────────────────────────────────────
@@ -159,14 +159,6 @@ impl YuvParamsGpu {
 
     fn for_sw_frame(colorspace: YuvColorspace, color_range: YuvColorRange, ten_bit: bool) -> Self {
         Self::for_frame(colorspace, color_range, TransferFunction::Bt1886, ten_bit)
-    }
-}
-
-fn yuv_colorspace_from_hw(color_space: ColorSpace) -> YuvColorspace {
-    match color_space {
-        ColorSpace::Bt601 => YuvColorspace::Bt601,
-        ColorSpace::Bt709 => YuvColorspace::Bt709,
-        ColorSpace::Bt2020 => YuvColorspace::Bt2020,
     }
 }
 
@@ -1010,37 +1002,28 @@ impl CallbackTrait for NvPaintCallback {
 /// SPEC-AV-RENDER-NV12-001
 struct NvRenderer {
     state: Arc<Mutex<NvPipelineInner>>,
-    d3d11_dev: Arc<D3d11Device>,
 }
 
 impl NvRenderer {
-    fn new(
-        device: &wgpu::Device,
-        d3d11_dev: Arc<D3d11Device>,
-        target_format: wgpu::TextureFormat,
-    ) -> Result<Self, AvError> {
+    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Result<Self, AvError> {
         let inner = NvPipelineInner::create(device, target_format)?;
         Ok(Self {
             state: Arc::new(Mutex::new(inner)),
-            d3d11_dev,
         })
     }
 
-    fn upload_hw(&self, hw: &HwVideoFrame) -> Result<(), AvError> {
-        let planes = self.d3d11_dev.extract_nv12_planes(&hw.tex)?;
+    /// Recebe um `HwVideoFrame` cujos planos NV12/P010 já foram extraídos no
+    /// decoder. Apenas move os planos para o estado pendente — sem tocar D3D11.
+    fn upload_hw(&self, hw: HwVideoFrame) -> Result<(), AvError> {
         let pending = NvPendingFrame {
-            y_data: planes.y_data,
-            uv_data: planes.uv_data,
-            width: planes.width,
-            height: planes.height,
-            colorspace: yuv_colorspace_from_hw(hw.tex.color_space),
-            color_range: if hw.tex.full_range {
-                YuvColorRange::Full
-            } else {
-                YuvColorRange::Limited
-            },
-            transfer: hw.tex.transfer,
-            ten_bit: planes.ten_bit,
+            y_data: hw.planes.y_data,
+            uv_data: hw.planes.uv_data,
+            width: hw.planes.width,
+            height: hw.planes.height,
+            colorspace: hw.colorspace,
+            color_range: hw.color_range,
+            transfer: hw.transfer,
+            ten_bit: hw.planes.ten_bit,
         };
         if let Ok(mut inner) = self.state.lock() {
             inner.pending = Some(pending);
@@ -1143,7 +1126,6 @@ enum RendererInner {
 struct GpuRendererContext {
     device: Arc<wgpu::Device>,
     target_format: wgpu::TextureFormat,
-    d3d11_dev: Option<Arc<D3d11Device>>,
 }
 
 /// Renderizador de frames de vídeo: modo GPU (wgpu PaintCallback) ou CPU (fallback).
@@ -1175,25 +1157,20 @@ pub struct VideoRenderer {
 }
 
 impl VideoRenderer {
-    /// Cria um `VideoRenderer` em modo GPU HW NV12 zero-copy (Fase C D3D11VA).
+    /// Cria um `VideoRenderer` em modo GPU HW NV12 (Fase C D3D11VA).
     ///
-    /// `device`       : dispositivo wgpu do `eframe::CreationContext::wgpu_render_state`.
-    /// `d3d11_dev`    : device D3D11 para staging copy NV12.
-    /// `target_format`: formato do framebuffer de saída.
+    /// Os planos NV12 são extraídos no decoder; este renderer apenas faz upload
+    /// wgpu. Requer que `d3d11_dev` exista no bootstrap (caller usa
+    /// `new_hw_gpu` vs `new_gpu` para escolher o modo).
     ///
     /// SPEC-AV-RENDER-NV12-001
-    pub fn new_hw_gpu(
-        device: Arc<wgpu::Device>,
-        d3d11_dev: Arc<D3d11Device>,
-        target_format: wgpu::TextureFormat,
-    ) -> Self {
-        match NvRenderer::new(&device, Arc::clone(&d3d11_dev), target_format) {
+    pub fn new_hw_gpu(device: Arc<wgpu::Device>, target_format: wgpu::TextureFormat) -> Self {
+        match NvRenderer::new(&device, target_format) {
             Ok(nv) => Self {
                 inner: RendererInner::HwGpu(nv),
                 gpu_context: Some(GpuRendererContext {
                     device,
                     target_format,
-                    d3d11_dev: Some(d3d11_dev),
                 }),
                 cpu_ctx: None,
                 upload_bytes_window: 0,
@@ -1222,28 +1199,17 @@ impl VideoRenderer {
         }
     }
 
-    /// Envia um `HwVideoFrame` (D3D11VA NV12) para renderização zero-copy.
-    ///
-    /// Extrai os planos NV12 via staging D3D11 e armazena pendente para upload
-    /// no `prepare()` do próximo frame egui.  Retorna erro se o renderer não
-    /// estiver no modo `HwGpu` ou se a extração D3D11 falhar.
+    /// Envia um `HwVideoFrame` (planos NV12/P010 já extraídos no decoder) para
+    /// renderização. Retorna erro se o renderer não estiver no modo `HwGpu`.
     ///
     /// SPEC-AV-RENDER-NV12-001
-    pub fn upload_hw(&mut self, hw: &HwVideoFrame) -> Result<(), AvError> {
-        self.ensure_hw_renderer(Arc::clone(&hw.d3d11_dev))?;
-        self.last_colorspace = Some(yuv_colorspace_from_hw(hw.tex.color_space));
-        self.last_color_range = Some(if hw.tex.full_range {
-            YuvColorRange::Full
-        } else {
-            YuvColorRange::Limited
-        });
+    pub fn upload_hw(&mut self, hw: HwVideoFrame) -> Result<(), AvError> {
+        self.ensure_hw_renderer()?;
+        self.last_colorspace = Some(hw.colorspace);
+        self.last_color_range = Some(hw.color_range);
 
         // Contabiliza bytes: w × h (Y) + w × h/2 (UV interleaved) = w × h × 3/2.
-        let bytes_per_sample: u64 = if matches!(hw.tex.format, HwPixelFormat::P010) {
-            2
-        } else {
-            1
-        };
+        let bytes_per_sample: u64 = if hw.planes.ten_bit { 2 } else { 1 };
         let frame_bytes = (hw.width as u64 * hw.height as u64
             + hw.width as u64 * hw.height.div_ceil(2) as u64)
             * bytes_per_sample;
@@ -1283,7 +1249,6 @@ impl VideoRenderer {
                 gpu_context: Some(GpuRendererContext {
                     device,
                     target_format,
-                    d3d11_dev: None,
                 }),
                 cpu_ctx: None,
                 upload_bytes_window: 0,
@@ -1473,19 +1438,17 @@ impl VideoRenderer {
         ))
     }
 
-    fn ensure_hw_renderer(&mut self, d3d11_dev: Arc<D3d11Device>) -> Result<(), AvError> {
+    fn ensure_hw_renderer(&mut self) -> Result<(), AvError> {
         if matches!(self.inner, RendererInner::HwGpu(_)) {
             return Ok(());
         }
 
-        let Some(mut context) = self.gpu_context.clone() else {
+        let Some(context) = self.gpu_context.clone() else {
             return Err(AvError::HwInitFailed(
                 "renderer não possui contexto wgpu para ativar upload HW".into(),
             ));
         };
-        context.d3d11_dev = Some(Arc::clone(&d3d11_dev));
-        let nv = NvRenderer::new(&context.device, d3d11_dev, context.target_format)?;
-        self.gpu_context = Some(context);
+        let nv = NvRenderer::new(&context.device, context.target_format)?;
         self.inner = RendererInner::HwGpu(nv);
         Ok(())
     }

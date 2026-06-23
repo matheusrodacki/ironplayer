@@ -95,7 +95,14 @@ pub const AV_PIX_FMT_D3D11: c_int = 171;
 /// `AV_HWDEVICE_TYPE_D3D11VA` — identificador do tipo de device hardware D3D11VA.
 pub const AV_HWDEVICE_TYPE_D3D11VA: c_int = 7;
 
-/// Offset do campo `hw_device_ctx` em `AVCodecContext` (FFmpeg 7.x / avcodec-62, x86-64).
+/// Offset do campo `data` em `AVBufferRef` (FFmpeg 7.x / avutil-62, x86-64).
+pub(crate) const AV_BUFFER_REF_DATA_OFFSET: usize = 8;
+
+/// Offset do campo `hwctx` em `AVHWDeviceContext` (x86-64).
+pub(crate) const AV_HWDEVICE_CTX_HWCTX_OFFSET: usize = 16;
+
+/// `AVCOL_RANGE_JPEG` — faixa de cor full (0–255).
+pub(crate) const AV_COL_RANGE_JPEG: i32 = 2;
 ///
 /// Confirmado via sondagem runtime: `hwaccel_flags` (AVOption) está em offset +568,
 /// portanto o ponteiro `AVBufferRef*` imediatamente anterior fica em +560.
@@ -452,6 +459,12 @@ type FnAvHwdeviceCtxCreate = unsafe extern "C" fn(
     flags: c_int,
 ) -> c_int;
 
+/// `av_hwdevice_ctx_alloc` — aloca um `AVBufferRef` para `AVHWDeviceContext` sem inicializar.
+type FnAvHwdeviceCtxAlloc = unsafe extern "C" fn(type_: c_int) -> *mut c_void;
+
+/// `av_hwdevice_ctx_init` — inicializa um contexto alocado por `av_hwdevice_ctx_alloc`.
+type FnAvHwdeviceCtxInit = unsafe extern "C" fn(ctx: *mut c_void) -> c_int;
+
 /// `av_hwframe_transfer_data` — copia dados de um frame HW para um frame SW.
 type FnAvHwframeTransferData =
     unsafe extern "C" fn(dst: *mut c_void, src: *const c_void, flags: c_int) -> c_int;
@@ -514,6 +527,8 @@ pub struct FfmpegLib {
 
     // Funções hw-accel (D3D11VA, SPEC-AV-HW-DEC-001)
     pub(crate) av_hwdevice_ctx_create: FnAvHwdeviceCtxCreate,
+    pub(crate) av_hwdevice_ctx_alloc: FnAvHwdeviceCtxAlloc,
+    pub(crate) av_hwdevice_ctx_init: FnAvHwdeviceCtxInit,
     pub(crate) av_hwframe_transfer_data: FnAvHwframeTransferData,
     pub(crate) av_buffer_ref: FnAvBufferRef,
     pub(crate) av_buffer_unref: FnAvBufferUnref,
@@ -624,6 +639,9 @@ impl FfmpegLib {
 
         let av_hwdevice_ctx_create =
             sym!(avutil, b"av_hwdevice_ctx_create\0", FnAvHwdeviceCtxCreate);
+        let av_hwdevice_ctx_alloc =
+            sym!(avutil, b"av_hwdevice_ctx_alloc\0", FnAvHwdeviceCtxAlloc);
+        let av_hwdevice_ctx_init = sym!(avutil, b"av_hwdevice_ctx_init\0", FnAvHwdeviceCtxInit);
         let av_hwframe_transfer_data = sym!(
             avutil,
             b"av_hwframe_transfer_data\0",
@@ -662,6 +680,8 @@ impl FfmpegLib {
             av_dict_set,
             av_dict_free,
             av_hwdevice_ctx_create,
+            av_hwdevice_ctx_alloc,
+            av_hwdevice_ctx_init,
             av_hwframe_transfer_data,
             av_buffer_ref,
             av_buffer_unref,
@@ -685,6 +705,59 @@ impl FfmpegLib {
             format!("código {code}")
         }
     }
+}
+
+/// Lê o ponteiro `data` de um `AVBufferRef*` (layout x86-64 FFmpeg 7.x).
+///
+/// SAFETY: `buf` deve ser um `AVBufferRef*` válido.
+#[inline]
+unsafe fn buffer_ref_data(buf: *mut c_void) -> *mut u8 {
+    *((buf as *const u8).add(AV_BUFFER_REF_DATA_OFFSET) as *const *mut u8)
+}
+
+/// Cria um `AVBufferRef` de device D3D11VA reutilizando `ID3D11Device` existente.
+///
+/// SPEC-AV-HW-DEC-001
+#[cfg(windows)]
+unsafe fn create_d3d11_hw_device_ctx(
+    lib: &FfmpegLib,
+    device: *mut c_void,
+    context: *mut c_void,
+) -> Result<*mut c_void, AvError> {
+    use crate::hw::com_addref;
+
+    let hw_buf = (lib.av_hwdevice_ctx_alloc)(AV_HWDEVICE_TYPE_D3D11VA);
+    if hw_buf.is_null() {
+        return Err(AvError::FfmpegError { code: -12 });
+    }
+
+    let hw_dev = buffer_ref_data(hw_buf) as *mut c_void;
+    let d3d11_va_ctx = *((hw_dev as *const u8).add(AV_HWDEVICE_CTX_HWCTX_OFFSET)
+        as *const *mut c_void);
+    if d3d11_va_ctx.is_null() {
+        let mut buf = hw_buf;
+        (lib.av_buffer_unref)(&mut buf);
+        return Err(AvError::FfmpegError { code: -22 });
+    }
+
+    com_addref(device);
+    com_addref(context);
+    std::ptr::write(
+        (d3d11_va_ctx as *mut u8).add(0) as *mut *mut c_void,
+        device,
+    );
+    std::ptr::write(
+        (d3d11_va_ctx as *mut u8).add(8) as *mut *mut c_void,
+        context,
+    );
+
+    let ret = (lib.av_hwdevice_ctx_init)(hw_buf);
+    if ret < 0 {
+        let mut buf = hw_buf;
+        (lib.av_buffer_unref)(&mut buf);
+        return Err(AvError::FfmpegError { code: ret });
+    }
+    Ok(hw_buf)
 }
 
 // ─── RAII: FfmpegCodecContext ─────────────────────────────────────────────────
@@ -810,17 +883,10 @@ impl FfmpegCodecContext {
 
     /// Abre um decodificador FFmpeg com aceleração de hardware D3D11VA.
     ///
-    /// Cria um `AVHWDeviceContext` via `av_hwdevice_ctx_create` (o FFmpeg cria
-    /// internamente um `ID3D11Device` próprio) e o escreve no campo
-    /// `hw_device_ctx` de `AVCodecContext` (offset +560, verificado via sondagem
-    /// em tempo de execução) antes de chamar `avcodec_open2`.
-    ///
-    /// O `avcodec_default_get_format` padrão do FFmpeg seleciona automaticamente
-    /// `AV_PIX_FMT_D3D11` quando `hw_device_ctx` está preenchido — não é
-    /// necessário registrar um callback `get_format` customizado.
-    ///
-    /// Retorna `Err` se o device HW não puder ser criado ou o codec falhar ao
-    /// abrir com o device — o caller deve fazer fallback para `open()` (SW).
+    /// Quando `external_d3d11` é `Some((device, context))`, injeta o
+    /// `ID3D11Device` existente no `AVD3D11VADeviceContext` (device compartilhado
+    /// com wgpu). Caso contrário, o FFmpeg cria um device próprio via
+    /// `av_hwdevice_ctx_create`.
     ///
     /// SPEC-AV-HW-DEC-001
     pub fn open_with_hwaccel(
@@ -828,6 +894,7 @@ impl FfmpegCodecContext {
         codec_id: u32,
         config: &CodecConfig,
         hw_type: c_int,
+        external_d3d11: Option<(*mut c_void, *mut c_void)>,
     ) -> Result<Self, AvError> {
         // SAFETY: avcodec_find_decoder é thread-safe e retorna ponteiro estático.
         let codec = unsafe { (lib.avcodec_find_decoder)(codec_id) };
@@ -843,27 +910,47 @@ impl FfmpegCodecContext {
             return Err(AvError::FfmpegError { code: -12 }); // ENOMEM
         }
 
-        // Cria AVHWDeviceContext. O FFmpeg cria um ID3D11Device interno para o tipo
-        // solicitado. No Windows, hw_type=7 (AV_HWDEVICE_TYPE_D3D11VA).
-        let mut hw_ctx: *mut c_void = std::ptr::null_mut();
-        let hw_ret = unsafe {
-            (lib.av_hwdevice_ctx_create)(
-                &mut hw_ctx,
-                hw_type,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                0,
-            )
+        let hw_ctx = if let Some((device, context)) = external_d3d11 {
+            #[cfg(windows)]
+            {
+                match unsafe { create_d3d11_hw_device_ctx(&lib, device, context) } {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        let mut p = ctx;
+                        unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+                        return Err(e);
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (device, context);
+                let mut p = ctx;
+                unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+                return Err(AvError::HwInitFailed(
+                    "device D3D11 externo indisponível fora do Windows".into(),
+                ));
+            }
+        } else {
+            let mut created: *mut c_void = std::ptr::null_mut();
+            let hw_ret = unsafe {
+                (lib.av_hwdevice_ctx_create)(
+                    &mut created,
+                    hw_type,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if hw_ret < 0 {
+                let mut p = ctx;
+                unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+                return Err(AvError::FfmpegError { code: hw_ret });
+            }
+            created
         };
-        if hw_ret < 0 {
-            let mut p = ctx;
-            unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
-            return Err(AvError::FfmpegError { code: hw_ret });
-        }
 
         // Cria uma referência adicional ao hw_ctx para transferir ao AVCodecContext.
-        // O FFmpeg AddRef-a internamente durante avcodec_open2; liberamos nossa cópia
-        // original logo após a abertura. hw_ref passa a ser propriedade do contexto.
         let hw_ref = unsafe { (lib.av_buffer_ref)(hw_ctx) };
         if hw_ref.is_null() {
             let mut hw = hw_ctx;
@@ -874,8 +961,6 @@ impl FfmpegCodecContext {
         }
 
         // Escreve hw_ref no campo hw_device_ctx do AVCodecContext (offset +560).
-        // SAFETY: ctx é não-nulo e alinhado a 8 bytes; offset 560 é múltiplo de 8;
-        //         hw_ref é um AVBufferRef* não-nulo.
         unsafe {
             std::ptr::write_unaligned(
                 (ctx as *mut u8).add(AV_CTX_HW_DEVICE_CTX_OFFSET) as *mut *mut c_void,
@@ -883,9 +968,6 @@ impl FfmpegCodecContext {
             );
         }
 
-        // Libera nossa referência original (hw_ctx). A cópia hw_ref já foi
-        // transferida para o contexto — o FFmpeg a mantém viva enquanto o
-        // AVCodecContext existir e a libera via avcodec_free_context.
         let mut hw = hw_ctx;
         unsafe { (lib.av_buffer_unref)(&mut hw) };
 
@@ -1581,7 +1663,6 @@ impl FfmpegFrame {
     ///
     /// SPEC-AV-HW-DEC-001
     #[allow(clippy::type_complexity)]
-    #[allow(dead_code)]
     pub(crate) fn hw_frame_info(
         &self,
     ) -> Result<(*mut c_void, u32, u32, u32, i64, (u32, u32), i32, i32, i32), crate::error::AvError>
@@ -1632,7 +1713,6 @@ impl FfmpegFrame {
     ///
     /// SPEC-AV-HW-DEC-001
     #[allow(clippy::type_complexity)]
-    #[allow(dead_code)]
     pub(crate) fn download_to_yuv_planes(
         &self,
     ) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {

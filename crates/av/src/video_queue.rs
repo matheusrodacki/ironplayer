@@ -127,18 +127,24 @@ pub struct YuvFrame {
 
 // ─── HwVideoFrame ─────────────────────────────────────────────────────────────
 
-/// Frame de vídeo HW produzido pelo decoder D3D11VA — Fase C zero-copy.
+/// Frame de vídeo HW produzido pelo decoder D3D11VA.
 ///
-/// Encapsula a textura D3D11 AddRef'd (viva enquanto este struct existir)
-/// e o `D3d11Device` necessário para a extração NV12 no renderer.
+/// Os planos NV12/P010 **já foram extraídos** da surface D3D11 (staging copy
+/// feita no decoder, enquanto o `AVFrame` ainda estava vivo e a surface do pool
+/// continha este frame). Isso evita o batimento ("zig-zag") causado por reuso
+/// da surface: se a cópia fosse adiada para a thread de render, o decoder já
+/// teria reescrito a slice do pool com um frame mais novo.
 ///
 /// SPEC-AV-HW-TEX-001
-#[derive(Debug)]
 pub struct HwVideoFrame {
-    /// Textura D3D11VA com AddRef próprio.
-    pub tex: crate::hw::D3d11Texture,
-    /// Device D3D11 para staging copy na renderização.
-    pub d3d11_dev: std::sync::Arc<crate::hw::D3d11Device>,
+    /// Planos NV12/P010 compactados (CPU), prontos para upload à GPU.
+    pub planes: crate::hw::NvPlanes,
+    /// Espaço de cor para a matriz YUV→RGB.
+    pub colorspace: YuvColorspace,
+    /// Faixa de cor (limited/full).
+    pub color_range: YuvColorRange,
+    /// Curva de transferência (BT.1886, PQ, HLG, sRGB).
+    pub transfer: crate::hw::TransferFunction,
     /// PTS do frame em unidades de 90 kHz.
     pub pts: Option<u64>,
     /// Largura do frame em pixels.
@@ -151,9 +157,16 @@ pub struct HwVideoFrame {
     pub sar_den: u32,
 }
 
-// SAFETY: D3d11Texture e D3d11Device são Send+Sync (multithread protegido).
-unsafe impl Send for HwVideoFrame {}
-unsafe impl Sync for HwVideoFrame {}
+impl std::fmt::Debug for HwVideoFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HwVideoFrame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("pts", &self.pts)
+            .field("ten_bit", &self.planes.ten_bit)
+            .finish()
+    }
+}
 
 // ─── VideoFrame ───────────────────────────────────────────────────────────────
 

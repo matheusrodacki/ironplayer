@@ -242,6 +242,33 @@ impl D3d11Device {
     pub unsafe fn as_raw(&self) -> *mut std::ffi::c_void {
         self.device.as_raw()
     }
+
+    /// Ponteiro bruto para o `ID3D11DeviceContext` imediato.
+    ///
+    /// # Safety
+    ///
+    /// O chamador deve chamar `AddRef` se armazenar o ponteiro além do tempo de
+    /// vida deste `D3d11Device`.
+    ///
+    /// SPEC-AV-HW-001
+    pub unsafe fn as_raw_context(&self) -> *mut std::ffi::c_void {
+        self.context.as_raw()
+    }
+}
+
+/// Incrementa o refcount COM de um ponteiro `IUnknown` (usado ao injetar
+/// `ID3D11Device` / `ID3D11DeviceContext` no `AVD3D11VADeviceContext` do FFmpeg).
+///
+/// # Safety
+///
+/// `ptr` deve ser um ponteiro COM válido ou nulo (nulo é ignorado).
+pub(crate) unsafe fn com_addref(ptr: *mut std::ffi::c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    let borrowed =
+        std::mem::ManuallyDrop::new(windows::core::IUnknown::from_raw(ptr as *mut _));
+    let _ = borrowed.clone();
 }
 
 impl Drop for D3d11Device {
@@ -564,26 +591,23 @@ impl D3d11Device {
         }
 
         // ── 4. Map + extração compacta ─────────────────────────────────────────
-        let mut mapped_y = D3D11_MAPPED_SUBRESOURCE::default();
-        let mut mapped_uv = D3D11_MAPPED_SUBRESOURCE::default();
-
+        //
+        // NV12/P010 são uma única allocation: o plano UV segue o plano Y.
+        // Formatos planares NÃO suportam `Map` por plane-subresource (apenas
+        // `CopySubresourceRegion`/SRV aceitam plane slices). A textura staging
+        // tem ArraySize=1 e MipLevels=1, portanto o único subresource mapeável
+        // é o índice 0 — mapear o índice 1 retorna E_INVALIDARG (0x80070057).
+        //
+        // `Map(0)` expõe a surface inteira: o plano UV fica em
+        // `pData + RowPitch * Height` (layout NV12/P010 canônico).
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe {
             self.context
-                .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped_y))
-                .map_err(|e| map_d3d11_error("Map Y", e))?;
+                .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| map_d3d11_error("Map NV12", e))?;
         }
 
-        // Map UV — se falhar, deve Unmap Y antes de retornar
-        let uv_map_result = unsafe {
-            self.context
-                .Map(&staging_res, 1, D3D11_MAP_READ, 0, Some(&mut mapped_uv))
-        };
-        if let Err(e) = uv_map_result {
-            unsafe { self.context.Unmap(&staging_res, 0) };
-            return Err(map_d3d11_error("Map UV", e));
-        }
-
-        // Copia Y compactado (sem row padding do driver)
+        // Copia Y/UV compactados (sem row padding do driver).
         let w = width as usize;
         let h = height as usize;
         let h_uv = h.div_ceil(2);
@@ -592,21 +616,22 @@ impl D3d11Device {
         let mut y_data = vec![0u8; row_bytes * h];
         let mut uv_data = vec![0u8; row_bytes * h_uv];
 
-        let y_row_pitch = mapped_y.RowPitch as usize;
-        let uv_row_pitch = mapped_uv.RowPitch as usize;
+        let row_pitch = mapped.RowPitch as usize;
+        // Offset do plano UV dentro da surface NV12/P010 mapeada.
+        let uv_plane_offset = row_pitch * h;
 
         unsafe {
-            let y_src = mapped_y.pData as *const u8;
+            let base = mapped.pData as *const u8;
             for row in 0..h {
-                let src = y_src.add(row * y_row_pitch);
+                let src = base.add(row * row_pitch);
                 let dst = y_data[row * row_bytes..].as_mut_ptr();
                 std::ptr::copy_nonoverlapping(src, dst, row_bytes);
             }
 
-            let uv_src = mapped_uv.pData as *const u8;
+            let uv_base = base.add(uv_plane_offset);
             for row in 0..h_uv {
                 // Cada linha UV tem `width × bytes_per_sample` bytes compactados.
-                let src = uv_src.add(row * uv_row_pitch);
+                let src = uv_base.add(row * row_pitch);
                 let dst = uv_data[row * row_bytes..].as_mut_ptr();
                 std::ptr::copy_nonoverlapping(src, dst, row_bytes);
             }
@@ -614,7 +639,6 @@ impl D3d11Device {
 
         // ── 5. Unmap ───────────────────────────────────────────────────────────
         unsafe {
-            self.context.Unmap(&staging_res, 1);
             self.context.Unmap(&staging_res, 0);
         }
 

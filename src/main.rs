@@ -596,6 +596,7 @@ fn main() -> eframe::Result<()> {
         let video_frames_tx = ch.video_frames_tx;
         let video_frames_rx_for_drop = ch.video_frames_rx.clone();
         let audio_frames_tx = ch.audio_frames_tx;
+        let audio_frames_rx_for_drop = ch.audio_frames_rx.clone();
         let audio_status = audio_status.clone();
         // Constrói CodecConfig a partir do DecoderConfig lido do ironstream.toml.
         //
@@ -790,7 +791,10 @@ fn main() -> eframe::Result<()> {
                                                     );
                                                 }
                                                 av::DecodedFrame::Audio(af) => {
-                                                    audio_frames_tx.try_send(af);
+                                                    audio_frames_tx.try_send_latest(
+                                                        &audio_frames_rx_for_drop,
+                                                        af,
+                                                    );
                                                 }
                                             }
                                         }

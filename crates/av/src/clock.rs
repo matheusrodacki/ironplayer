@@ -182,6 +182,18 @@ impl AudioClockHandle {
         let latency = self.playback_latency_samples.load(Ordering::Relaxed);
         submitted.saturating_sub(latency)
     }
+
+    /// Identificador estável do handle — ponteiro do contador de samples.
+    ///
+    /// Clones do mesmo handle (mesma `AudioOutput`) retornam o mesmo id; um
+    /// handle recriado por uma nova saída de áudio (troca de serviço/trilha)
+    /// retorna um id distinto. Usado pela UI para detectar substituição do
+    /// clock e re-adotá-lo, evitando travar o relógio num handle obsoleto.
+    ///
+    /// SPEC-AV-CLOCK-002
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.samples_played) as usize
+    }
 }
 
 impl Clock for AudioClockHandle {

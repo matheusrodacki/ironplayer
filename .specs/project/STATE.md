@@ -42,7 +42,25 @@
 
 ## Lições Aprendidas
 
-_(vazio — preencher durante implementação)_
+### L-001 — D3D11VA / A/V sync: armadilhas de debug (2026-06-23)
+
+Sessão de debug em stream multicast H.264 (`h264_d3d11va`, Intel Arc). Sintomas e **invariantes que não podem regredir**:
+
+| Sintoma | Causa raiz | Invariante obrigatória |
+| ------- | ---------- | ---------------------- |
+| Tela preta + `Map UV: 0x80070057` | `Map(subresource 1)` em textura staging NV12 — formatos planares só permitem `Map(0)`; UV fica em `pData + RowPitch × Height` | `extract_nv12_planes`: um único `Map(0)`; `CopySubresourceRegion` para Y/UV continua válido |
+| Tela preta + offset A/V ~+80 s, milhares de frames *held* | UI não re-adotava `AudioClockHandle` após reset/troca de serviço (`clock_uses_audio` bloqueava upgrade; contador de samples congelado) | `adopted_audio_clock_id` + re-adotar handle quando `audio-out` publica novo id |
+| Vídeo em "zig-zag" / frames repetidos | `AddRef` na textura D3D11 **não** impede reuso da **slice** do pool após `AVFrame::unref`; cópia adiada para a UI lia surface já reescrita | Staging copy (`extract_nv12_planes`) **no decoder**, enquanto o `AVFrame` está vivo; canal transporta `NvPlanes` (CPU), não `D3d11Texture` |
+| Desync A/V (wall vs áudio) | `video_clock_initialized` servia para wall **e** bloqueava upgrade para `AudioClock` | Flags separadas: `clock_uses_audio` vs `video_clock_initialized` |
+
+**Checklist rápido em regressão GPU:**
+
+1. Log `poll_video_frames: falha no upload` com `Map UV` → rever `d3d11_impl::extract_nv12_planes`.
+2. Imagem ok mas batimento cíclico → verificar se cópia NV12 ainda ocorre na thread UI (deve ser no `av-decode`).
+3. Áudio ok, vídeo preto/travado após trocar serviço → verificar re-adoption do `AudioClockHandle` em `ui::poll_video_frames`.
+4. `Pool frames: 1` no painel Debug A/V é esperado com cópia imediata; não confundir com pool FFmpeg.
+
+Refs: `crates/av/src/hw/d3d11_impl.rs`, `crates/av/src/decoder.rs` (`try_hw_zero_copy`), `crates/ui/src/lib.rs` (`poll_video_frames`), `.specs/features/spec-09-gpu-decode/tdd-sprint-02-gpu-decode.md` §16.
 
 ---
 

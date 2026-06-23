@@ -109,8 +109,16 @@ pub struct IronPlayerApp {
     ///
     /// SPEC-AV-VQ-001
     video_clock: MasterClock,
-    /// Indica se o clock de vídeo já foi ancorado ao PTS do primeiro frame.
+    /// Indica se o clock de vídeo já foi ancorado (wall no primeiro PTS ou áudio).
     video_clock_initialized: bool,
+    /// `true` quando `video_clock` usa `AudioClock` como master A/V.
+    clock_uses_audio: bool,
+    /// Id estável do `AudioClockHandle` atualmente adotado pela UI.
+    ///
+    /// Permite detectar quando a thread `audio-out` publica um handle novo
+    /// (troca de serviço/trilha) e re-adotá-lo, em vez de continuar usando um
+    /// handle obsoleto cujo contador de samples está congelado.
+    adopted_audio_clock_id: Option<usize>,
     /// Renderizador de vídeo: mantém textura GPU/CPU entre frames.
     ///
     /// SPEC-AV-003
@@ -172,9 +180,8 @@ impl IronPlayerApp {
         let video_renderer = video_frames_rx.as_ref().map(|_| {
             if let Some(wgpu_state) = &cc.wgpu_render_state {
                 match d3d11_device.as_ref() {
-                    Some(d3d11_dev) => VideoRenderer::new_hw_gpu(
+                    Some(_d3d11_dev) => VideoRenderer::new_hw_gpu(
                         wgpu_state.device.clone(),
-                        Arc::clone(d3d11_dev),
                         wgpu_state.target_format,
                     ),
                     None => VideoRenderer::new_gpu(
@@ -203,6 +210,8 @@ impl IronPlayerApp {
             video_queue: VideoQueue::default(),
             video_clock: MasterClock::wall(0),
             video_clock_initialized: false,
+            clock_uses_audio: false,
+            adopted_audio_clock_id: None,
             video_renderer,
             video_dims: None,
             aspect_ratio_mode: AspectRatioMode::default(),
@@ -334,6 +343,8 @@ impl IronPlayerApp {
         // um novo AudioClockHandle e video_clock será trocado novamente.
         self.video_clock = MasterClock::wall(0);
         self.video_clock_initialized = false;
+        self.clock_uses_audio = false;
+        self.adopted_audio_clock_id = None;
         // Limpa o handle de áudio obsoleto para que poll_video_frames troque
         // para o novo handle da próxima sessão.
         if let Some(rx) = &self.audio_clock_rx {
@@ -372,17 +383,35 @@ impl IronPlayerApp {
             None => return,
         };
 
-        // 1. Tenta trocar para AudioClock assim que audio-out publicar o handle.
-        //    Isso é feito antes de drenar frames para que o clock já esteja
-        //    correto quando processarmos o primeiro frame abaixo.
-        //    `video_clock_initialized` é reaproveitado como flag "já trocado".
-        if !self.video_clock_initialized {
-            if let Some(rx) = &self.audio_clock_rx {
-                if let Ok(guard) = rx.try_read() {
-                    if let Some(handle) = guard.as_ref() {
-                        self.video_clock = MasterClock::Audio(handle.clone());
-                        self.video_clock_initialized = true;
-                        tracing::debug!("poll_video_frames: trocado para AudioClock (A/V master)");
+        // 1. Adota (ou re-adota) o AudioClockHandle publicado por audio-out.
+        //    - Upgrade wall→áudio mesmo após o vídeo ter ancorado o WallClock.
+        //    - Detecta substituição do handle (troca de serviço/trilha) via id
+        //      estável: um handle recriado tem id distinto, então trocamos o
+        //      clock em vez de travar num handle obsoleto (contador congelado).
+        if let Some(rx) = &self.audio_clock_rx {
+            if let Ok(guard) = rx.try_read() {
+                match guard.as_ref() {
+                    Some(handle) => {
+                        let id = handle.id();
+                        if self.adopted_audio_clock_id != Some(id) {
+                            self.video_clock = MasterClock::Audio(handle.clone());
+                            self.adopted_audio_clock_id = Some(id);
+                            self.clock_uses_audio = true;
+                            self.video_clock_initialized = true;
+                            tracing::debug!(
+                                clock_id = id,
+                                "poll_video_frames: AudioClock adotado (A/V master)"
+                            );
+                        }
+                    }
+                    None => {
+                        // Áudio em reinicialização (reset/troca de serviço): marca
+                        // para re-adotar o próximo handle. Mantém o clock atual até
+                        // lá (freeze breve de ~1 frame, sem salto de PTS).
+                        if self.adopted_audio_clock_id.is_some() {
+                            self.adopted_audio_clock_id = None;
+                            self.clock_uses_audio = false;
+                        }
                     }
                 }
             }
@@ -390,9 +419,9 @@ impl IronPlayerApp {
 
         // 2. Drena até 16 frames do canal e insere na fila PTS-ordenada.
         for frame in rx.try_iter().take(16) {
-            // Fallback: ancora o WallClock no PTS do primeiro frame caso ainda
-            // não tenhamos AudioClock disponível.
-            if !self.video_clock_initialized {
+            // Fallback: ancora o WallClock no PTS do primeiro frame apenas sem
+            // AudioClock (não sobrescreve após upgrade para áudio).
+            if !self.clock_uses_audio && !self.video_clock_initialized {
                 if let Some(pts) = frame.pts() {
                     self.video_clock.reset(pts as i64);
                     self.video_clock_initialized = true;
@@ -422,8 +451,14 @@ impl IronPlayerApp {
         // 3. Faz upload do frame ao renderer.
         if let Some(frame) = ready_frame {
             if let Some(renderer) = &mut self.video_renderer {
-                let upload_result = match &frame {
-                    VideoFrame::Sw(yuv) => renderer.upload(yuv),
+                let (frame_w, frame_h, sar_num, sar_den) = (
+                    frame.width(),
+                    frame.height(),
+                    frame.sar_num(),
+                    frame.sar_den(),
+                );
+                let upload_result = match frame {
+                    VideoFrame::Sw(ref yuv) => renderer.upload(yuv),
                     VideoFrame::Hw(hw) => renderer.upload_hw(hw),
                 };
                 match upload_result {
@@ -454,14 +489,13 @@ impl IronPlayerApp {
                         // DAR = SAR * (w/h); mantemos w fixo e ajustamos h:
                         //   display_h = pixel_h * sar_den / sar_num
                         // Para 1920×540 com SAR 1:2 → display_h = 540*2/1 = 1080 → 16:9
-                        let (sar_num, sar_den) = (frame.sar_num(), frame.sar_den());
                         let display_h = if sar_num > 1 || sar_den > 1 {
-                            let h64 = frame.height() as u64 * sar_den as u64;
+                            let h64 = frame_h as u64 * sar_den as u64;
                             (h64 / sar_num.max(1) as u64) as u32
                         } else {
-                            frame.height()
+                            frame_h
                         };
-                        self.video_dims = Some((frame.width(), display_h.max(1)));
+                        self.video_dims = Some((frame_w, display_h.max(1)));
                     }
                     Err(e) => {
                         if e.is_device_removed() {

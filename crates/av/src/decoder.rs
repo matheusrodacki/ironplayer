@@ -17,11 +17,13 @@ use crate::ffi::{
     find_ffmpeg_dll_dir, frame_flags, FfmpegCodecContext, FfmpegFrame, FfmpegLib, FfmpegPacket,
     FfmpegParser, FilterLib, AV_CODEC_ID_AAC, AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3,
     AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
-    AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
+    AV_COL_RANGE_JPEG, AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
 };
-use crate::hw::{HwAccelMode, HwAccelState};
+use crate::hw::{D3d11Device, HwAccelMode, HwAccelState};
+#[cfg(windows)]
+use crate::hw::{ColorSpace, TransferFunction};
 use crate::pes::PesPacket;
-use crate::video_queue::{VideoFrame, YuvColorRange, YuvColorspace, YuvFrame};
+use crate::video_queue::{HwVideoFrame, VideoFrame, YuvColorRange, YuvColorspace, YuvFrame};
 
 // ─── DecodedFrame ─────────────────────────────────────────────────────────────
 
@@ -388,11 +390,15 @@ impl FfmpegDecoder {
                     thread_type: ThreadType::Auto,
                     ..self.codec_config.clone()
                 };
+                let external_d3d11 = self.shared_d3d11_device().map(|dev| unsafe {
+                    (dev.as_raw(), dev.as_raw_context())
+                });
                 match FfmpegCodecContext::open_with_hwaccel(
                     Arc::clone(&self.lib),
                     avid,
                     &hw_codec_config,
                     AV_HWDEVICE_TYPE_D3D11VA,
+                    external_d3d11,
                 ) {
                     Ok(ctx) => {
                         self.last_hw_codec = hw_codec_label(pes.codec).map(str::to_owned);
@@ -427,12 +433,9 @@ impl FfmpegDecoder {
             };
 
             // Deadline para o primeiro frame HW quando em modo D3D11VA.
-            // 500 ms é suficiente para um stream de broadcast de alta taxa (≥1 Mbps):
-            // ao ritmo de 17 Mbps o decoder receberia ≥5 frames antes de esgotar
-            // o prazo. Deadline curto elimina o freeze inicial em streams cujo
-            // perfil HEVC não é suportado pelo driver D3D11VA (ex.: Rext 4:2:2 10-bit).
+            // 2 s (spec §4.3): tempo para o primeiro frame HW antes de fallback SW.
             let hw_init_deadline = if is_video && self.hw_state.is_active() {
-                Some(Instant::now() + Duration::from_millis(500))
+                Some(Instant::now() + Duration::from_secs(2))
             } else {
                 None
             };
@@ -460,22 +463,7 @@ impl FfmpegDecoder {
 
         let mut frames = Vec::new();
 
-        // Verifica deadline de init HW: se o tempo expirou sem receber frames
-        // D3D11, aplica fallback para SW e remove o estado para reabrir na próxima
-        // chamada sem hwaccel. SPEC-AV-HW-DEC-001
-        {
-            let exceeded = self
-                .states
-                .get(&pid_raw)
-                .and_then(|s| s.hw_init_deadline)
-                .is_some_and(|d| Instant::now() > d);
-            if exceeded {
-                tracing::warn!(pid = pid_raw, "timeout de 2 s sem frame HW — fallback SW");
-                self.fallback_to_sw("timeout HW init (2 s)");
-                self.states.remove(&pid_raw);
-                return Ok(frames);
-            }
-        }
+        let shared_d3d = self.shared_d3d11_device();
 
         let state = self.states.get_mut(&pid_raw).ok_or_else(|| {
             AvError::Other(anyhow::anyhow!(
@@ -570,7 +558,7 @@ impl FfmpegDecoder {
 
         // Flag para acionar fallback SW após sair do loop (evita borrow duplo
         // de `self` dentro do loop onde `state` já emprestou `self.states`).
-        let hw_download_failed = false;
+        let mut hw_download_failed = false;
         let mut hw_interlaced_requires_sw = false;
         let mut hw_frames_ok: usize = 0;
 
@@ -608,31 +596,49 @@ impl FfmpegDecoder {
                                 // Cancela o deadline de init — recebemos o primeiro frame HW.
                                 state.hw_init_deadline = None;
 
-                                // O decoder HW ainda usa um AVHWDeviceContext criado pelo FFmpeg.
-                                // Baixamos o frame para YUV no próprio FFmpeg para evitar tocar a
-                                // textura D3D11 com um device diferente no renderer/UI.
-                                let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, ten_bit) =
-                                    state.frame.download_to_yuv_planes().map_err(|e| {
-                                        tracing::warn!(
-                                            %e,
-                                            pid = pid_raw,
-                                            "falha ao baixar frame HW para YUV"
-                                        );
-                                        e
-                                    })?;
-                                hw_frames_ok += 1;
-                                let pts = pts_raw_to_option(pts_raw);
-                                Some(DecodedFrame::Video(VideoFrame::Sw(YuvFrame {
-                                    planes,
-                                    width: w,
-                                    height: h,
-                                    pts,
-                                    sar_num: sar.0,
-                                    sar_den: sar.1,
-                                    colorspace: YuvColorspace::from_avutil(raw_cs),
-                                    color_range: YuvColorRange::from_avutil(raw_cr),
-                                    ten_bit,
-                                })))
+                                let decoded_hw = if let Some(d3d_dev) = shared_d3d.as_deref() {
+                                    match try_hw_zero_copy(&state.frame, d3d_dev) {
+                                        Ok(vf) => Some(vf),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                %e,
+                                                pid = pid_raw,
+                                                "zero-copy HW falhou — tentando download SW"
+                                            );
+                                            hw_video_frame_from_download(&state.frame, pid_raw)
+                                                .map_err(|e2| {
+                                                    hw_download_failed = true;
+                                                    tracing::warn!(
+                                                        %e2,
+                                                        pid = pid_raw,
+                                                        "falha ao baixar frame HW para YUV"
+                                                    );
+                                                    e2
+                                                })
+                                                .ok()
+                                        }
+                                    }
+                                } else {
+                                    hw_video_frame_from_download(&state.frame, pid_raw)
+                                        .map_err(|e| {
+                                            hw_download_failed = true;
+                                            tracing::warn!(
+                                                %e,
+                                                pid = pid_raw,
+                                                "falha ao baixar frame HW para YUV"
+                                            );
+                                            e
+                                        })
+                                        .ok()
+                                };
+
+                                if let Some(vf) = decoded_hw {
+                                    hw_frames_ok += 1;
+                                    Some(DecodedFrame::Video(vf))
+                                } else {
+                                    state.frame.unref();
+                                    continue;
+                                }
                             } else {
                                 // ── Caminho SW: YUV420P / YUV420P10LE ────────────────
                                 // Verifica se o frame é interlaced (FFmpeg 8.x: flags bit 0).
@@ -709,10 +715,7 @@ impl FfmpegDecoder {
                         if let Some(f) = decoded {
                             frames.push(f);
                         }
-                        // Limpa o frame para reutilização (HW path já fez unref antes).
-                        if !hw_download_failed {
-                            state.frame.unref();
-                        }
+                        state.frame.unref();
                     }
                     Ok(false) => {
                         // EAGAIN ou EOF — sem mais frames por agora.
@@ -748,8 +751,98 @@ impl FfmpegDecoder {
             self.states.remove(&pid_raw);
         }
 
+        let deadline_exceeded = self
+            .states
+            .get(&pid_raw)
+            .and_then(|s| s.hw_init_deadline)
+            .is_some_and(|d| Instant::now() > d);
+        if deadline_exceeded {
+            tracing::warn!(pid = pid_raw, "timeout de 2 s sem frame HW — fallback SW");
+            self.fallback_to_sw("timeout HW init (2 s)");
+            self.states.remove(&pid_raw);
+        }
+
         Ok(frames)
     }
+
+    /// Retorna o `D3d11Device` compartilhado quando hwaccel D3D11VA está ativo.
+    fn shared_d3d11_device(&self) -> Option<Arc<D3d11Device>> {
+        match &self.hwaccel {
+            #[cfg(windows)]
+            HwAccelMode::D3d11Va(dev) if self.hw_state.is_active() => Some(Arc::clone(dev)),
+            #[cfg(not(windows))]
+            HwAccelMode::D3d11Va(_) if self.hw_state.is_active() => None,
+            _ => None,
+        }
+    }
+}
+
+/// Extrai os planos NV12/P010 de um frame HW D3D11VA para `VideoFrame::Hw`.
+///
+/// CRÍTICO: a staging copy (`extract_nv12_planes`) ocorre **aqui**, enquanto o
+/// `AVFrame` ainda está vivo. A surface pertence ao pool do decoder e é
+/// reescrita assim que liberada (`unref`); adiar a cópia para a thread de
+/// render faria a UI copiar uma slice já reutilizada por um frame mais novo,
+/// produzindo batimento ("zig-zag"). O `AddRef` na textura é temporário e serve
+/// apenas para a cópia — não protege a slice contra reuso.
+#[cfg(windows)]
+fn try_hw_zero_copy(frame: &FfmpegFrame, d3d_dev: &D3d11Device) -> Result<VideoFrame, AvError> {
+    use crate::hw::D3d11Texture;
+
+    let (tex_ptr, slice, w, h, pts_raw, sar, trc, cs, cr) = frame.hw_frame_info()?;
+    let tex = unsafe {
+        D3d11Texture::from_raw_addref(
+            tex_ptr,
+            slice,
+            w,
+            h,
+            ColorSpace::from_avutil(cs),
+            TransferFunction::from_avutil(trc),
+            cr == AV_COL_RANGE_JPEG,
+        )?
+    };
+    let planes = d3d_dev.extract_nv12_planes(&tex)?;
+    let colorspace = match ColorSpace::from_avutil(cs) {
+        ColorSpace::Bt601 => YuvColorspace::Bt601,
+        ColorSpace::Bt709 => YuvColorspace::Bt709,
+        ColorSpace::Bt2020 => YuvColorspace::Bt2020,
+    };
+    let color_range = if cr == AV_COL_RANGE_JPEG {
+        YuvColorRange::Full
+    } else {
+        YuvColorRange::Limited
+    };
+    Ok(VideoFrame::Hw(HwVideoFrame {
+        planes,
+        colorspace,
+        color_range,
+        transfer: TransferFunction::from_avutil(trc),
+        pts: pts_raw_to_option(pts_raw),
+        width: w,
+        height: h,
+        sar_num: sar.0,
+        sar_den: sar.1,
+    }))
+}
+
+/// Fallback: baixa frame HW para YUV na CPU (`VideoFrame::Sw`).
+fn hw_video_frame_from_download(frame: &FfmpegFrame, pid_raw: u16) -> Result<VideoFrame, AvError> {
+    let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, ten_bit) =
+        frame.download_to_yuv_planes().map_err(|e| {
+            tracing::debug!(%e, pid = pid_raw, "download_to_yuv_planes falhou");
+            e
+        })?;
+    Ok(VideoFrame::Sw(YuvFrame {
+        planes,
+        width: w,
+        height: h,
+        pts: pts_raw_to_option(pts_raw),
+        sar_num: sar.0,
+        sar_den: sar.1,
+        colorspace: YuvColorspace::from_avutil(raw_cs),
+        color_range: YuvColorRange::from_avutil(raw_cr),
+        ten_bit,
+    }))
 }
 
 fn hw_codec_label(codec: MediaCodec) -> Option<&'static str> {

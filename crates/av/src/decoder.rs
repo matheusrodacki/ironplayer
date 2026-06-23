@@ -517,7 +517,7 @@ impl FfmpegDecoder {
                                 pid_raw,
                                 out_sr,
                                 out_ch,
-                                pts_raw_to_option(pts_raw),
+                                resolve_audio_pts(pts_raw, None, pes.pts),
                                 samples,
                             )));
                             state.frame.unref();
@@ -707,7 +707,7 @@ impl FfmpegDecoder {
                         })?;
                             let (pts_raw, out_sr, out_ch, samples) =
                                 state.frame.to_pcm_f32(sr, ch)?;
-                            let pts = pts_raw_to_option(pts_raw);
+                            let pts = resolve_audio_pts(pts_raw, pkt_pts, pes.pts);
                             Some(DecodedFrame::Audio(AudioFrame::new(
                                 pid_raw, out_sr, out_ch, pts, samples,
                             )))
@@ -910,6 +910,22 @@ fn pts_raw_to_option(pts_raw: i64) -> Option<u64> {
     }
 }
 
+/// Resolve PTS de áudio quando o decoder FFmpeg não preenche `AVFrame::pts`.
+///
+/// AC-3 (e outros codecs com parser) podem emitir frames com `AV_NOPTS_VALUE`
+/// mesmo quando o PES/pacote carrega PTS válido — usar o PTS do container
+/// evita âncora `0` no `AudioClock` e descompasso A/V.
+#[inline]
+fn resolve_audio_pts(
+    pts_raw: i64,
+    packet_pts: Option<u64>,
+    pes_pts: Option<u64>,
+) -> Option<u64> {
+    pts_raw_to_option(pts_raw)
+        .or(packet_pts)
+        .or(pes_pts)
+}
+
 // ─── Testes ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -954,6 +970,20 @@ mod tests {
     fn spec_av_002b_pts_raw_to_option_valid() {
         assert_eq!(pts_raw_to_option(90_000), Some(90_000u64));
         assert_eq!(pts_raw_to_option(0), Some(0u64));
+    }
+
+    /// AC-3: quando o decoder não preenche PTS, usa o PTS do pacote/PES.
+    #[test]
+    fn spec_av_002b_resolve_audio_pts_falls_back_to_packet() {
+        assert_eq!(
+            resolve_audio_pts(i64::MIN, Some(4_875_238_029), Some(99)),
+            Some(4_875_238_029)
+        );
+        assert_eq!(
+            resolve_audio_pts(i64::MIN, None, Some(4_875_238_029)),
+            Some(4_875_238_029)
+        );
+        assert_eq!(resolve_audio_pts(123, Some(456), Some(789)), Some(123));
     }
 
     /// SPEC-AV-002b: `codec_to_avid` deve mapear todos os codecs suportados.

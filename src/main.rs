@@ -866,6 +866,7 @@ fn main() -> eframe::Result<()> {
                 .spawn(move || {
                     let mut audio_out: Option<av::AudioOutput> = None;
                     let mut active_audio_pid: Option<u16> = None;
+                    let mut clock_published = false;
                     let mut rebuild_failures = 0u64;
 
                     loop {
@@ -874,6 +875,7 @@ fn main() -> eframe::Result<()> {
                                 AudioCommand::Reset => {
                                     audio_out = None;
                                     active_audio_pid = None;
+                                    clock_published = false;
                                     rebuild_failures = 0;
                                     while audio_frames_rx.try_recv().is_ok() {}
                                     if let Ok(mut guard) = audio_clock_tx.write() {
@@ -949,6 +951,7 @@ fn main() -> eframe::Result<()> {
                         if needs_reinit {
                             if pid_changed {
                                 audio_out = None;
+                                clock_published = false;
                                 if let Ok(mut guard) = audio_clock_tx.write() {
                                     *guard = None;
                                 }
@@ -978,18 +981,6 @@ fn main() -> eframe::Result<()> {
                                         channels = frame.channels,
                                         "audio-out: AudioOutput inicializado"
                                     );
-                                    // Publica o AudioClockHandle para a UI usar como
-                                    // clock master do vídeo (A/V sync via AudioClock).
-                                    // anchor_pts = PTS do primeiro frame de áudio, que
-                                    // corresponde a samples_played = 0.
-                                    let anchor = frame.pts.map(|p| p as i64).unwrap_or(0);
-                                    if let Ok(mut guard) = audio_clock_tx.write() {
-                                        *guard = Some(out.clock_handle(anchor));
-                                        tracing::debug!(
-                                            anchor_pts = anchor,
-                                            "audio-out: AudioClockHandle publicado"
-                                        );
-                                    }
                                     active_audio_pid = Some(frame.pid);
                                     audio_out = Some(out);
                                 }
@@ -1013,6 +1004,23 @@ fn main() -> eframe::Result<()> {
                         if let Some(ref out) = audio_out {
                             out.push_samples(&frame);
                             refresh_audio_status_from_output(&audio_status, out);
+
+                            // Publica o AudioClockHandle somente quando o primeiro frame
+                            // tiver PTS válido — AC-3 pode emitir frames iniciais sem PTS
+                            // do decoder, mas com PTS no PES (via resolve_audio_pts).
+                            if !clock_published {
+                                if let Some(pts) = frame.pts {
+                                    let anchor = pts as i64;
+                                    if let Ok(mut guard) = audio_clock_tx.write() {
+                                        *guard = Some(out.clock_handle(anchor));
+                                        clock_published = true;
+                                        tracing::debug!(
+                                            anchor_pts = anchor,
+                                            "audio-out: AudioClockHandle publicado"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
 

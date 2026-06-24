@@ -116,6 +116,8 @@ pub struct AudioStatusSnapshot {
     pub channels: Option<u16>,
     /// Nível atual do jitter buffer em `[0.0, 1.0]`.
     pub buffer_level: f32,
+    /// Latência estimada entre callback de áudio e playback audível.
+    pub output_latency_ms: u64,
     /// Estado operacional do pipeline.
     pub state: AudioOperationalState,
     /// Contadores de erro acumulados.
@@ -131,6 +133,7 @@ impl Default for AudioStatusSnapshot {
             sample_rate_hz: None,
             channels: None,
             buffer_level: 0.0,
+            output_latency_ms: 0,
             state: AudioOperationalState::Idle,
             errors: AudioErrorSnapshot::default(),
         }
@@ -150,6 +153,7 @@ impl AudioStatusSnapshot {
         self.sample_rate_hz = None;
         self.channels = None;
         self.buffer_level = 0.0;
+        self.output_latency_ms = 0;
         self.state = state;
         self.errors = AudioErrorSnapshot::default();
     }
@@ -344,6 +348,45 @@ pub enum AppCommand {
     ResetErrors,
     /// Alterna entre tema escuro e claro.
     ChangeTheme { dark: bool },
+    /// Solicita ao backend que troque o modo de aceleração de hardware do
+    /// decoder de vídeo em runtime.
+    ///
+    /// SPEC-CFG-HW-001
+    SetHwAccel { choice: HwAccelChoice },
+    /// Notifica o backend que o renderer encontrou `DXGI_ERROR_DEVICE_REMOVED`.
+    GpuDeviceRemoved,
+}
+
+// ---------------------------------------------------------------------------
+// HwAccelChoice — seleção de hwaccel acessível pela UI
+// ---------------------------------------------------------------------------
+
+/// Seleção de hardware acceleration exposta para a UI (sem dependência de
+/// `serde`/TOML).  Espelha as três opções aceitas pelo CLI e pelo
+/// `ironstream.toml`; o binário converte para a sua própria
+/// `config::HwAccelChoice` antes de aplicar no decoder.
+///
+/// SPEC-CFG-HW-001
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HwAccelChoice {
+    /// Tenta D3D11VA quando o sistema suporta; cai em CPU caso contrário.
+    #[default]
+    Auto,
+    /// Força D3D11VA; se não disponível, fica em CPU mas registra fallback.
+    D3d11va,
+    /// Desativa qualquer hwaccel; decode 100 % CPU.
+    None,
+}
+
+impl HwAccelChoice {
+    /// Identificador estável para logs e telemetria.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::D3d11va => "d3d11va",
+            Self::None => "none",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +410,33 @@ mod tests {
         assert!(state.pcr_history.is_empty());
     }
 
+    /// `HwAccelChoice` expõe labels estáveis e default = Auto.
+    ///
+    /// SPEC-CFG-HW-001
+    #[test]
+    fn spec_cfg_hw_001_hwaccel_choice_labels() {
+        assert_eq!(HwAccelChoice::default(), HwAccelChoice::Auto);
+        assert_eq!(HwAccelChoice::Auto.label(), "auto");
+        assert_eq!(HwAccelChoice::D3d11va.label(), "d3d11va");
+        assert_eq!(HwAccelChoice::None.label(), "none");
+    }
+
+    /// `AppCommand::SetHwAccel` carrega o choice transportando-o intacto.
+    ///
+    /// SPEC-CFG-HW-001
+    #[test]
+    fn spec_cfg_hw_001_set_hwaccel_command_payload() {
+        let cmd = AppCommand::SetHwAccel {
+            choice: HwAccelChoice::D3d11va,
+        };
+        match cmd {
+            AppCommand::SetHwAccel { choice } => {
+                assert_eq!(choice, HwAccelChoice::D3d11va);
+            }
+            _ => panic!("variante incorreta"),
+        }
+    }
+
     #[test]
     fn spec_ui_002_audio_status_snapshot_default_is_idle() {
         let audio = AudioStatusSnapshot::default();
@@ -376,6 +446,7 @@ mod tests {
         assert_eq!(audio.sample_rate_hz, None);
         assert_eq!(audio.channels, None);
         assert_eq!(audio.buffer_level, 0.0);
+        assert_eq!(audio.output_latency_ms, 0);
         assert_eq!(audio.state, AudioOperationalState::Idle);
         assert_eq!(audio.errors, AudioErrorSnapshot::default());
     }

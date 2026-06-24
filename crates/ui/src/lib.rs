@@ -8,7 +8,8 @@ pub mod status_bar;
 
 pub use state::{
     AppCommand, AppState, AspectRatioMode, AudioErrorSnapshot, AudioOperationalState,
-    AudioStatusSnapshot, AudioTrackInfo, ConnectionState, TableEvent, TablesSnapshot,
+    AudioStatusSnapshot, AudioTrackInfo, ConnectionState, HwAccelChoice, TableEvent,
+    TablesSnapshot,
 };
 
 use std::sync::{Arc, RwLock};
@@ -22,7 +23,37 @@ use crate::panels::tables::TablesPanel;
 use crate::panels::video::VideoPanel;
 use crate::status_bar::StatusBar;
 use av::video_queue::{PopResult, VideoQueue};
-use av::{Clock, MasterClock, VideoRenderer, YuvFrame};
+use av::{Clock, MasterClock, VideoFrame, VideoRenderer};
+
+const PRIMARY_CONTENT_RATIO: f32 = 0.85;
+const TABLES_WIDTH_RATIO: f32 = 0.30;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DashboardLayout {
+    top_height: f32,
+    bottom_height: f32,
+    left_width: f32,
+    right_width: f32,
+}
+
+fn compute_dashboard_layout(available: egui::Vec2, spacing: egui::Vec2) -> DashboardLayout {
+    let total_width = available.x.max(0.0);
+    let total_height = available.y.max(0.0);
+
+    let top_height = total_height * PRIMARY_CONTENT_RATIO;
+    let bottom_height = (total_height - top_height).max(0.0);
+
+    let row_width = (total_width - spacing.x).max(0.0);
+    let left_width = row_width * TABLES_WIDTH_RATIO;
+    let right_width = (row_width - left_width).max(0.0);
+
+    DashboardLayout {
+        top_height,
+        bottom_height,
+        left_width,
+        right_width,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // IronPlayerApp
@@ -64,7 +95,7 @@ pub struct IronPlayerApp {
     /// Receptor de frames de vídeo decodificados (FfmpegDecoder → UI).
     ///
     /// SPEC-AV-003
-    video_frames_rx: Option<Receiver<YuvFrame>>,
+    video_frames_rx: Option<Receiver<VideoFrame>>,
     /// Fila de frames de vídeo ordenada por PTS com políticas drop/hold/resync.
     ///
     /// Substitui o pipeline best-effort de drenagem simples.
@@ -78,8 +109,16 @@ pub struct IronPlayerApp {
     ///
     /// SPEC-AV-VQ-001
     video_clock: MasterClock,
-    /// Indica se o clock de vídeo já foi ancorado ao PTS do primeiro frame.
+    /// Indica se o clock de vídeo já foi ancorado (wall no primeiro PTS ou áudio).
     video_clock_initialized: bool,
+    /// `true` quando `video_clock` usa `AudioClock` como master A/V.
+    clock_uses_audio: bool,
+    /// Id estável do `AudioClockHandle` atualmente adotado pela UI.
+    ///
+    /// Permite detectar quando a thread `audio-out` publica um handle novo
+    /// (troca de serviço/trilha) e re-adotá-lo, em vez de continuar usando um
+    /// handle obsoleto cujo contador de samples está congelado.
+    adopted_audio_clock_id: Option<usize>,
     /// Renderizador de vídeo: mantém textura GPU/CPU entre frames.
     ///
     /// SPEC-AV-003
@@ -119,7 +158,7 @@ impl IronPlayerApp {
     /// `snapshot_rx`: receptor de métricas do pipeline; `None` quando o
     /// pipeline ainda não foi iniciado (modo stand-alone / testes).
     ///
-    /// `video_frames_rx`: receptor de `YuvFrame` decodificados; `None` em
+    /// `video_frames_rx`: receptor de `VideoFrame` decodificados; `None` em
     /// modo stand-alone. Quando `Some`, o renderer é inicializado em modo GPU
     /// (D3D11 via wgpu) se disponível, ou modo CPU como fallback.
     ///
@@ -133,17 +172,24 @@ impl IronPlayerApp {
         audio_status_rx: Option<Arc<RwLock<AudioStatusSnapshot>>>,
         selected_service_rx: Option<Arc<RwLock<Option<u16>>>>,
         table_events_rx: Option<Receiver<TableEvent>>,
-        video_frames_rx: Option<Receiver<YuvFrame>>,
+        video_frames_rx: Option<Receiver<VideoFrame>>,
+        d3d11_device: Option<Arc<av::D3d11Device>>,
     ) -> Self {
         // Inicializa VideoRenderer em modo GPU (D3D11) quando wgpu disponível,
         // ou em modo CPU como fallback. SPEC-AV-003 · SPEC-AV-003c
         let video_renderer = video_frames_rx.as_ref().map(|_| {
             if let Some(wgpu_state) = &cc.wgpu_render_state {
-                VideoRenderer::new_gpu(
-                    wgpu_state.device.clone(),
-                    wgpu_state.queue.clone(),
-                    wgpu_state.target_format,
-                )
+                match d3d11_device.as_ref() {
+                    Some(_d3d11_dev) => VideoRenderer::new_hw_gpu(
+                        wgpu_state.device.clone(),
+                        wgpu_state.target_format,
+                    ),
+                    None => VideoRenderer::new_gpu(
+                        wgpu_state.device.clone(),
+                        wgpu_state.queue.clone(),
+                        wgpu_state.target_format,
+                    ),
+                }
             } else {
                 VideoRenderer::new_cpu(cc.egui_ctx.clone())
             }
@@ -164,6 +210,8 @@ impl IronPlayerApp {
             video_queue: VideoQueue::default(),
             video_clock: MasterClock::wall(0),
             video_clock_initialized: false,
+            clock_uses_audio: false,
+            adopted_audio_clock_id: None,
             video_renderer,
             video_dims: None,
             aspect_ratio_mode: AspectRatioMode::default(),
@@ -199,6 +247,18 @@ impl IronPlayerApp {
         self.audio_clock_rx = Some(rx);
     }
 
+    pub fn set_hwaccel_choice(&mut self, choice: HwAccelChoice) {
+        self.metrics_panel.set_hwaccel_choice(choice);
+    }
+
+    /// Fecha o canal de comandos para permitir shutdown em cascata do backend.
+    ///
+    /// SPEC-UI-001
+    pub fn close_command_channel(&mut self) {
+        let (replacement_tx, _replacement_rx) = crossbeam_channel::bounded(0);
+        self.cmd_tx = replacement_tx;
+    }
+
     /// Retorna uma referência imutável ao estado atual da UI.
     pub fn state(&self) -> &AppState {
         &self.state
@@ -224,8 +284,10 @@ impl IronPlayerApp {
             now,
         );
 
-        // Atualiza o snapshot de métricas.
+        // Atualiza o snapshot de métricas preservando campos preenchidos pela UI.
+        let pipeline = self.state.metrics.pipeline.clone();
         self.state.metrics = snapshot;
+        self.state.metrics.pipeline = pipeline;
 
         // Atualiza o estado de conexão a partir do command handler.
         if let Some(conn_rx) = &self.connection_rx {
@@ -281,6 +343,8 @@ impl IronPlayerApp {
         // um novo AudioClockHandle e video_clock será trocado novamente.
         self.video_clock = MasterClock::wall(0);
         self.video_clock_initialized = false;
+        self.clock_uses_audio = false;
+        self.adopted_audio_clock_id = None;
         // Limpa o handle de áudio obsoleto para que poll_video_frames troque
         // para o novo handle da próxima sessão.
         if let Some(rx) = &self.audio_clock_rx {
@@ -301,7 +365,9 @@ impl IronPlayerApp {
     ///    clock master, o vídeo é sincronizado contra o PTS real de reprodução
     ///    WASAPI, eliminando o drift causado pela latência do decoder multi-thread.
     /// 2. Drena até 16 frames do canal `video_frames_rx` e os insere na
-    ///    `VideoQueue` com as políticas drop/hold/resync/wrap.
+    ///    `VideoQueue` com as políticas drop/hold/resync/wrap. O skew de mux no
+    ///    startup (vídeo após o 1º IDR) é absorvido pela fila — a âncora do
+    ///    `AudioClock` nunca é deslocada (cf. STATE.md L-002).
     /// 3. Fallback: se ainda sem AudioClock, ancora o `WallClock` no PTS do
     ///    primeiro frame de vídeo recebido (`reset(anchor)`).
     /// 4. Chama `pop_ready(clock.now_pts90())` para extrair o próximo frame
@@ -313,23 +379,41 @@ impl IronPlayerApp {
     ///    e amostra o offset no histórico de 60 s a ~1 Hz.
     ///
     /// SPEC-AV-003 · SPEC-AV-VQ-001 · SPEC-METRICS-SYNC-001
-    fn poll_video_frames(&mut self) {
+    fn poll_video_frames(&mut self, ctx: &egui::Context) {
         let rx = match &self.video_frames_rx {
             Some(r) => r.clone(),
             None => return,
         };
 
-        // 1. Tenta trocar para AudioClock assim que audio-out publicar o handle.
-        //    Isso é feito antes de drenar frames para que o clock já esteja
-        //    correto quando processarmos o primeiro frame abaixo.
-        //    `video_clock_initialized` é reaproveitado como flag "já trocado".
-        if !self.video_clock_initialized {
-            if let Some(rx) = &self.audio_clock_rx {
-                if let Ok(guard) = rx.try_read() {
-                    if let Some(handle) = guard.as_ref() {
-                        self.video_clock = MasterClock::Audio(handle.clone());
-                        self.video_clock_initialized = true;
-                        tracing::debug!("poll_video_frames: trocado para AudioClock (A/V master)");
+        // 1. Adota (ou re-adota) o AudioClockHandle publicado por audio-out.
+        //    - Upgrade wall→áudio mesmo após o vídeo ter ancorado o WallClock.
+        //    - Detecta substituição do handle (troca de serviço/trilha) via id
+        //      estável: um handle recriado tem id distinto, então trocamos o
+        //      clock em vez de travar num handle obsoleto (contador congelado).
+        if let Some(rx) = &self.audio_clock_rx {
+            if let Ok(guard) = rx.try_read() {
+                match guard.as_ref() {
+                    Some(handle) => {
+                        let id = handle.id();
+                        if self.adopted_audio_clock_id != Some(id) {
+                            self.video_clock = MasterClock::Audio(handle.clone());
+                            self.adopted_audio_clock_id = Some(id);
+                            self.clock_uses_audio = true;
+                            self.video_clock_initialized = true;
+                            tracing::debug!(
+                                clock_id = id,
+                                "poll_video_frames: AudioClock adotado (A/V master)"
+                            );
+                        }
+                    }
+                    None => {
+                        // Áudio em reinicialização (reset/troca de serviço): marca
+                        // para re-adotar o próximo handle. Mantém o clock atual até
+                        // lá (freeze breve de ~1 frame, sem salto de PTS).
+                        if self.adopted_audio_clock_id.is_some() {
+                            self.adopted_audio_clock_id = None;
+                            self.clock_uses_audio = false;
+                        }
                     }
                 }
             }
@@ -337,10 +421,10 @@ impl IronPlayerApp {
 
         // 2. Drena até 16 frames do canal e insere na fila PTS-ordenada.
         for frame in rx.try_iter().take(16) {
-            // Fallback: ancora o WallClock no PTS do primeiro frame caso ainda
-            // não tenhamos AudioClock disponível.
-            if !self.video_clock_initialized {
-                if let Some(pts) = frame.pts {
+            // Fallback: ancora o WallClock no PTS do primeiro frame apenas sem
+            // AudioClock (não sobrescreve após upgrade para áudio).
+            if !self.clock_uses_audio && !self.video_clock_initialized {
+                if let Some(pts) = frame.pts() {
                     self.video_clock.reset(pts as i64);
                     self.video_clock_initialized = true;
                 }
@@ -348,22 +432,39 @@ impl IronPlayerApp {
             self.video_queue.push(frame);
         }
 
-        // 2. Extrai o próximo frame pronto para exibição.
+        // 3. Extrai o próximo frame pronto (um por tick — pop_ready já descarta
+        // frames tardios internamente; multi-pop avançava o vídeo à frente do áudio).
+        let allow_clock_resync = self.video_clock.audio_handle().is_none();
         let clock_pts = self.video_clock.now_pts90();
-        let ready_frame = match self.video_queue.pop_ready(clock_pts) {
+        let ready_frame = match self
+            .video_queue
+            .pop_ready_with_resync(clock_pts, allow_clock_resync)
+        {
             PopResult::Ready(f) => Some(f),
             PopResult::Resync { frame, new_anchor } => {
-                // Resincroniza o clock ao novo âncora de PTS.
-                self.video_clock.reset(new_anchor);
+                if allow_clock_resync {
+                    self.video_clock.reset(new_anchor);
+                }
                 Some(frame)
             }
-            PopResult::TooEarly | PopResult::Empty => None,
+            PopResult::TooEarly => None,
+            PopResult::Empty => None,
         };
 
-        // 3. Faz upload do frame ao renderer.
+        // 4. Faz upload do frame ao renderer.
         if let Some(frame) = ready_frame {
             if let Some(renderer) = &mut self.video_renderer {
-                match renderer.upload(&frame) {
+                let (frame_w, frame_h, sar_num, sar_den) = (
+                    frame.width(),
+                    frame.height(),
+                    frame.sar_num(),
+                    frame.sar_den(),
+                );
+                let upload_result = match frame {
+                    VideoFrame::Sw(ref yuv) => renderer.upload(yuv),
+                    VideoFrame::Hw(hw) => renderer.upload_hw(hw),
+                };
+                match upload_result {
                     Ok(()) => {
                         // Atualiza métricas de GPU upload, colorspace e color_range.
                         // SPEC-METRICS-PIPELINE-001
@@ -375,19 +476,34 @@ impl IronPlayerApp {
                         if let Some(cr) = renderer.current_color_range_label() {
                             self.state.metrics.pipeline.color_range = Some(cr.to_string());
                         }
+                        if let Some(shared) = &self.pipeline_metrics_rx {
+                            if let Ok(mut metrics) = shared.write() {
+                                metrics.gpu_upload_bytes_per_sec =
+                                    renderer.gpu_upload_bytes_per_sec();
+                                if let Some(cs) = renderer.current_colorspace_label() {
+                                    metrics.colorspace = Some(cs.to_string());
+                                }
+                                if let Some(cr) = renderer.current_color_range_label() {
+                                    metrics.color_range = Some(cr.to_string());
+                                }
+                            }
+                        }
                         // Aplica o SAR para calcular as dimensões de exibição corretas.
                         // DAR = SAR * (w/h); mantemos w fixo e ajustamos h:
                         //   display_h = pixel_h * sar_den / sar_num
                         // Para 1920×540 com SAR 1:2 → display_h = 540*2/1 = 1080 → 16:9
-                        let display_h = if frame.sar_num > 1 || frame.sar_den > 1 {
-                            let h64 = frame.height as u64 * frame.sar_den as u64;
-                            (h64 / frame.sar_num.max(1) as u64) as u32
+                        let display_h = if sar_num > 1 || sar_den > 1 {
+                            let h64 = frame_h as u64 * sar_den as u64;
+                            (h64 / sar_num.max(1) as u64) as u32
                         } else {
-                            frame.height
+                            frame_h
                         };
-                        self.video_dims = Some((frame.width, display_h.max(1)));
+                        self.video_dims = Some((frame_w, display_h.max(1)));
                     }
                     Err(e) => {
+                        if e.is_device_removed() {
+                            self.handle_device_removed(ctx, &e);
+                        }
                         tracing::warn!(error = %e, "poll_video_frames: falha no upload do frame");
                     }
                 }
@@ -443,12 +559,38 @@ impl IronPlayerApp {
     fn poll_pipeline_metrics(&mut self) {
         if let Some(rx) = &self.pipeline_metrics_rx {
             if let Ok(m) = rx.read() {
-                self.state.metrics.pipeline.decoder_threads_used = m.decoder_threads_used;
-                self.state.metrics.pipeline.deinterlacer_active = m.deinterlacer_active;
-                self.state.metrics.pipeline.decode_time_ms_p50 = m.decode_time_ms_p50.clone();
-                self.state.metrics.pipeline.decode_time_ms_p99 = m.decode_time_ms_p99.clone();
+                self.state.metrics.pipeline = m.clone();
             }
         }
+    }
+
+    fn handle_device_removed(&mut self, _ctx: &egui::Context, error: &av::AvError) {
+        if let Some(rx) = &self.video_frames_rx {
+            while rx.try_recv().is_ok() {}
+        }
+        self.video_queue.clear();
+        self.video_dims = None;
+        self.state.metrics.video_queue_depth = 0;
+        self.state.metrics.pipeline.hw_decode_active = false;
+        self.state.metrics.pipeline.hw_decode_fallback_reason =
+            Some("DXGI_ERROR_DEVICE_REMOVED".to_string());
+        self.state.metrics.pipeline.tdr_recoveries =
+            self.state.metrics.pipeline.tdr_recoveries.saturating_add(1);
+
+        if let Some(renderer) = &mut self.video_renderer {
+            let _ = renderer.fallback_to_software();
+        }
+
+        if let Some(shared) = &self.pipeline_metrics_rx {
+            if let Ok(mut metrics) = shared.write() {
+                metrics.hw_decode_active = false;
+                metrics.hw_decode_fallback_reason = Some("DXGI_ERROR_DEVICE_REMOVED".to_string());
+                metrics.tdr_recoveries = metrics.tdr_recoveries.saturating_add(1);
+            }
+        }
+
+        let _ = self.cmd_tx.try_send(AppCommand::GpuDeviceRemoved);
+        tracing::warn!(error = %error, "poll_video_frames: device D3D11 removido; fila drenada e fallback SW ativado");
     }
 }
 
@@ -511,8 +653,8 @@ impl eframe::App for IronPlayerApp {
         // ── Poll de métricas do pipeline ──────────────────────────────────
         self.poll_snapshot();
         self.poll_table_events();
-        self.poll_video_frames();
         self.poll_pipeline_metrics();
+        self.poll_video_frames(ctx);
 
         // eframe é reactive por padrão. Para vídeo em tempo real, pedimos
         // repaint reativo na chegada de cada frame (via ctx.request_repaint()
@@ -565,32 +707,48 @@ impl eframe::App for IronPlayerApp {
             StatusBar::show(ui, &self.state);
         });
 
-        // ── Painel esquerdo: VideoPanel (≈40%) ───────────────────────────────
-        egui::SidePanel::left("video_panel")
-            .resizable(true)
-            .default_width(400.0)
-            .show(ctx, |ui| {
-                VideoPanel::show(
-                    ui,
-                    &self.state,
-                    self.video_renderer.as_ref(),
-                    self.video_dims,
-                    &self.cmd_tx,
-                    &mut self.aspect_ratio_mode,
-                );
-            });
-
-        // ── Painel direito: MetricsPanel (≈25%) ──────────────────────────────
-        egui::SidePanel::right("metrics_panel")
-            .resizable(true)
-            .default_width(280.0)
-            .show(ctx, |ui| {
-                self.metrics_panel.show(ui, &self.state, &self.cmd_tx);
-            });
-
-        // ── Painel central: PIDs / Tables / Serviços (≈35%) ──────────────────
+        // ── Dashboard principal: topo 90% (tabelas 30% + vídeo 70%),
+        //    rodapé 10% com métricas em colunas ──────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.tables_panel.show(ui, &self.state, &self.cmd_tx);
+            let layout = compute_dashboard_layout(ui.available_size(), ui.spacing().item_spacing);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), layout.top_height),
+                egui::Layout::left_to_right(egui::Align::Min),
+                |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(layout.left_width, layout.top_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.tables_panel.show(ui, &self.state, &self.cmd_tx);
+                        },
+                    );
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(layout.right_width, layout.top_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            VideoPanel::show(
+                                ui,
+                                &self.state,
+                                self.video_renderer.as_ref(),
+                                self.video_dims,
+                                &self.cmd_tx,
+                                &mut self.aspect_ratio_mode,
+                            );
+                        },
+                    );
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), layout.bottom_height),
+                egui::Layout::left_to_right(egui::Align::Min),
+                |ui| {
+                    self.metrics_panel
+                        .show_columnar_strip(ui, &self.state, &self.cmd_tx);
+                },
+            );
         });
     }
 }
@@ -614,6 +772,26 @@ pub fn run(title: &str) -> eframe::Result {
             .with_inner_size([1280.0, 720.0]),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             present_mode: eframe::wgpu::PresentMode::Fifo,
+            device_descriptor: std::sync::Arc::new(|adapter| {
+                let base_limits = if adapter.get_info().backend == eframe::wgpu::Backend::Gl {
+                    eframe::wgpu::Limits::downlevel_webgl2_defaults()
+                } else {
+                    eframe::wgpu::Limits::default()
+                };
+
+                let wanted = eframe::wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+                let required_features = wanted & adapter.features();
+
+                eframe::wgpu::DeviceDescriptor {
+                    label: Some("ironplayer wgpu device"),
+                    required_features,
+                    required_limits: eframe::wgpu::Limits {
+                        max_texture_dimension_2d: 8192,
+                        ..base_limits
+                    },
+                    memory_hints: eframe::wgpu::MemoryHints::default(),
+                }
+            }),
             ..Default::default()
         },
         ..Default::default()
@@ -624,7 +802,7 @@ pub fn run(title: &str) -> eframe::Result {
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(IronPlayerApp::new(
-                cc, cmd_tx, None, None, None, None, None, None,
+                cc, cmd_tx, None, None, None, None, None, None, None,
             )))
         }),
     )
@@ -634,6 +812,16 @@ pub fn run(title: &str) -> eframe::Result {
 mod tests {
     use super::*;
     use ts::metrics::{ErrorSnapshot, MetricsSnapshot, PcrJitterRecord};
+
+    #[test]
+    fn spec_ui_001_dashboard_layout_uses_requested_ratios() {
+        let layout = compute_dashboard_layout(egui::vec2(1000.0, 800.0), egui::vec2(8.0, 8.0));
+
+        assert_eq!(layout.top_height, 680.0);
+        assert_eq!(layout.bottom_height, 120.0);
+        assert_eq!(layout.left_width, 297.6);
+        assert_eq!(layout.right_width, 694.4);
+    }
 
     #[test]
     fn spec_ui_008_metric_histories_ignore_repainted_snapshot() {

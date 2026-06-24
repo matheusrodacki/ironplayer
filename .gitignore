@@ -27,4 +27,7 @@ target
 PRD.md
 progress.txt
 
+# Logs temporários de sessões de debug do agente
+debug-*.log
+
 /ffmpeg/

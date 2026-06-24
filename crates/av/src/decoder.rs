@@ -7,32 +7,36 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::audio::AudioFrame;
-use crate::codec::{AudioCodec, CodecConfig, MediaCodec};
+use crate::codec::{AudioCodec, CodecConfig, MediaCodec, ThreadType, VideoCodec};
 use crate::deinterlace::Deinterlacer;
 use crate::error::AvError;
 use crate::ffi::{
     find_ffmpeg_dll_dir, frame_flags, FfmpegCodecContext, FfmpegFrame, FfmpegLib, FfmpegPacket,
-    FilterLib, AV_CODEC_ID_AAC, AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3,
-    AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
-    AV_FRAME_FLAG_INTERLACED,
+    FfmpegParser, FilterLib, AV_CODEC_ID_AAC, AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3,
+    AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
+    AV_COL_RANGE_JPEG, AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
 };
+use crate::hw::{D3d11Device, HwAccelMode, HwAccelState};
+#[cfg(windows)]
+use crate::hw::{ColorSpace, TransferFunction};
 use crate::pes::PesPacket;
-use crate::video_queue::{YuvColorRange, YuvColorspace, YuvFrame};
+use crate::video_queue::{HwVideoFrame, VideoFrame, YuvColorRange, YuvColorspace, YuvFrame};
 
 // ─── DecodedFrame ─────────────────────────────────────────────────────────────
 
-/// Frame decodificado: vídeo YUV ou áudio PCM f32.
+/// Frame decodificado: vídeo (SW ou HW) ou áudio PCM f32.
 ///
 /// Produzido pelo `FfmpegDecoder` e consumido pelo pipeline de renderização
 /// e reprodução de áudio.
 ///
-/// SPEC-AV-002b
-#[derive(Debug, Clone)]
+/// SPEC-AV-002b · SPEC-AV-HW-TEX-001
+#[derive(Debug)]
 pub enum DecodedFrame {
-    /// Frame de vídeo decodificado (YUV planar).
-    Video(YuvFrame),
+    /// Frame de vídeo decodificado (YUV planar SW ou D3D11VA HW).
+    Video(VideoFrame),
     /// Frame de áudio decodificado (PCM f32 interleaved).
     Audio(AudioFrame),
 }
@@ -43,7 +47,7 @@ impl DecodedFrame {
     /// SPEC-AV-002b
     pub fn pts(&self) -> Option<u64> {
         match self {
-            Self::Video(f) => f.pts,
+            Self::Video(f) => f.pts(),
             Self::Audio(f) => f.pts,
         }
     }
@@ -86,10 +90,20 @@ struct CodecState {
     /// Frame AVFrame reutilizado entre chamadas para evitar alloc/free por frame.
     frame: FfmpegFrame,
     is_video: bool,
+    /// Parser FFmpeg para realinhar PES em frames/access units completos.
+    /// `None` quando o codec não tem parser registrado (AAC LATM usa split
+    /// manual via sync word; ver `split_loas_frames`).
+    parser: Option<FfmpegParser>,
     /// Deinterlacador bwdif, criado lazily na primeira aparição de frame
     /// interlaced. `None` se o stream não for interlaced ou se `FilterLib`
     /// não estiver disponível.
     deinterlacer: Option<Deinterlacer>,
+    /// Deadline para o primeiro frame HW (2 s após abertura do contexto).
+    /// `None` quando em modo SW ou após receber o primeiro frame D3D11.
+    /// Expirar sem receber frame HW dispara fallback para SW.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    hw_init_deadline: Option<Instant>,
 }
 
 // ─── FfmpegDecoder ────────────────────────────────────────────────────────────
@@ -118,6 +132,19 @@ pub struct FfmpegDecoder {
     codec_config: CodecConfig,
     /// Mapa de PID → estado do decodificador para aquele stream.
     states: HashMap<u16, CodecState>,
+    /// Modo de aceleração de hardware solicitado (Fase B, SPEC-AV-HW-DEC-001).
+    ///
+    /// Nesta versão do decoder, `D3d11Va(_)` é aceito mas o caminho FFI real
+    /// (callback `get_format` + `AVHWDeviceContext`) será conectado na próxima
+    /// iteração da Fase B.  A máquina de estados em `hw_state` já está pronta
+    /// para receber sinais de falha e acionar fallback.
+    hwaccel: HwAccelMode,
+    /// Estado da máquina de fallback hwaccel (falhas seguidas / motivo).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    hw_state: HwAccelState,
+    /// Codec do último decoder HW aberto com sucesso (telemetria/UI).
+    last_hw_codec: Option<String>,
 }
 
 impl FfmpegDecoder {
@@ -167,6 +194,9 @@ impl FfmpegDecoder {
             filter_lib,
             codec_config: config,
             states: HashMap::new(),
+            hwaccel: HwAccelMode::Off,
+            hw_state: HwAccelState::new(),
+            last_hw_codec: None,
         })
     }
 
@@ -190,6 +220,9 @@ impl FfmpegDecoder {
             filter_lib: None,
             codec_config: config,
             states: HashMap::new(),
+            hwaccel: HwAccelMode::Off,
+            hw_state: HwAccelState::new(),
+            last_hw_codec: None,
         }
     }
 
@@ -219,6 +252,118 @@ impl FfmpegDecoder {
         self.codec_config.thread_count
     }
 
+    // ── Hardware acceleration (Fase B, SPEC-AV-HW-DEC-001) ────────────────────
+
+    /// Habilita (ou desabilita) o caminho hwaccel para decodes futuros.
+    ///
+    /// O caller deve chamar `reset()` antes de mudar o modo se houver streams
+    /// já abertos — `AVCodecContext` existentes mantêm o pix_fmt original e
+    /// não migram entre CPU e GPU em runtime.
+    ///
+    /// O caminho FFI real (callback `get_format` + `AVHWDeviceContext`) é
+    /// conectado na continuação da Fase B; nesta versão a chamada apenas
+    /// registra a intenção, ativa a máquina de estado e mantém compatibilidade
+    /// com o caminho SW para CI e fallback.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn enable_hwaccel(&mut self, mode: HwAccelMode) -> Result<(), AvError> {
+        match &mode {
+            HwAccelMode::Off => {
+                self.hw_state = HwAccelState::new();
+            }
+            HwAccelMode::D3d11Va(_) => {
+                self.hw_state = HwAccelState::new();
+                self.hw_state.activate();
+                tracing::info!(target: "av::hw", "hw.init.ok mode=d3d11va");
+            }
+        }
+        self.hwaccel = mode;
+        Ok(())
+    }
+
+    /// Modo de hwaccel configurado atualmente (não reflete fallback dinâmico).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn hwaccel_mode(&self) -> &HwAccelMode {
+        &self.hwaccel
+    }
+
+    /// `true` se o decoder está ativamente produzindo frames acelerados em GPU.
+    ///
+    /// Difere de `hwaccel_mode().is_gpu()`: este método fica `false` após o
+    /// fallback automático para CPU.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn is_hwaccel_active(&self) -> bool {
+        self.hw_state.is_active()
+    }
+
+    /// Motivo do último fallback hwaccel→CPU (se houve).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.hw_state.fallback_reason()
+    }
+
+    /// Label do último codec HW ativo (ex.: `hevc_d3d11va`).
+    pub fn hw_decode_codec(&self) -> Option<&str> {
+        self.last_hw_codec.as_deref()
+    }
+
+    /// Contagem aproximada de contextos de vídeo HW ativos nesta sessão.
+    pub fn hw_frame_pool_in_use(&self) -> u32 {
+        if !self.hw_state.is_active() {
+            return 0;
+        }
+        self.states.values().filter(|state| state.is_video).count() as u32
+    }
+
+    /// Promove imediatamente o decoder para o caminho CPU, registrando o motivo.
+    ///
+    /// Usado pelo callback `get_format` (Fase B FFI) quando o driver recusa o
+    /// pix_fmt D3D11, ou pelo render pass na recuperação de TDR (Fase E).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn fallback_to_sw(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        tracing::warn!(target: "av::hw", reason = %reason, "hw.fallback");
+        self.hw_state.fallback(reason);
+    }
+
+    /// Registra uma falha transitória do caminho hwaccel.  Retorna `true` se a
+    /// contagem atingiu o limite (`HW_FALLBACK_THRESHOLD`) e o caller já deve
+    /// chamar `fallback_to_sw`.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[must_use = "verifique o retorno para acionar fallback quando necessário"]
+    pub fn record_hw_failure(&mut self) -> bool {
+        self.hw_state.record_failure()
+    }
+
+    /// Sinaliza que o caminho hwaccel entregou um frame válido (reseta a streak).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[allow(dead_code)]
+    pub(crate) fn record_hw_success(&mut self) {
+        self.hw_state.record_success();
+    }
+
+    /// Reset completo do decoder (limpa codec_ctxs e estado hwaccel).
+    ///
+    /// Nota: para preservar a compatibilidade da API, esta variante é apenas
+    /// um helper que combina `reset()` + reset do estado hwaccel.  Use-a ao
+    /// reabrir um stream para começar uma nova sessão de telemetria.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn reset_with_hw_state(&mut self) {
+        self.states.clear();
+        self.hw_state = HwAccelState::new();
+        self.last_hw_codec = None;
+        if self.hwaccel.is_gpu() {
+            self.hw_state.activate();
+        }
+    }
+
     /// Decodifica um `PesPacket` completo, retornando todos os frames prontos.
     ///
     /// Internamente:
@@ -236,33 +381,95 @@ impl FfmpegDecoder {
         // Obtém ou cria o codec state para este PID.
         if !self.states.contains_key(&pid_raw) {
             let avid = codec_to_avid(pes.codec)?;
-            let codec_ctx =
+            let is_video = matches!(pes.codec, MediaCodec::Video(_));
+
+            // Tenta abrir com hwaccel se for vídeo e o estado estiver ativo.
+            let codec_ctx = if is_video && self.hw_state.is_active() {
+                let hw_codec_config = CodecConfig {
+                    thread_count: 1,
+                    thread_type: ThreadType::Auto,
+                    ..self.codec_config.clone()
+                };
+                let external_d3d11 = self.shared_d3d11_device().map(|dev| unsafe {
+                    (dev.as_raw(), dev.as_raw_context())
+                });
+                match FfmpegCodecContext::open_with_hwaccel(
+                    Arc::clone(&self.lib),
+                    avid,
+                    &hw_codec_config,
+                    AV_HWDEVICE_TYPE_D3D11VA,
+                    external_d3d11,
+                ) {
+                    Ok(ctx) => {
+                        self.last_hw_codec = hw_codec_label(pes.codec).map(str::to_owned);
+                        tracing::debug!(pid = pid_raw, "hwaccel D3D11VA aberto para PID");
+                        ctx
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %e,
+                            pid = pid_raw,
+                            "hwaccel init falhou — revertendo para SW"
+                        );
+                        self.fallback_to_sw(format!("hwaccel init: {e}"));
+                        FfmpegCodecContext::open(
+                            Arc::clone(&self.lib),
+                            avid,
+                            &self.codec_config,
+                        )
+                        .map_err(|e2| {
+                            tracing::error!(%e2, pid = pid_raw, "falha ao abrir decodificador SW");
+                            e2
+                        })?
+                    }
+                }
+            } else {
                 FfmpegCodecContext::open(Arc::clone(&self.lib), avid, &self.codec_config).map_err(
                     |e| {
                         tracing::error!(%e, pid = pid_raw, "falha ao abrir decodificador");
                         e
                     },
-                )?;
+                )?
+            };
+
+            // Deadline para o primeiro frame HW quando em modo D3D11VA.
+            // 2 s (spec §4.3): tempo para o primeiro frame HW antes de fallback SW.
+            let hw_init_deadline = if is_video && self.hw_state.is_active() {
+                Some(Instant::now() + Duration::from_secs(2))
+            } else {
+                None
+            };
+
             let frame = FfmpegFrame::alloc(Arc::clone(&self.lib))?;
-            let is_video = matches!(pes.codec, MediaCodec::Video(_));
+            // Parser para realinhar PES em frames/access units (HEVC/H264/AC3/EAC3/MP2).
+            // AAC LATM tem seu próprio splitter manual (split_loas_frames).
+            let parser = if matches!(pes.codec, MediaCodec::Audio(AudioCodec::AacLatm)) {
+                None
+            } else {
+                FfmpegParser::try_init(Arc::clone(&self.lib), avid)
+            };
             self.states.insert(
                 pid_raw,
                 CodecState {
                     codec_ctx,
                     frame,
                     is_video,
+                    parser,
                     deinterlacer: None,
+                    hw_init_deadline,
                 },
             );
         }
+
+        let mut frames = Vec::new();
+
+        let shared_d3d = self.shared_d3d11_device();
 
         let state = self.states.get_mut(&pid_raw).ok_or_else(|| {
             AvError::Other(anyhow::anyhow!(
                 "codec state ausente após inserção — invariante violado"
             ))
         })?;
-
-        let mut frames = Vec::new();
 
         // AAC LATM: um PES pode conter múltiplos frames LOAS concatenados.
         // O decoder aac_latm do FFmpeg aceita apenas um frame LOAS por AVPacket;
@@ -307,9 +514,10 @@ impl FfmpegDecoder {
                             let (pts_raw, out_sr, out_ch, samples) =
                                 state.frame.to_pcm_f32(sr, ch)?;
                             frames.push(DecodedFrame::Audio(AudioFrame::new(
+                                pid_raw,
                                 out_sr,
                                 out_ch,
-                                pts_raw_to_option(pts_raw),
+                                resolve_audio_pts(pts_raw, None, pes.pts),
                                 samples,
                             )));
                             state.frame.unref();
@@ -334,104 +542,315 @@ impl FfmpegDecoder {
         // aqui seria correto para erros fatais, mas para o caso mid-stream o
         // decoder se recupera sozinho no próximo IDR — portanto loga e continua.
 
-        // Cria o AVPacket com o payload PES.
-        let pkt = FfmpegPacket::from_bytes(Arc::clone(&self.lib), &pes.payload, pes.pts)?;
+        // Usa o parser FFmpeg para realinhar o payload PES em frames/access
+        // units completos antes de enviar ao decoder. PES não está garantido
+        // a alinhar-se com fronteiras de codec (especialmente HEVC com PES
+        // longos atravessando múltiplos AUs, e AC-3 com vários frames por PES).
+        //
+        // Quando o parser não está disponível (codec sem parser registrado),
+        // cai para o comportamento legado de enviar o payload completo de uma vez.
+        let parsed_packets: Vec<(Vec<u8>, Option<u64>)> =
+            if let Some(parser) = state.parser.as_mut() {
+                parser.parse(&state.codec_ctx, &pes.payload, pes.pts)
+            } else {
+                vec![(pes.payload.to_vec(), pes.pts)]
+            };
 
-        // Envia o pacote ao decodificador.
-        if let Err(e) = state.codec_ctx.send_packet(&pkt) {
-            tracing::debug!(%e, pid = pid_raw, "send_packet: erro transitório (aguardando IDR?)");
-            return Ok(frames);
-        }
+        // Flag para acionar fallback SW após sair do loop (evita borrow duplo
+        // de `self` dentro do loop onde `state` já emprestou `self.states`).
+        let mut hw_download_failed = false;
+        let mut hw_interlaced_requires_sw = false;
+        let mut hw_frames_ok: usize = 0;
 
-        loop {
-            match state.codec_ctx.receive_frame(&mut state.frame) {
-                Ok(true) => {
-                    // Frame pronto — converte para tipo Rust.
-                    let decoded = if state.is_video {
-                        // Verifica se o frame é interlaced (FFmpeg 8.x: flags bit 0).
-                        // SAFETY: state.frame.as_ptr() aponta para AVFrame válido e preenchido.
-                        let is_interlaced = unsafe {
-                            frame_flags(state.frame.as_ptr()) & AV_FRAME_FLAG_INTERLACED != 0
-                        };
+        'pkt_loop: for (pkt_bytes, pkt_pts) in parsed_packets {
+            if pkt_bytes.is_empty() {
+                continue;
+            }
+            let pkt = FfmpegPacket::from_bytes(Arc::clone(&self.lib), &pkt_bytes, pkt_pts)?;
+            if let Err(e) = state.codec_ctx.send_packet(&pkt) {
+                tracing::debug!(%e, pid = pid_raw, "send_packet: erro transitório (aguardando IDR?)");
+                continue;
+            }
 
-                        // Aplica bwdif se interlaced e FilterLib disponível.
-                        let di_frame: Option<FfmpegFrame> = if is_interlaced
-                            && state.deinterlacer.is_none()
-                        {
-                            if let Some(fl) = &self.filter_lib {
-                                state.deinterlacer =
-                                    Some(Deinterlacer::new(Arc::clone(fl), Arc::clone(&self.lib)));
-                            }
-                            None
-                        } else {
-                            None
-                        };
+            loop {
+                match state.codec_ctx.receive_frame(&mut state.frame) {
+                    Ok(true) => {
+                        // Frame pronto — converte para tipo Rust.
+                        let decoded = if state.is_video {
+                            // ── Caminho HW: frame D3D11VA — download seguro via FFmpeg ──
+                            if state.frame.is_hw() {
+                                let is_interlaced = unsafe {
+                                    frame_flags(state.frame.as_ptr()) & AV_FRAME_FLAG_INTERLACED
+                                        != 0
+                                };
+                                if is_interlaced {
+                                    tracing::warn!(
+                                    pid = pid_raw,
+                                    "frame HW interlaced detectado — reabrindo decoder em SW para bwdif"
+                                );
+                                    state.frame.unref();
+                                    hw_interlaced_requires_sw = true;
+                                    break 'pkt_loop;
+                                }
 
-                        let di_frame = if is_interlaced {
-                            if let Some(di) = state.deinterlacer.as_mut() {
-                                match di.process(&state.frame) {
-                                    Ok(f) => f,
-                                    Err(e) => {
-                                        tracing::warn!(%e, pid = pid_raw, "bwdif: erro; usando frame original");
-                                        None
+                                // Cancela o deadline de init — recebemos o primeiro frame HW.
+                                state.hw_init_deadline = None;
+
+                                let decoded_hw = if let Some(d3d_dev) = shared_d3d.as_deref() {
+                                    match try_hw_zero_copy(&state.frame, d3d_dev) {
+                                        Ok(vf) => Some(vf),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                %e,
+                                                pid = pid_raw,
+                                                "zero-copy HW falhou — tentando download SW"
+                                            );
+                                            hw_video_frame_from_download(&state.frame, pid_raw)
+                                                .map_err(|e2| {
+                                                    hw_download_failed = true;
+                                                    tracing::warn!(
+                                                        %e2,
+                                                        pid = pid_raw,
+                                                        "falha ao baixar frame HW para YUV"
+                                                    );
+                                                    e2
+                                                })
+                                                .ok()
+                                        }
                                     }
+                                } else {
+                                    hw_video_frame_from_download(&state.frame, pid_raw)
+                                        .map_err(|e| {
+                                            hw_download_failed = true;
+                                            tracing::warn!(
+                                                %e,
+                                                pid = pid_raw,
+                                                "falha ao baixar frame HW para YUV"
+                                            );
+                                            e
+                                        })
+                                        .ok()
+                                };
+
+                                if let Some(vf) = decoded_hw {
+                                    hw_frames_ok += 1;
+                                    Some(DecodedFrame::Video(vf))
+                                } else {
+                                    state.frame.unref();
+                                    continue;
                                 }
                             } else {
-                                di_frame
-                            }
-                        } else {
-                            di_frame
-                        };
+                                // ── Caminho SW: YUV420P / YUV420P10LE ────────────────
+                                // Verifica se o frame é interlaced (FFmpeg 8.x: flags bit 0).
+                                // SAFETY: state.frame.as_ptr() aponta para AVFrame válido e preenchido.
+                                let is_interlaced = unsafe {
+                                    frame_flags(state.frame.as_ptr()) & AV_FRAME_FLAG_INTERLACED
+                                        != 0
+                                };
 
-                        // Se bwdif retornou EAGAIN (precisando de mais contexto),
-                        // descarta o frame e aguarda o próximo.
-                        let source = di_frame.as_ref().unwrap_or(&state.frame);
+                                // Aplica bwdif se interlaced e FilterLib disponível.
+                                let di_frame: Option<FfmpegFrame> =
+                                    if is_interlaced && state.deinterlacer.is_none() {
+                                        if let Some(fl) = &self.filter_lib {
+                                            state.deinterlacer = Some(Deinterlacer::new(
+                                                Arc::clone(fl),
+                                                Arc::clone(&self.lib),
+                                            ));
+                                        }
+                                        None
+                                    } else {
+                                        None
+                                    };
 
-                        let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, ten_bit) =
+                                let di_frame = if is_interlaced {
+                                    if let Some(di) = state.deinterlacer.as_mut() {
+                                        match di.process(&state.frame) {
+                                            Ok(f) => f,
+                                            Err(e) => {
+                                                tracing::warn!(%e, pid = pid_raw, "bwdif: erro; usando frame original");
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        di_frame
+                                    }
+                                } else {
+                                    di_frame
+                                };
+
+                                // Se bwdif retornou EAGAIN (precisando de mais contexto),
+                                // descarta o frame e aguarda o próximo.
+                                let source = di_frame.as_ref().unwrap_or(&state.frame);
+
+                                let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, ten_bit) =
                             source.to_yuv_planes().map_err(|e| {
                                 tracing::warn!(%e, pid = pid_raw, "falha ao extrair planos YUV");
                                 e
                             })?;
-                        let pts = pts_raw_to_option(pts_raw);
-                        DecodedFrame::Video(YuvFrame {
-                            planes,
-                            width: w,
-                            height: h,
-                            pts,
-                            sar_num: sar.0,
-                            sar_den: sar.1,
-                            colorspace: YuvColorspace::from_avutil(raw_cs),
-                            color_range: YuvColorRange::from_avutil(raw_cr),
-                            ten_bit,
-                        })
-                    } else {
-                        let (sr, ch) = state.frame.audio_params().map_err(|e| {
+                                let pts = pts_raw_to_option(pts_raw);
+                                Some(DecodedFrame::Video(VideoFrame::Sw(YuvFrame {
+                                    planes,
+                                    width: w,
+                                    height: h,
+                                    pts,
+                                    sar_num: sar.0,
+                                    sar_den: sar.1,
+                                    colorspace: YuvColorspace::from_avutil(raw_cs),
+                                    color_range: YuvColorRange::from_avutil(raw_cr),
+                                    ten_bit,
+                                })))
+                            } // fim caminho SW
+                        } else {
+                            let (sr, ch) = state.frame.audio_params().map_err(|e| {
                             tracing::warn!(%e, pid = pid_raw, "falha ao ler metadata de áudio do frame");
                             e
                         })?;
-                        let (pts_raw, out_sr, out_ch, samples) = state.frame.to_pcm_f32(sr, ch)?;
-                        let pts = pts_raw_to_option(pts_raw);
-                        DecodedFrame::Audio(AudioFrame::new(out_sr, out_ch, pts, samples))
-                    };
-                    frames.push(decoded);
-                    // Limpa o frame para reutilização.
-                    state.frame.unref();
-                }
-                Ok(false) => {
-                    // EAGAIN ou EOF — sem mais frames por agora.
-                    break;
-                }
-                Err(e) => {
-                    // Erro de receive_frame: pode ocorrer em bitstreams corrompidos
-                    // ou durante sincronização inicial.  Loga e interrompe o loop
-                    // sem propagar o erro — o decodificador continuará no próximo PES.
-                    tracing::debug!(%e, pid = pid_raw, "receive_frame: erro transitório");
-                    break;
+                            let (pts_raw, out_sr, out_ch, samples) =
+                                state.frame.to_pcm_f32(sr, ch)?;
+                            let pts = resolve_audio_pts(pts_raw, pkt_pts, pes.pts);
+                            Some(DecodedFrame::Audio(AudioFrame::new(
+                                pid_raw, out_sr, out_ch, pts, samples,
+                            )))
+                        };
+                        if let Some(f) = decoded {
+                            frames.push(f);
+                        }
+                        state.frame.unref();
+                    }
+                    Ok(false) => {
+                        // EAGAIN ou EOF — sem mais frames por agora.
+                        break;
+                    }
+                    Err(e) => {
+                        // Erro de receive_frame: pode ocorrer em bitstreams corrompidos
+                        // ou durante sincronização inicial.  Loga e interrompe o loop
+                        // sem propagar o erro — o decodificador continuará no próximo PES.
+                        tracing::debug!(%e, pid = pid_raw, "receive_frame: erro transitório");
+                        break;
+                    }
                 }
             }
+        } // fim 'pkt_loop
+
+        // Pós-loop: atualiza estado HW (fora do borrow de `state`).
+        // SPEC-AV-HW-DEC-001
+        if hw_frames_ok > 0 {
+            self.record_hw_success();
+        }
+        if hw_interlaced_requires_sw {
+            self.fallback_to_sw("frame HW interlaced requer bwdif SW");
+            self.states.remove(&pid_raw);
+            return Ok(frames);
+        }
+        if hw_download_failed && self.record_hw_failure() {
+            tracing::warn!(
+                pid = pid_raw,
+                "3 falhas consecutivas no download HW — fallback SW"
+            );
+            self.fallback_to_sw("3 falhas consecutivas no download HW");
+            self.states.remove(&pid_raw);
+        }
+
+        let deadline_exceeded = self
+            .states
+            .get(&pid_raw)
+            .and_then(|s| s.hw_init_deadline)
+            .is_some_and(|d| Instant::now() > d);
+        if deadline_exceeded {
+            tracing::warn!(pid = pid_raw, "timeout de 2 s sem frame HW — fallback SW");
+            self.fallback_to_sw("timeout HW init (2 s)");
+            self.states.remove(&pid_raw);
         }
 
         Ok(frames)
+    }
+
+    /// Retorna o `D3d11Device` compartilhado quando hwaccel D3D11VA está ativo.
+    fn shared_d3d11_device(&self) -> Option<Arc<D3d11Device>> {
+        match &self.hwaccel {
+            #[cfg(windows)]
+            HwAccelMode::D3d11Va(dev) if self.hw_state.is_active() => Some(Arc::clone(dev)),
+            #[cfg(not(windows))]
+            HwAccelMode::D3d11Va(_) if self.hw_state.is_active() => None,
+            _ => None,
+        }
+    }
+}
+
+/// Extrai os planos NV12/P010 de um frame HW D3D11VA para `VideoFrame::Hw`.
+///
+/// CRÍTICO: a staging copy (`extract_nv12_planes`) ocorre **aqui**, enquanto o
+/// `AVFrame` ainda está vivo. A surface pertence ao pool do decoder e é
+/// reescrita assim que liberada (`unref`); adiar a cópia para a thread de
+/// render faria a UI copiar uma slice já reutilizada por um frame mais novo,
+/// produzindo batimento ("zig-zag"). O `AddRef` na textura é temporário e serve
+/// apenas para a cópia — não protege a slice contra reuso.
+#[cfg(windows)]
+fn try_hw_zero_copy(frame: &FfmpegFrame, d3d_dev: &D3d11Device) -> Result<VideoFrame, AvError> {
+    use crate::hw::D3d11Texture;
+
+    let (tex_ptr, slice, w, h, pts_raw, sar, trc, cs, cr) = frame.hw_frame_info()?;
+    let tex = unsafe {
+        D3d11Texture::from_raw_addref(
+            tex_ptr,
+            slice,
+            w,
+            h,
+            ColorSpace::from_avutil(cs),
+            TransferFunction::from_avutil(trc),
+            cr == AV_COL_RANGE_JPEG,
+        )?
+    };
+    let planes = d3d_dev.extract_nv12_planes(&tex)?;
+    let colorspace = match ColorSpace::from_avutil(cs) {
+        ColorSpace::Bt601 => YuvColorspace::Bt601,
+        ColorSpace::Bt709 => YuvColorspace::Bt709,
+        ColorSpace::Bt2020 => YuvColorspace::Bt2020,
+    };
+    let color_range = if cr == AV_COL_RANGE_JPEG {
+        YuvColorRange::Full
+    } else {
+        YuvColorRange::Limited
+    };
+    Ok(VideoFrame::Hw(HwVideoFrame {
+        planes,
+        colorspace,
+        color_range,
+        transfer: TransferFunction::from_avutil(trc),
+        pts: pts_raw_to_option(pts_raw),
+        width: w,
+        height: h,
+        sar_num: sar.0,
+        sar_den: sar.1,
+    }))
+}
+
+/// Fallback: baixa frame HW para YUV na CPU (`VideoFrame::Sw`).
+fn hw_video_frame_from_download(frame: &FfmpegFrame, pid_raw: u16) -> Result<VideoFrame, AvError> {
+    let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, ten_bit) =
+        frame.download_to_yuv_planes().map_err(|e| {
+            tracing::debug!(%e, pid = pid_raw, "download_to_yuv_planes falhou");
+            e
+        })?;
+    Ok(VideoFrame::Sw(YuvFrame {
+        planes,
+        width: w,
+        height: h,
+        pts: pts_raw_to_option(pts_raw),
+        sar_num: sar.0,
+        sar_den: sar.1,
+        colorspace: YuvColorspace::from_avutil(raw_cs),
+        color_range: YuvColorRange::from_avutil(raw_cr),
+        ten_bit,
+    }))
+}
+
+fn hw_codec_label(codec: MediaCodec) -> Option<&'static str> {
+    match codec {
+        MediaCodec::Video(VideoCodec::Mpeg2) => Some("mpeg2video_d3d11va"),
+        MediaCodec::Video(VideoCodec::H264) => Some("h264_d3d11va"),
+        MediaCodec::Video(VideoCodec::Hevc) => Some("hevc_d3d11va"),
+        MediaCodec::Audio(_) => None,
     }
 }
 
@@ -491,6 +910,22 @@ fn pts_raw_to_option(pts_raw: i64) -> Option<u64> {
     }
 }
 
+/// Resolve PTS de áudio quando o decoder FFmpeg não preenche `AVFrame::pts`.
+///
+/// AC-3 (e outros codecs com parser) podem emitir frames com `AV_NOPTS_VALUE`
+/// mesmo quando o PES/pacote carrega PTS válido — usar o PTS do container
+/// evita âncora `0` no `AudioClock` e descompasso A/V.
+#[inline]
+fn resolve_audio_pts(
+    pts_raw: i64,
+    packet_pts: Option<u64>,
+    pes_pts: Option<u64>,
+) -> Option<u64> {
+    pts_raw_to_option(pts_raw)
+        .or(packet_pts)
+        .or(pes_pts)
+}
+
 // ─── Testes ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -535,6 +970,20 @@ mod tests {
     fn spec_av_002b_pts_raw_to_option_valid() {
         assert_eq!(pts_raw_to_option(90_000), Some(90_000u64));
         assert_eq!(pts_raw_to_option(0), Some(0u64));
+    }
+
+    /// AC-3: quando o decoder não preenche PTS, usa o PTS do pacote/PES.
+    #[test]
+    fn spec_av_002b_resolve_audio_pts_falls_back_to_packet() {
+        assert_eq!(
+            resolve_audio_pts(i64::MIN, Some(4_875_238_029), Some(99)),
+            Some(4_875_238_029)
+        );
+        assert_eq!(
+            resolve_audio_pts(i64::MIN, None, Some(4_875_238_029)),
+            Some(4_875_238_029)
+        );
+        assert_eq!(resolve_audio_pts(123, Some(456), Some(789)), Some(123));
     }
 
     /// SPEC-AV-002b: `codec_to_avid` deve mapear todos os codecs suportados.
@@ -703,10 +1152,16 @@ mod tests {
                     assert!(frame.is_video(), "esperava frame de vídeo");
                     if let DecodedFrame::Video(vf) = frame {
                         // Dimensões devem ser positivas se frame for decodificado.
-                        assert!(vf.width > 0, "width deve ser > 0");
-                        assert!(vf.height > 0, "height deve ser > 0");
-                        let y_expected = vf.width as usize * vf.height as usize;
-                        assert_eq!(vf.planes[0].len(), y_expected, "plano Y deve ter w*h bytes");
+                        assert!(vf.width() > 0, "width deve ser > 0");
+                        assert!(vf.height() > 0, "height deve ser > 0");
+                        if let VideoFrame::Sw(sw) = vf {
+                            let y_expected = sw.width as usize * sw.height as usize;
+                            assert_eq!(
+                                sw.planes[0].len(),
+                                y_expected,
+                                "plano Y deve ter w*h bytes"
+                            );
+                        }
                     }
                 }
             }
@@ -811,5 +1266,82 @@ mod tests {
         let frames = split_loas_frames(&data);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), 3 + frame_len);
+    }
+
+    // ── Hwaccel API (Fase B) ────────────────────────────────────────────────
+
+    /// Constrói um decoder isolado, sem DLLs FFmpeg, para testar a superfície
+    /// pública de hwaccel.
+    fn dummy_decoder() -> Option<FfmpegDecoder> {
+        let dir = find_ffmpeg_dll_dir()?;
+        let lib = FfmpegLib::load(&dir).ok()?;
+        Some(FfmpegDecoder::with_lib(lib))
+    }
+
+    /// SPEC-AV-HW-DEC-001: estado inicial do decoder = CPU, sem fallback.
+    #[test]
+    fn spec_av_hw_dec_001_decoder_starts_in_cpu_mode() {
+        let Some(d) = dummy_decoder() else {
+            eprintln!("FFmpeg DLLs ausentes — teste ignorado");
+            return;
+        };
+        assert!(matches!(d.hwaccel_mode(), HwAccelMode::Off));
+        assert!(!d.is_hwaccel_active());
+        assert!(d.fallback_reason().is_none());
+    }
+
+    /// SPEC-AV-HW-DEC-001: enable_hwaccel(Off) é idempotente e mantém estado limpo.
+    #[test]
+    fn spec_av_hw_dec_001_enable_off_idempotent() {
+        let Some(mut d) = dummy_decoder() else {
+            return;
+        };
+        d.enable_hwaccel(HwAccelMode::Off).unwrap();
+        assert!(!d.is_hwaccel_active());
+        assert!(d.fallback_reason().is_none());
+    }
+
+    /// SPEC-AV-HW-DEC-001: 3 falhas seguidas → record_hw_failure retorna true na 3ª.
+    #[test]
+    fn spec_av_hw_dec_001_three_failures_signal_fallback() {
+        let Some(mut d) = dummy_decoder() else {
+            return;
+        };
+        // Simula ativação em GPU manualmente via record_hw_success (zera
+        // contador) e depois 3 falhas.
+        assert!(!d.record_hw_failure());
+        assert!(!d.record_hw_failure());
+        assert!(d.record_hw_failure(), "3ª falha deve disparar fallback");
+        d.fallback_to_sw("simulated");
+        assert!(!d.is_hwaccel_active());
+        assert_eq!(d.fallback_reason(), Some("simulated"));
+    }
+
+    /// SPEC-AV-HW-DEC-001: fallback_to_sw preserva a primeira razão.
+    #[test]
+    fn spec_av_hw_dec_001_fallback_preserves_first_reason() {
+        let Some(mut d) = dummy_decoder() else {
+            return;
+        };
+        d.fallback_to_sw("driver ausente");
+        d.fallback_to_sw("outra causa");
+        assert_eq!(d.fallback_reason(), Some("driver ausente"));
+    }
+
+    #[test]
+    fn spec_av_hw_dec_001_hw_codec_labels_are_stable() {
+        assert_eq!(
+            hw_codec_label(MediaCodec::Video(VideoCodec::Mpeg2)),
+            Some("mpeg2video_d3d11va")
+        );
+        assert_eq!(
+            hw_codec_label(MediaCodec::Video(VideoCodec::H264)),
+            Some("h264_d3d11va")
+        );
+        assert_eq!(
+            hw_codec_label(MediaCodec::Video(VideoCodec::Hevc)),
+            Some("hevc_d3d11va")
+        );
+        assert_eq!(hw_codec_label(MediaCodec::Audio(AudioCodec::Mp2)), None);
     }
 }

@@ -30,6 +30,71 @@ impl Default for NetworkConfig {
     }
 }
 
+/// Seleção de hardware acceleration para o decoder de vídeo.
+///
+/// SPEC-CFG-HW-001
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HwAccelChoice {
+    /// Tenta D3D11VA quando o sistema suporta; cai em CPU caso contrário.
+    #[default]
+    Auto,
+    /// Força D3D11VA; se não disponível, fica em CPU mas registra fallback.
+    D3d11va,
+    /// Desativa qualquer hwaccel; decode 100 % CPU.
+    None,
+}
+
+impl HwAccelChoice {
+    /// Faz parsing de uma string CLI/config (case-insensitive).
+    ///
+    /// SPEC-CFG-HW-001
+    pub fn parse_cli(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "d3d11va" | "d3d11" | "dxva" | "dxva2" => Ok(Self::D3d11va),
+            "none" | "off" | "cpu" | "sw" => Ok(Self::None),
+            other => Err(format!(
+                "valor inválido para --hwaccel: '{other}' (use auto|d3d11va|none)"
+            )),
+        }
+    }
+
+    /// Identificador estável para logs e telemetria.
+    ///
+    /// SPEC-CFG-HW-001
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::D3d11va => "d3d11va",
+            Self::None => "none",
+        }
+    }
+}
+
+// Conversões com a variante UI (sem dependência de serde/TOML).
+//
+// SPEC-CFG-HW-001
+impl From<ui::HwAccelChoice> for HwAccelChoice {
+    fn from(value: ui::HwAccelChoice) -> Self {
+        match value {
+            ui::HwAccelChoice::Auto => Self::Auto,
+            ui::HwAccelChoice::D3d11va => Self::D3d11va,
+            ui::HwAccelChoice::None => Self::None,
+        }
+    }
+}
+
+impl From<HwAccelChoice> for ui::HwAccelChoice {
+    fn from(value: HwAccelChoice) -> Self {
+        match value {
+            HwAccelChoice::Auto => Self::Auto,
+            HwAccelChoice::D3d11va => Self::D3d11va,
+            HwAccelChoice::None => Self::None,
+        }
+    }
+}
+
 /// Configurações do player.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -43,6 +108,10 @@ pub struct PlayerConfig {
     /// Seleciona automaticamente o primeiro serviço com streams A/V válidos ao
     /// receber a primeira PMT, sem sobrescrever uma seleção manual. Padrão: true.
     pub auto_play_first_service: bool,
+    /// Aceleração de hardware do decoder de vídeo (D3D11VA).  Padrão: `Auto`.
+    ///
+    /// SPEC-CFG-HW-001
+    pub hwaccel: HwAccelChoice,
 }
 
 impl Default for PlayerConfig {
@@ -52,6 +121,7 @@ impl Default for PlayerConfig {
             volume: 1.0,
             fallback_cpu_render: false,
             auto_play_first_service: true,
+            hwaccel: HwAccelChoice::Auto,
         }
     }
 }
@@ -141,7 +211,10 @@ impl Default for DecoderConfig {
         Self {
             thread_count: 0, // 0 = detectar em runtime via available_parallelism
             thread_type: DecoderThreadType::Auto,
-            skip_loop_filter: false,
+            // skip_loop_filter habilitado por padrão: para uso de monitoramento
+            // broadcast, pular o filtro de deblocking em frames não-referência
+            // economiza ~15–25 % de CPU em HEVC com impacto mínimo na imagem.
+            skip_loop_filter: true,
             flag2_fast: false,
             profile: DecoderProfile::Default,
         }
@@ -462,5 +535,69 @@ timeout_ms = 5000
         let (_dir, path) = temp_toml(toml_str);
         let cfg = AppConfig::load_from_path_or_default(&path);
         assert_eq!(cfg.decoder, DecoderConfig::default());
+    }
+
+    // ── HwAccelChoice (SPEC-CFG-HW-001) ────────────────────────────────────
+
+    /// SPEC-CFG-HW-001 — default de hwaccel é Auto.
+    #[test]
+    fn spec_cfg_hw_001_default_is_auto() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.player.hwaccel, HwAccelChoice::Auto);
+    }
+
+    /// SPEC-CFG-HW-001 — `--hwaccel` CLI aceita auto/d3d11va/none.
+    #[test]
+    fn spec_cfg_hw_001_parse_cli_canonical_forms() {
+        assert_eq!(HwAccelChoice::parse_cli("auto"), Ok(HwAccelChoice::Auto));
+        assert_eq!(
+            HwAccelChoice::parse_cli("d3d11va"),
+            Ok(HwAccelChoice::D3d11va)
+        );
+        assert_eq!(HwAccelChoice::parse_cli("none"), Ok(HwAccelChoice::None));
+    }
+
+    /// SPEC-CFG-HW-001 — parse_cli é case-insensitive e aceita aliases.
+    #[test]
+    fn spec_cfg_hw_001_parse_cli_aliases() {
+        assert_eq!(HwAccelChoice::parse_cli("AUTO"), Ok(HwAccelChoice::Auto));
+        assert_eq!(
+            HwAccelChoice::parse_cli("D3D11"),
+            Ok(HwAccelChoice::D3d11va)
+        );
+        assert_eq!(HwAccelChoice::parse_cli("Off"), Ok(HwAccelChoice::None));
+        assert_eq!(HwAccelChoice::parse_cli("cpu"), Ok(HwAccelChoice::None));
+    }
+
+    /// SPEC-CFG-HW-001 — valores inválidos retornam Err com contexto.
+    #[test]
+    fn spec_cfg_hw_001_parse_cli_rejects_invalid() {
+        let err = HwAccelChoice::parse_cli("nvdec").unwrap_err();
+        assert!(err.contains("nvdec"));
+        assert!(err.contains("auto"));
+    }
+
+    /// SPEC-CFG-HW-001 — `[player].hwaccel` é desserializado do TOML.
+    #[test]
+    fn spec_cfg_hw_001_player_hwaccel_from_toml() {
+        let toml_str = r#"
+[player]
+hwaccel = "d3d11va"
+"#;
+        let (_dir, path) = temp_toml(toml_str);
+        let cfg = AppConfig::load_from_path_or_default(&path);
+        assert_eq!(cfg.player.hwaccel, HwAccelChoice::D3d11va);
+    }
+
+    /// SPEC-CFG-HW-001 — `hwaccel = "none"` desativa hwaccel via config.
+    #[test]
+    fn spec_cfg_hw_001_player_hwaccel_none_from_toml() {
+        let toml_str = r#"
+[player]
+hwaccel = "none"
+"#;
+        let (_dir, path) = temp_toml(toml_str);
+        let cfg = AppConfig::load_from_path_or_default(&path);
+        assert_eq!(cfg.player.hwaccel, HwAccelChoice::None);
     }
 }

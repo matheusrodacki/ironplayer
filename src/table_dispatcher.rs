@@ -53,6 +53,14 @@ pub enum PesCommand {
 pub enum DecodeCommand {
     /// Reinicia todos os contextos de decodificação (ao trocar de serviço).
     Reset,
+    /// Aplica um novo modo de aceleração de hardware no decoder.
+    ///
+    /// SPEC-CFG-HW-001
+    SetHwAccel {
+        choice: crate::config::HwAccelChoice,
+    },
+    /// Notifica o decoder que o render encontrou `DXGI_ERROR_DEVICE_REMOVED`.
+    HandleDeviceRemoved,
 }
 
 /// SPEC-TABLE
@@ -452,6 +460,14 @@ impl TableDispatcher {
             "serviço alterado — re-roteando PIDs A/V"
         );
 
+        let initial_auto_play_selection = self.last_selected_service.is_none()
+            && new_service.is_some()
+            && self.auto_play
+            && self.auto_play_triggered;
+        let should_reset_decoder = self.last_selected_service != new_service
+            && !self.active_av_pids.is_empty()
+            && !initial_auto_play_selection;
+
         if new_service.is_none() {
             self.auto_play_triggered = false;
         }
@@ -464,7 +480,7 @@ impl TableDispatcher {
         }
 
         // Reinicia o decodificador para descartar contextos obsoletos.
-        if self.decode_tx.try_send(DecodeCommand::Reset).is_err() {
+        if should_reset_decoder && self.decode_tx.try_send(DecodeCommand::Reset).is_err() {
             warn!("canal decode-control cheio — Reset descartado");
         }
 
@@ -558,10 +574,6 @@ impl TableDispatcher {
             }
         }
 
-        if self.decode_tx.try_send(DecodeCommand::Reset).is_err() {
-            warn!("canal decode-control cheio — Reset descartado");
-        }
-
         self.sync_active_audio_track();
     }
 
@@ -639,7 +651,8 @@ impl TableDispatcher {
     }
 
     fn dispatch_cat(&self, section: &CompleteSection) {
-        match Cat::parse(&section.data) {
+        let bytes = section_with_crc_padding(section);
+        match Cat::parse(&bytes) {
             Ok(cat) => {
                 self.tx.try_send(TableEvent::Cat(cat));
             }
@@ -1345,6 +1358,7 @@ mod tests {
         dispatcher.process_section(make_pmt_section(0x200, 2, 0, 0x201));
         while demux_cmd_rx.try_recv().is_ok() {} // drena RegisterAvPid x2
         while pes_cmd_rx.try_recv().is_ok() {} // drena RegisterPid x2
+        dispatcher.last_selected_service = Some(1);
 
         // UI seleciona serviço 2 via Arc<RwLock>
         *selected_service_ctrl.write().unwrap() = Some(2);
@@ -1393,7 +1407,7 @@ mod tests {
         let (table_events_tx, _table_events_rx) = crossbeam_channel::bounded(64);
         let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded(64);
         let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded(64);
-        let (decode_cmd_tx, _decode_cmd_rx) = crossbeam_channel::bounded(64);
+        let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded(64);
         let bounded_tx = BoundedSender::new(table_events_tx, "test_auto_play");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_read = Arc::clone(&selected_service);
@@ -1428,6 +1442,12 @@ mod tests {
         assert!(
             dispatcher.auto_play_triggered,
             "auto_play_triggered deve ser true após o primeiro serviço com A/V"
+        );
+        dispatcher.on_service_changed(selected_after_pmt1);
+        dispatcher.last_selected_service = selected_after_pmt1;
+        assert!(
+            decode_cmd_rx.try_recv().is_err(),
+            "primeira seleção via auto_play não deve resetar o decoder inteiro"
         );
         while demux_cmd_rx.try_recv().is_ok() {}
         while pes_cmd_rx.try_recv().is_ok() {}
@@ -2039,7 +2059,10 @@ mod tests {
             }),
             "assembler deve registrar a faixa escolhida"
         );
-        assert_eq!(decode_cmd_rx.try_recv().unwrap(), DecodeCommand::Reset);
+        assert!(
+            decode_cmd_rx.try_recv().is_err(),
+            "troca manual de áudio não deve resetar o decoder inteiro"
+        );
 
         let snapshot = audio_status.read().unwrap().clone();
         assert_eq!(
@@ -2058,9 +2081,8 @@ mod tests {
 
     /// Constrói uma seção CAT mínima para testes do dispatcher.
     fn make_cat_section(version: u8) -> CompleteSection {
-        use ts::crc::crc32_mpeg2;
         let section_length = 2 + 3 + 0 + 4; // reserved(2) + version_bytes(3) + no descs + CRC
-        let mut data = vec![
+        let data = vec![
             0x01u8,
             0x80 | ((section_length >> 8) as u8),
             (section_length & 0xFF) as u8,
@@ -2070,10 +2092,6 @@ mod tests {
             0x00,
             0x00,
         ];
-        let crc_pos = data.len();
-        data.extend_from_slice(&[0, 0, 0, 0]);
-        let crc = crc32_mpeg2(&data[..crc_pos]);
-        data[crc_pos..].copy_from_slice(&crc.to_be_bytes());
         CompleteSection {
             pid: 0x0001,
             table_id: 0x01,

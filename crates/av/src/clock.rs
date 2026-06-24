@@ -8,8 +8,9 @@
 //!
 //! - **Fase A**: tipo `Pts90` e trait `Clock` com contrato de `now_pts90()` /
 //!   `reset()` — base para instrumentação de drift.
-//! - **Fase B**: `AudioClockHandle` (contador atômico de samples consumidos
-//!   pela callback cpal) e `WallClockHandle` (fallback wall-clock) expostos
+//! - **Fase B**: `AudioClockHandle` (contador atômico de samples enviados
+//!   pela callback cpal, compensado pela latência de playback) e
+//!   `WallClockHandle` (fallback wall-clock) expostos
 //!   via `MasterClock`.
 //!
 //! ## Unidade interna
@@ -20,11 +21,12 @@
 //! ## Fórmula de `AudioClockHandle::now_pts90`
 //!
 //! ```text
-//! now_pts90 = anchor_pts + (samples_played / channels / sample_rate) * 90_000
+//! now_pts90 = anchor_pts + ((samples_played - playback_latency_samples) / channels / sample_rate) * 90_000
 //! ```
 //!
-//! Onde `samples_played` é um `AtomicU64` incrementado pela callback cpal em
-//! `output.len()` a cada chamada.
+//! Onde `samples_played` é um `AtomicU64` incrementado pela callback cpal com
+//! amostras reais de mídia, e `playback_latency_samples` representa a fila já
+//! entregue ao dispositivo, mas ainda não audível.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -64,26 +66,30 @@ pub trait Clock: Send + Sync {
 
 // ─── AudioClockHandle ────────────────────────────────────────────────────────
 
-/// Handle do relógio baseado em samples de áudio consumidos pelo WASAPI.
+/// Handle do relógio baseado em samples de áudio entregues ao WASAPI.
 ///
-/// O campo `samples_played` é um `Arc<AtomicU64>` compartilhado com a
-/// callback cpal: a callback incrementa o contador com `output.len()` a
-/// cada invocação; `now_pts90()` lê o contador e converte para PTS 90 kHz.
+/// O campo `samples_played` é um `Arc<AtomicU64>` compartilhado com a callback
+/// cpal: a callback incrementa o contador com amostras reais copiadas para o
+/// dispositivo. `now_pts90()` subtrai a latência estimada de playback antes de
+/// converter para PTS 90 kHz, para representar o áudio audível no DAC.
 ///
 /// O relógio mede *samples interleaved* (i.e. `channels` amostras por frame
 /// de áudio), portanto a conversão para tempo real é:
 ///
 /// ```text
-/// elapsed_s = samples_played / channels / sample_rate
+/// elapsed_s = (samples_played - playback_latency_samples) / channels / sample_rate
 /// now_pts90 = anchor_pts + elapsed_s * 90_000
 /// ```
 ///
 /// SPEC-AV-CLOCK-002
 #[derive(Clone, Debug)]
 pub struct AudioClockHandle {
-    /// Contador atômico de samples interleaved consumidos pelo driver de
-    /// áudio.  Compartilhado com a callback cpal via `Arc`.
+    /// Contador atômico de samples interleaved entregues ao driver de áudio.
+    /// Compartilhado com a callback cpal via `Arc`.
     pub samples_played: Arc<AtomicU64>,
+    /// Samples interleaved já entregues ao driver, mas ainda pendentes até a
+    /// reprodução audível.
+    playback_latency_samples: Arc<AtomicU64>,
     /// Taxa de amostragem em Hz (e.g. 48 000).
     pub sample_rate: u32,
     /// Número de canais (1 = mono, 2 = estéreo).
@@ -100,6 +106,7 @@ impl AudioClockHandle {
     pub fn new(sample_rate: u32, channels: u16, anchor_pts: Pts90) -> Self {
         Self {
             samples_played: Arc::new(AtomicU64::new(0)),
+            playback_latency_samples: Arc::new(AtomicU64::new(0)),
             sample_rate,
             channels,
             anchor_pts: Arc::new(AtomicI64::new(anchor_pts)),
@@ -121,6 +128,30 @@ impl AudioClockHandle {
     ) -> Self {
         Self {
             samples_played,
+            playback_latency_samples: Arc::new(AtomicU64::new(0)),
+            sample_rate,
+            channels,
+            anchor_pts: Arc::new(AtomicI64::new(anchor_pts)),
+        }
+    }
+
+    /// Cria um `AudioClockHandle` com contador de samples e contador de
+    /// latência compartilhados.
+    ///
+    /// Usado por `AudioOutput::clock_handle()` para compensar a latência real
+    /// informada pelo callback cpal/WASAPI.
+    ///
+    /// SPEC-AV-CLOCK-002
+    pub fn with_counter_and_latency(
+        samples_played: Arc<AtomicU64>,
+        playback_latency_samples: Arc<AtomicU64>,
+        sample_rate: u32,
+        channels: u16,
+        anchor_pts: Pts90,
+    ) -> Self {
+        Self {
+            samples_played,
+            playback_latency_samples,
             sample_rate,
             channels,
             anchor_pts: Arc::new(AtomicI64::new(anchor_pts)),
@@ -138,13 +169,55 @@ impl AudioClockHandle {
     pub fn samples_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.samples_played)
     }
+
+    /// Retorna o contador compartilhado de latência de playback.
+    ///
+    /// SPEC-AV-CLOCK-002
+    pub fn playback_latency_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.playback_latency_samples)
+    }
+
+    fn audible_samples(&self) -> u64 {
+        let submitted = self.samples_played.load(Ordering::Relaxed);
+        let latency = self.playback_latency_samples.load(Ordering::Relaxed);
+        submitted.saturating_sub(latency)
+    }
+
+    /// PTS de âncora atual em 90 kHz.
+    ///
+    /// SPEC-AV-CLOCK-002
+    pub fn anchor_pts(&self) -> Pts90 {
+        self.anchor_pts.load(Ordering::Relaxed)
+    }
+
+    /// Ajusta a âncora sem zerar `samples_played` (correção de drift em runtime).
+    ///
+    /// Usado pela UI para puxar o clock de áudio em direção ao PTS do vídeo
+    /// sem interromper a reprodução WASAPI.
+    ///
+    /// SPEC-AV-CLOCK-002
+    pub fn shift_anchor(&self, new_anchor: Pts90) {
+        self.anchor_pts.store(new_anchor, Ordering::Relaxed);
+    }
+
+    /// Identificador estável do handle — ponteiro do contador de samples.
+    ///
+    /// Clones do mesmo handle (mesma `AudioOutput`) retornam o mesmo id; um
+    /// handle recriado por uma nova saída de áudio (troca de serviço/trilha)
+    /// retorna um id distinto. Usado pela UI para detectar substituição do
+    /// clock e re-adotá-lo, evitando travar o relógio num handle obsoleto.
+    ///
+    /// SPEC-AV-CLOCK-002
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.samples_played) as usize
+    }
 }
 
 impl Clock for AudioClockHandle {
-    /// Calcula o PTS presente a partir dos samples consumidos.
+    /// Calcula o PTS presente a partir dos samples audíveis.
     ///
     /// ```text
-    /// elapsed_s  = samples_played / channels / sample_rate
+    /// elapsed_s  = (samples_played - playback_latency_samples) / channels / sample_rate
     /// now_pts90  = anchor_pts + elapsed_s * 90_000
     /// ```
     ///
@@ -154,7 +227,7 @@ impl Clock for AudioClockHandle {
     ///
     /// SPEC-AV-CLOCK-002
     fn now_pts90(&self) -> Pts90 {
-        let played = self.samples_played.load(Ordering::Relaxed);
+        let played = self.audible_samples();
         let anchor = self.anchor_pts.load(Ordering::Relaxed);
 
         if self.channels == 0 || self.sample_rate == 0 {
@@ -178,6 +251,7 @@ impl Clock for AudioClockHandle {
     /// SPEC-AV-CLOCK-002
     fn reset(&self, anchor_pts: Pts90) {
         self.samples_played.store(0, Ordering::Relaxed);
+        self.playback_latency_samples.store(0, Ordering::Relaxed);
         self.anchor_pts.store(anchor_pts, Ordering::Relaxed);
     }
 }
@@ -285,6 +359,15 @@ impl MasterClock {
             MasterClock::Wall(_) => None,
         }
     }
+
+    /// Ajusta a âncora do relógio de áudio sem resetar samples (no-op para Wall).
+    ///
+    /// SPEC-AV-CLOCK-001
+    pub fn shift_anchor(&self, new_anchor: Pts90) {
+        if let MasterClock::Audio(h) = self {
+            h.shift_anchor(new_anchor);
+        }
+    }
 }
 
 impl Clock for MasterClock {
@@ -335,6 +418,36 @@ mod tests {
         assert_eq!(clock.now_pts90(), 90_000);
     }
 
+    /// A latência de playback é subtraída para que o clock represente o áudio audível.
+    ///
+    /// SPEC-AV-CLOCK-002
+    #[test]
+    fn spec_av_clock_002_audio_clock_subtracts_playback_latency() {
+        let samples = Arc::new(AtomicU64::new(48_000 * 2 * 3));
+        let latency = Arc::new(AtomicU64::new(48_000 * 2));
+        let clock = AudioClockHandle::with_counter_and_latency(
+            Arc::clone(&samples),
+            Arc::clone(&latency),
+            48_000,
+            2,
+            0,
+        );
+
+        assert_eq!(clock.now_pts90(), 180_000);
+    }
+
+    /// Latência maior que o total enviado satura na âncora em vez de retroceder o PTS.
+    ///
+    /// SPEC-AV-CLOCK-002
+    #[test]
+    fn spec_av_clock_002_audio_clock_latency_saturates_at_anchor() {
+        let samples = Arc::new(AtomicU64::new(48_000));
+        let latency = Arc::new(AtomicU64::new(48_000 * 2));
+        let clock = AudioClockHandle::with_counter_and_latency(samples, latency, 48_000, 1, 1234);
+
+        assert_eq!(clock.now_pts90(), 1234);
+    }
+
     /// Âncora não-zero é somada corretamente ao offset calculado.
     ///
     /// SPEC-AV-CLOCK-002
@@ -359,7 +472,21 @@ mod tests {
             .store(48_000 * 2 * 5, Ordering::Relaxed);
         clock.reset(180_000); // nova âncora = 2 s
         assert_eq!(clock.samples_played.load(Ordering::Relaxed), 0);
+        assert_eq!(clock.playback_latency_counter().load(Ordering::Relaxed), 0);
         assert_eq!(clock.now_pts90(), 180_000);
+    }
+
+    /// `shift_anchor()` ajusta PTS sem zerar samples (drift correction).
+    ///
+    /// SPEC-AV-CLOCK-002
+    #[test]
+    fn spec_av_clock_002_shift_anchor_preserves_samples() {
+        let clock = AudioClockHandle::new(48_000, 2, 0);
+        clock.samples_played.store(48_000 * 2, Ordering::Relaxed);
+        assert_eq!(clock.now_pts90(), 90_000);
+        clock.shift_anchor(180_000);
+        assert_eq!(clock.samples_played.load(Ordering::Relaxed), 48_000 * 2);
+        assert_eq!(clock.now_pts90(), 270_000);
     }
 
     /// `samples_counter()` retorna um `Arc` compartilhado com o contador

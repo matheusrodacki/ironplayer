@@ -108,6 +108,7 @@ flowchart LR
 
 - Áudio nunca é descartado nem reamostrado nessa fase. **Áudio dita o tempo do mundo.**
 - Vídeo apresenta-se contra o `MasterClock`; nunca contra `Instant::now()` direto.
+- **Nunca deslocar `AudioClockHandle::anchor_pts`** para alinhar PTS de vídeo ao mux. O skew de startup (vídeo só decodifica após o 1º IDR, ~1–2 s à frente do áudio no mux) é absorvido pela `VideoQueue` via hold-early/drop-late — não via `shift_anchor`. Deslocar a âncora faz o vídeo parecer sincronizado ao clock deslocado, mas adianta ~1–2 s vs o áudio audível (regressão confirmada em 2026-06-24; cf. STATE.md L-002).
 - Toda apresentação de frame consulta `VideoQueue::next_due(now_pts)`; nenhum frame é apresentado sem agendamento.
 - Descontinuidade PCR ou wrap de PTS dispara `MasterClock::reset()` + drain de `VideoQueue` + drain do `AudioRingBuffer`.
 
@@ -198,7 +199,7 @@ pub struct MetricsSnapshot {
 | `HOLD_THRESHOLD`       | 20 ms         | < 1 frame @ 50 fps                      |
 | `DROP_THRESHOLD`       | 100 ms        | EBU R 37 limit (vídeo após áudio)       |
 | `RESYNC_THRESHOLD`     | 500 ms        | descontinuidade ou stall pós-IDR        |
-| `VideoQueue::capacity` | 16 frames     | absorve burst de I-frame em GOP 50 HEVC |
+| `VideoQueue::capacity` | 64 frames     | absorve lead de startup (1º IDR ~1,5–2 s após áudio) + burst de I-frame |
 | `AudioRingBuffer` alvo | 80 ms         | menor latência sem underrun             |
 | Wrap detection         | `Δpts > 2^32` | margem segura para 33-bit               |
 
@@ -230,7 +231,7 @@ PSI/SI (CAT, NIT dinâmico, TOT) e fixtures reais correm em paralelo, sem depend
 | #   | Risco                                                                                                    | Probabilidade | Impacto | Mitigação                                                                                    |
 | --- | -------------------------------------------------------------------------------------------------------- | ------------- | ------- | -------------------------------------------------------------------------------------------- |
 | R1  | `AudioClock` deriva contra wall clock em hardware com clock impreciso (USB DAC, virtualização).          | Média         | Alto    | Detectar drift > 200 ppm em 60 s e cair para `WallClock`; expor warning na UI.               |
-| R2  | `VideoQueue` cheia em streams com B-frames longos (HEVC GOP 50 + 4 B-frames) causa drops de I/P válidos. | Média         | Alto    | Capacidade 16; medir via `video_queue_depth` em testes reais; ajustar antes do merge.        |
+| R2  | `VideoQueue` cheia em streams com B-frames longos (HEVC GOP 50 + 4 B-frames) causa drops de I/P válidos. | Média         | Alto    | Capacidade 64 (lead de startup + burst); medir via `video_queue_depth` em testes reais; ajustar antes do merge. |
 | R3  | Wrap de PTS detectado erroneamente em stream com discontinuity sem indicator (provedor mal configurado). | Baixa         | Médio   | Wrap exige `Δ > 2^32`; descontinuidade legítima dispara `RESYNC_THRESHOLD` antes.            |
 | R4  | Mudança no contrato `MetricsSnapshot` quebra UI antiga (consumidor `tokio::sync::watch`).                | Baixa         | Baixo   | Adicionar campos novos com `#[serde(default)]` equivalente em estrutura interna.             |
 | R5  | CAT vazio em streams FTA gera falso-positivo de "scrambled" se a UI interpretar mal.                     | Baixa         | Baixo   | CAT ausente ≠ scrambling; UI só sinaliza CA quando `transport_scrambling_control != 0`.      |

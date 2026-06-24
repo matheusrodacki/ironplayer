@@ -65,7 +65,9 @@ pub const AV_CODEC_ID_AAC_LATM: u32 = 0x15031;
 
 /// Formatos de pixel YUV planar suportados pelo decoder.
 pub const AV_PIX_FMT_YUV420P: c_int = 0;
-pub const AV_PIX_FMT_YUV420P10LE: c_int = 63;
+pub const AV_PIX_FMT_YUV422P: c_int = 4;
+pub const AV_PIX_FMT_YUV420P10LE: c_int = 62;
+pub const AV_PIX_FMT_YUV422P10LE: c_int = 64;
 
 /// Formatos de sample de áudio.
 pub const AV_SAMPLE_FMT_FLT: c_int = 3;
@@ -81,6 +83,30 @@ pub const AVERROR_EOF: c_int = -541_478_725_i32;
 ///
 /// Introduzido em FFmpeg 6.x em substituição ao campo deprecated `interlaced_frame`.
 pub const AV_FRAME_FLAG_INTERLACED: c_int = 1;
+
+/// `AV_PIX_FMT_NV12` — semi-planar YCbCr 4:2:0 (plano Y + UV intercalado).
+/// Formato nativo de saída do decoder D3D11VA.
+pub const AV_PIX_FMT_NV12: c_int = 23;
+
+/// `AV_PIX_FMT_D3D11` — frame em textura D3D11 (hardware surface).
+/// Retornado por `avcodec_receive_frame` quando D3D11VA está ativo.
+pub const AV_PIX_FMT_D3D11: c_int = 171;
+
+/// `AV_HWDEVICE_TYPE_D3D11VA` — identificador do tipo de device hardware D3D11VA.
+pub const AV_HWDEVICE_TYPE_D3D11VA: c_int = 7;
+
+/// Offset do campo `data` em `AVBufferRef` (FFmpeg 7.x / avutil-62, x86-64).
+pub(crate) const AV_BUFFER_REF_DATA_OFFSET: usize = 8;
+
+/// Offset do campo `hwctx` em `AVHWDeviceContext` (x86-64).
+pub(crate) const AV_HWDEVICE_CTX_HWCTX_OFFSET: usize = 16;
+
+/// `AVCOL_RANGE_JPEG` — faixa de cor full (0–255).
+pub(crate) const AV_COL_RANGE_JPEG: i32 = 2;
+///
+/// Confirmado via sondagem runtime: `hwaccel_flags` (AVOption) está em offset +568,
+/// portanto o ponteiro `AVBufferRef*` imediatamente anterior fica em +560.
+pub(crate) const AV_CTX_HW_DEVICE_CTX_OFFSET: usize = 560;
 
 // ─── Tipos opacos FFmpeg ──────────────────────────────────────────────────────
 
@@ -306,6 +332,18 @@ pub(crate) unsafe fn frame_colorspace(frame: *mut c_void) -> i32 {
     *((frame as *const u8).add(292) as *const i32)
 }
 
+/// Lê `color_trc` de um `AVFrame*` opaco (offset 288).
+///
+/// Valores relevantes: `1` = SDR (BT.1886), `16` = SMPTE ST 2084 (PQ),
+/// `18` = ARIB STD-B67 (HLG).
+///
+/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
+#[inline]
+#[allow(dead_code)]
+pub(crate) unsafe fn frame_color_trc(frame: *mut c_void) -> i32 {
+    *((frame as *const u8).add(288) as *const i32)
+}
+
 /// Lê `flags` de um `AVFrame*` opaco (offset 276).
 ///
 /// Contém flags como `AV_FRAME_FLAG_INTERLACED (1 << 0)` e
@@ -337,6 +375,37 @@ type FnAvcodecReceiveFrame =
 
 type FnAvPacketAlloc = unsafe extern "C" fn() -> *mut AvPacket;
 type FnAvPacketFree = unsafe extern "C" fn(pkt: *mut *mut AvPacket);
+
+/// Opaco — `AVCodecParserContext` do FFmpeg.
+#[repr(C)]
+pub struct AvCodecParserContext {
+    _opaque: [u8; 0],
+}
+
+/// `av_parser_init(codec_id)` — abre um parser para o codec_id especificado.
+/// Retorna NULL se não houver parser disponível para o codec.
+type FnAvParserInit = unsafe extern "C" fn(codec_id: c_int) -> *mut AvCodecParserContext;
+
+/// `av_parser_parse2(s, avctx, poutbuf, poutbuf_size, buf, buf_size, pts, dts, pos)`.
+///
+/// Retorna o número de bytes consumidos de `buf`. Quando `*poutbuf_size > 0`,
+/// um pacote completo está disponível em `*poutbuf` (referência ao buffer
+/// interno do parser — não deve ser liberado).
+#[allow(clippy::type_complexity)]
+type FnAvParserParse2 = unsafe extern "C" fn(
+    s: *mut AvCodecParserContext,
+    avctx: *mut AvCodecContext,
+    poutbuf: *mut *mut u8,
+    poutbuf_size: *mut c_int,
+    buf: *const u8,
+    buf_size: c_int,
+    pts: i64,
+    dts: i64,
+    pos: i64,
+) -> c_int;
+
+/// `av_parser_close(s)` — libera o parser.
+type FnAvParserClose = unsafe extern "C" fn(s: *mut AvCodecParserContext);
 type FnAvNewPacket = unsafe extern "C" fn(pkt: *mut AvPacket, size: c_int) -> c_int;
 type FnAvFrameAlloc = unsafe extern "C" fn() -> *mut c_void;
 type FnAvFrameFree = unsafe extern "C" fn(frame: *mut *mut c_void);
@@ -379,6 +448,33 @@ type FnAvDictSet = unsafe extern "C" fn(
 
 type FnAvDictFree = unsafe extern "C" fn(m: *mut *mut AvDictionary);
 
+// ─── Tipos de função para hardware acceleration ────────────────────────────────
+
+/// `av_hwdevice_ctx_create` — cria um `AVBufferRef*` wrapping um `AVHWDeviceContext`.
+type FnAvHwdeviceCtxCreate = unsafe extern "C" fn(
+    device_ctx: *mut *mut c_void,
+    hw_type: c_int,
+    device: *const std::ffi::c_char,
+    opts: *mut c_void,
+    flags: c_int,
+) -> c_int;
+
+/// `av_hwdevice_ctx_alloc` — aloca um `AVBufferRef` para `AVHWDeviceContext` sem inicializar.
+type FnAvHwdeviceCtxAlloc = unsafe extern "C" fn(type_: c_int) -> *mut c_void;
+
+/// `av_hwdevice_ctx_init` — inicializa um contexto alocado por `av_hwdevice_ctx_alloc`.
+type FnAvHwdeviceCtxInit = unsafe extern "C" fn(ctx: *mut c_void) -> c_int;
+
+/// `av_hwframe_transfer_data` — copia dados de um frame HW para um frame SW.
+type FnAvHwframeTransferData =
+    unsafe extern "C" fn(dst: *mut c_void, src: *const c_void, flags: c_int) -> c_int;
+
+/// `av_buffer_ref` — incrementa refcount e retorna novo `AVBufferRef*`.
+type FnAvBufferRef = unsafe extern "C" fn(buf: *mut c_void) -> *mut c_void;
+
+/// `av_buffer_unref` — decrementa refcount; libera se chegar a zero.
+type FnAvBufferUnref = unsafe extern "C" fn(buf: *mut *mut c_void);
+
 // ─── FfmpegLib ────────────────────────────────────────────────────────────────
 
 /// Bibliotecas FFmpeg carregadas e ponteiros de função resolvidos.
@@ -402,6 +498,11 @@ pub struct FfmpegLib {
     pub(crate) avcodec_send_packet: FnAvcodecSendPacket,
     pub(crate) avcodec_receive_frame: FnAvcodecReceiveFrame,
 
+    // Parser de bitstream (av_parser_*)
+    pub(crate) av_parser_init: FnAvParserInit,
+    pub(crate) av_parser_parse2: FnAvParserParse2,
+    pub(crate) av_parser_close: FnAvParserClose,
+
     // Funções avutil
     pub(crate) av_packet_alloc: FnAvPacketAlloc,
     pub(crate) av_packet_free: FnAvPacketFree,
@@ -423,6 +524,14 @@ pub struct FfmpegLib {
     // Funções de dicionário avutil (usadas para opções de codec)
     pub(crate) av_dict_set: FnAvDictSet,
     pub(crate) av_dict_free: FnAvDictFree,
+
+    // Funções hw-accel (D3D11VA, SPEC-AV-HW-DEC-001)
+    pub(crate) av_hwdevice_ctx_create: FnAvHwdeviceCtxCreate,
+    pub(crate) av_hwdevice_ctx_alloc: FnAvHwdeviceCtxAlloc,
+    pub(crate) av_hwdevice_ctx_init: FnAvHwdeviceCtxInit,
+    pub(crate) av_hwframe_transfer_data: FnAvHwframeTransferData,
+    pub(crate) av_buffer_ref: FnAvBufferRef,
+    pub(crate) av_buffer_unref: FnAvBufferUnref,
 }
 
 // SAFETY: Os ponteiros de função são obtidos de DLLs thread-safe do FFmpeg.
@@ -497,6 +606,10 @@ impl FfmpegLib {
         let avcodec_receive_frame =
             sym!(avcodec, b"avcodec_receive_frame\0", FnAvcodecReceiveFrame);
 
+        let av_parser_init = sym!(avcodec, b"av_parser_init\0", FnAvParserInit);
+        let av_parser_parse2 = sym!(avcodec, b"av_parser_parse2\0", FnAvParserParse2);
+        let av_parser_close = sym!(avcodec, b"av_parser_close\0", FnAvParserClose);
+
         let av_packet_alloc = sym!(avcodec, b"av_packet_alloc\0", FnAvPacketAlloc);
         let av_packet_free = sym!(avcodec, b"av_packet_free\0", FnAvPacketFree);
         let av_new_packet = sym!(avcodec, b"av_new_packet\0", FnAvNewPacket);
@@ -524,6 +637,19 @@ impl FfmpegLib {
         let av_dict_set = sym!(avutil, b"av_dict_set\0", FnAvDictSet);
         let av_dict_free = sym!(avutil, b"av_dict_free\0", FnAvDictFree);
 
+        let av_hwdevice_ctx_create =
+            sym!(avutil, b"av_hwdevice_ctx_create\0", FnAvHwdeviceCtxCreate);
+        let av_hwdevice_ctx_alloc =
+            sym!(avutil, b"av_hwdevice_ctx_alloc\0", FnAvHwdeviceCtxAlloc);
+        let av_hwdevice_ctx_init = sym!(avutil, b"av_hwdevice_ctx_init\0", FnAvHwdeviceCtxInit);
+        let av_hwframe_transfer_data = sym!(
+            avutil,
+            b"av_hwframe_transfer_data\0",
+            FnAvHwframeTransferData
+        );
+        let av_buffer_ref = sym!(avutil, b"av_buffer_ref\0", FnAvBufferRef);
+        let av_buffer_unref = sym!(avutil, b"av_buffer_unref\0", FnAvBufferUnref);
+
         Ok(Arc::new(Self {
             _avutil: avutil,
             _avcodec: avcodec,
@@ -534,6 +660,9 @@ impl FfmpegLib {
             avcodec_open2,
             avcodec_send_packet,
             avcodec_receive_frame,
+            av_parser_init,
+            av_parser_parse2,
+            av_parser_close,
             av_packet_alloc,
             av_packet_free,
             av_new_packet,
@@ -550,6 +679,12 @@ impl FfmpegLib {
             swr_free,
             av_dict_set,
             av_dict_free,
+            av_hwdevice_ctx_create,
+            av_hwdevice_ctx_alloc,
+            av_hwdevice_ctx_init,
+            av_hwframe_transfer_data,
+            av_buffer_ref,
+            av_buffer_unref,
         }))
     }
 
@@ -570,6 +705,59 @@ impl FfmpegLib {
             format!("código {code}")
         }
     }
+}
+
+/// Lê o ponteiro `data` de um `AVBufferRef*` (layout x86-64 FFmpeg 7.x).
+///
+/// SAFETY: `buf` deve ser um `AVBufferRef*` válido.
+#[inline]
+unsafe fn buffer_ref_data(buf: *mut c_void) -> *mut u8 {
+    *((buf as *const u8).add(AV_BUFFER_REF_DATA_OFFSET) as *const *mut u8)
+}
+
+/// Cria um `AVBufferRef` de device D3D11VA reutilizando `ID3D11Device` existente.
+///
+/// SPEC-AV-HW-DEC-001
+#[cfg(windows)]
+unsafe fn create_d3d11_hw_device_ctx(
+    lib: &FfmpegLib,
+    device: *mut c_void,
+    context: *mut c_void,
+) -> Result<*mut c_void, AvError> {
+    use crate::hw::com_addref;
+
+    let hw_buf = (lib.av_hwdevice_ctx_alloc)(AV_HWDEVICE_TYPE_D3D11VA);
+    if hw_buf.is_null() {
+        return Err(AvError::FfmpegError { code: -12 });
+    }
+
+    let hw_dev = buffer_ref_data(hw_buf) as *mut c_void;
+    let d3d11_va_ctx = *((hw_dev as *const u8).add(AV_HWDEVICE_CTX_HWCTX_OFFSET)
+        as *const *mut c_void);
+    if d3d11_va_ctx.is_null() {
+        let mut buf = hw_buf;
+        (lib.av_buffer_unref)(&mut buf);
+        return Err(AvError::FfmpegError { code: -22 });
+    }
+
+    com_addref(device);
+    com_addref(context);
+    std::ptr::write(
+        (d3d11_va_ctx as *mut u8).add(0) as *mut *mut c_void,
+        device,
+    );
+    std::ptr::write(
+        (d3d11_va_ctx as *mut u8).add(8) as *mut *mut c_void,
+        context,
+    );
+
+    let ret = (lib.av_hwdevice_ctx_init)(hw_buf);
+    if ret < 0 {
+        let mut buf = hw_buf;
+        (lib.av_buffer_unref)(&mut buf);
+        return Err(AvError::FfmpegError { code: ret });
+    }
+    Ok(hw_buf)
 }
 
 // ─── RAII: FfmpegCodecContext ─────────────────────────────────────────────────
@@ -693,6 +881,149 @@ impl FfmpegCodecContext {
         Ok(Self { ctx, lib })
     }
 
+    /// Abre um decodificador FFmpeg com aceleração de hardware D3D11VA.
+    ///
+    /// Quando `external_d3d11` é `Some((device, context))`, injeta o
+    /// `ID3D11Device` existente no `AVD3D11VADeviceContext` (device compartilhado
+    /// com wgpu). Caso contrário, o FFmpeg cria um device próprio via
+    /// `av_hwdevice_ctx_create`.
+    ///
+    /// SPEC-AV-HW-DEC-001
+    pub fn open_with_hwaccel(
+        lib: Arc<FfmpegLib>,
+        codec_id: u32,
+        config: &CodecConfig,
+        hw_type: c_int,
+        external_d3d11: Option<(*mut c_void, *mut c_void)>,
+    ) -> Result<Self, AvError> {
+        // SAFETY: avcodec_find_decoder é thread-safe e retorna ponteiro estático.
+        let codec = unsafe { (lib.avcodec_find_decoder)(codec_id) };
+        if codec.is_null() {
+            return Err(AvError::FfmpegUnavailable {
+                message: format!("codec id={codec_id} não encontrado para hwaccel"),
+            });
+        }
+
+        // SAFETY: avcodec_alloc_context3 aloca com av_malloc; codec é válido.
+        let ctx = unsafe { (lib.avcodec_alloc_context3)(codec) };
+        if ctx.is_null() {
+            return Err(AvError::FfmpegError { code: -12 }); // ENOMEM
+        }
+
+        let hw_ctx = if let Some((device, context)) = external_d3d11 {
+            #[cfg(windows)]
+            {
+                match unsafe { create_d3d11_hw_device_ctx(&lib, device, context) } {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        let mut p = ctx;
+                        unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+                        return Err(e);
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (device, context);
+                let mut p = ctx;
+                unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+                return Err(AvError::HwInitFailed(
+                    "device D3D11 externo indisponível fora do Windows".into(),
+                ));
+            }
+        } else {
+            let mut created: *mut c_void = std::ptr::null_mut();
+            let hw_ret = unsafe {
+                (lib.av_hwdevice_ctx_create)(
+                    &mut created,
+                    hw_type,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if hw_ret < 0 {
+                let mut p = ctx;
+                unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+                return Err(AvError::FfmpegError { code: hw_ret });
+            }
+            created
+        };
+
+        // Cria uma referência adicional ao hw_ctx para transferir ao AVCodecContext.
+        let hw_ref = unsafe { (lib.av_buffer_ref)(hw_ctx) };
+        if hw_ref.is_null() {
+            let mut hw = hw_ctx;
+            unsafe { (lib.av_buffer_unref)(&mut hw) };
+            let mut p = ctx;
+            unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+            return Err(AvError::FfmpegError { code: -12 });
+        }
+
+        // Escreve hw_ref no campo hw_device_ctx do AVCodecContext (offset +560).
+        unsafe {
+            std::ptr::write_unaligned(
+                (ctx as *mut u8).add(AV_CTX_HW_DEVICE_CTX_OFFSET) as *mut *mut c_void,
+                hw_ref,
+            );
+        }
+
+        let mut hw = hw_ctx;
+        unsafe { (lib.av_buffer_unref)(&mut hw) };
+
+        // Monta AVDictionary com as opções de codec (mesma lógica de open()).
+        let mut opts: *mut AvDictionary = std::ptr::null_mut();
+
+        if config.thread_count > 0 {
+            let count_cstr =
+                CString::new(config.thread_count.to_string()).expect("thread_count ASCII");
+            unsafe {
+                (lib.av_dict_set)(&mut opts, c"threads".as_ptr(), count_cstr.as_ptr(), 0);
+            }
+        }
+        match config.thread_type {
+            ThreadType::Frame => unsafe {
+                (lib.av_dict_set)(&mut opts, c"thread_type".as_ptr(), c"frame".as_ptr(), 0);
+            },
+            ThreadType::Slice => unsafe {
+                (lib.av_dict_set)(&mut opts, c"thread_type".as_ptr(), c"slice".as_ptr(), 0);
+            },
+            ThreadType::Auto => {}
+        }
+        if config.skip_loop_filter {
+            unsafe {
+                (lib.av_dict_set)(
+                    &mut opts,
+                    c"skip_loop_filter".as_ptr(),
+                    c"noref".as_ptr(),
+                    0,
+                );
+            }
+        }
+
+        // SAFETY: avcodec_open2 usa o hw_device_ctx já configurado no contexto.
+        let ret = unsafe {
+            (lib.avcodec_open2)(
+                ctx,
+                codec,
+                &mut opts as *mut *mut AvDictionary as *mut *mut c_void,
+            )
+        };
+
+        if !opts.is_null() {
+            unsafe { (lib.av_dict_free)(&mut opts) };
+        }
+
+        if ret < 0 {
+            let mut p = ctx;
+            unsafe { (lib.avcodec_free_context)(&mut p as *mut *mut AvCodecContext) };
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        tracing::debug!(codec_id, "decodificador FFmpeg aberto com D3D11VA");
+        Ok(Self { ctx, lib })
+    }
+
     /// Envia um `AvPacket` para o decodificador.
     ///
     /// SPEC-AV-002b
@@ -703,6 +1034,13 @@ impl FfmpegCodecContext {
             return Err(AvError::FfmpegError { code: ret });
         }
         Ok(())
+    }
+
+    /// Ponteiro bruto para o `AVCodecContext`, para uso por funções FFI
+    /// auxiliares (ex.: `av_parser_parse2`).
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *mut AvCodecContext {
+        self.ctx
     }
 
     /// Recebe um frame decodificado do contexto.
@@ -793,6 +1131,146 @@ impl Drop for FfmpegPacket {
     }
 }
 
+// ─── RAII: FfmpegParser ───────────────────────────────────────────────────────
+
+/// Wrapper RAII para `AVCodecParserContext*`.
+///
+/// Re-empacota bytes brutos de bitstream em access units / frames completos
+/// antes de enviar ao decoder.  Necessário porque os payloads PES do TS não
+/// estão garantidamente alinhados com os limites de frame de codecs como
+/// HEVC, H.264, AC-3, E-AC-3 e MP2.
+///
+/// SPEC-AV-002b
+pub struct FfmpegParser {
+    parser: *mut AvCodecParserContext,
+    lib: Arc<FfmpegLib>,
+}
+
+// SAFETY: AVCodecParserContext é usado por uma única thread (a do decoder).
+unsafe impl Send for FfmpegParser {}
+
+impl FfmpegParser {
+    /// Inicializa um parser para `codec_id`.  Retorna `None` se o FFmpeg não
+    /// tiver parser registrado para esse codec — caller deve aceitar fallback
+    /// de envio direto do payload.
+    ///
+    /// SPEC-AV-002b
+    pub(crate) fn try_init(lib: Arc<FfmpegLib>, codec_id: u32) -> Option<Self> {
+        // SAFETY: av_parser_init recebe codec_id por valor; retorno NULL é
+        // tratado como ausência de parser.
+        let parser = unsafe { (lib.av_parser_init)(codec_id as c_int) };
+        if parser.is_null() {
+            None
+        } else {
+            Some(Self { parser, lib })
+        }
+    }
+
+    /// Alimenta `buf` no parser e devolve a lista de pacotes completos
+    /// extraídos, cada um com seu próprio payload (cópia) e PTS.
+    ///
+    /// `pts` é aplicado apenas ao primeiro pacote emitido neste lote — chamadas
+    /// subsequentes propagam o estado interno do parser para os frames seguintes.
+    ///
+    /// SPEC-AV-002b
+    pub(crate) fn parse(
+        &mut self,
+        codec_ctx: &FfmpegCodecContext,
+        buf: &[u8],
+        pts: Option<u64>,
+    ) -> Vec<(Vec<u8>, Option<u64>)> {
+        let mut out: Vec<(Vec<u8>, Option<u64>)> = Vec::new();
+        if buf.is_empty() {
+            return out;
+        }
+
+        let mut consumed: usize = 0;
+        let mut input_pts = pts.map(|v| v as i64).unwrap_or(i64::MIN);
+        let avctx = codec_ctx.as_ptr();
+
+        while consumed < buf.len() {
+            let remaining = &buf[consumed..];
+            let mut out_buf: *mut u8 = std::ptr::null_mut();
+            let mut out_size: c_int = 0;
+
+            // SAFETY: parser, avctx, out_buf/out_size pointers e remaining
+            // são todos válidos. av_parser_parse2 é robusto a entradas
+            // arbitrárias (não pode panicar) e retorna ≤ remaining.len().
+            let used = unsafe {
+                (self.lib.av_parser_parse2)(
+                    self.parser,
+                    avctx,
+                    &mut out_buf,
+                    &mut out_size,
+                    remaining.as_ptr(),
+                    remaining.len() as c_int,
+                    input_pts,
+                    i64::MIN,
+                    -1,
+                )
+            };
+
+            if used < 0 {
+                tracing::debug!(used, "av_parser_parse2 retornou erro");
+                break;
+            }
+            let used_usize = used as usize;
+            consumed += used_usize;
+
+            // PTS só se aplica ao primeiro byte de input; iterações subsequentes
+            // dentro do mesmo PES devem passar AV_NOPTS_VALUE.
+            input_pts = i64::MIN;
+
+            if out_size > 0 && !out_buf.is_null() {
+                // SAFETY: out_buf é um buffer interno do parser válido até a
+                // próxima chamada de av_parser_parse2; copiamos imediatamente.
+                let slice = unsafe { std::slice::from_raw_parts(out_buf, out_size as usize) };
+                out.push((slice.to_vec(), pts_for_output(self.parser)));
+            }
+
+            if used == 0 && out_size == 0 {
+                // Parser não progrediu — evita loop infinito.
+                break;
+            }
+        }
+
+        out
+    }
+}
+
+/// Lê o PTS do output mais recente do parser (offset 48 em
+/// `AVCodecParserContext` x86-64, FFmpeg 7.x/8.x).
+///
+/// Layout relevante:
+///   priv_data (8) + parser_ptr (8) + frame_offset (8) + cur_offset (8)
+///   + next_frame_offset (8) = 40; pict_type (4) + repeat_pict (4) = 48; pts i64 = 48.
+///
+/// Retorna `None` para `AV_NOPTS_VALUE` (i64::MIN).
+///
+/// SAFETY: caller deve garantir que `parser` é um `AVCodecParserContext*` válido.
+#[inline]
+fn pts_for_output(parser: *mut AvCodecParserContext) -> Option<u64> {
+    if parser.is_null() {
+        return None;
+    }
+    // SAFETY: offset 48 corresponde a `pts: int64_t` no layout x86-64.
+    let raw = unsafe { *((parser as *const u8).add(48) as *const i64) };
+    if raw == i64::MIN {
+        None
+    } else {
+        Some(raw as u64)
+    }
+}
+
+impl Drop for FfmpegParser {
+    fn drop(&mut self) {
+        // SAFETY: parser foi alocado por av_parser_init; é o único dono.
+        if !self.parser.is_null() {
+            unsafe { (self.lib.av_parser_close)(self.parser) };
+        }
+    }
+}
+
 // ─── RAII: FfmpegFrame ────────────────────────────────────────────────────────
 
 /// Wrapper RAII para `AVFrame*`.
@@ -830,7 +1308,12 @@ impl FfmpegFrame {
 
     /// Extrai os planos YUV de um frame de vídeo decodificado.
     ///
-    /// Suporta `YUV420P` (8-bit, `fmt == 0`) e `YUV420P10LE` (10-bit, `fmt == 63`).
+    /// Suporta:
+    /// - `YUV420P` (`fmt == 0`) — 4:2:0 8-bit
+    /// - `YUV420P10LE` (`fmt == 62`) — 4:2:0 10-bit little-endian
+    /// - `YUV422P` (`fmt == 4`) — 4:2:2 8-bit (chroma subsamplada verticalmente
+    ///   para encaixar no layout 4:2:0 do renderer)
+    /// - `YUV422P10LE` (`fmt == 64`) — 4:2:2 10-bit (idem)
     ///
     /// Retorna `(width, height, pts, [y_plane, u_plane, v_plane], (sar_num, sar_den),
     ///           raw_colorspace, raw_color_range, ten_bit)`.
@@ -862,8 +1345,13 @@ impl FfmpegFrame {
             return Err(AvError::FfmpegError { code: -22 }); // EINVAL
         }
 
-        let ten_bit = fmt == AV_PIX_FMT_YUV420P10LE;
-        if fmt != AV_PIX_FMT_YUV420P && fmt != AV_PIX_FMT_YUV420P10LE {
+        let ten_bit = fmt == AV_PIX_FMT_YUV420P10LE || fmt == AV_PIX_FMT_YUV422P10LE;
+        let is_422 = fmt == AV_PIX_FMT_YUV422P || fmt == AV_PIX_FMT_YUV422P10LE;
+        if fmt != AV_PIX_FMT_YUV420P
+            && fmt != AV_PIX_FMT_YUV420P10LE
+            && fmt != AV_PIX_FMT_YUV422P
+            && fmt != AV_PIX_FMT_YUV422P10LE
+        {
             tracing::warn!(fmt, "to_yuv_planes: formato de pixel inesperado");
             return Err(AvError::FfmpegError { code: -22 });
         }
@@ -873,6 +1361,10 @@ impl FfmpegFrame {
         let h = height as usize;
         let w_uv = w / 2;
         let h_uv = h / 2;
+        // Em 4:2:2, planos U/V têm altura igual a `h`; subsamplamos verticalmente
+        // pulando uma linha sim, uma não (`chroma_row_stride = 2`) para encaixar
+        // no layout 4:2:0 esperado pelo renderer. Em 4:2:0 a leitura é sequencial.
+        let chroma_row_stride = if is_422 { 2 } else { 1 };
 
         // ── Plano Y ──────────────────────────────────────────────────────────
         let ls_y = unsafe { frame_linesize(self.frame, 0) } as usize;
@@ -892,8 +1384,9 @@ impl FfmpegFrame {
         let mut u_plane = vec![0u8; row_uv * h_uv];
         for row in 0..h_uv {
             // SAFETY: frame->data[1] aponta para plano U válido após receive_frame.
+            // Em 4:2:2, `chroma_row_stride == 2` salta uma linha (subsampling vertical).
             unsafe {
-                let src = frame_data_ptr(self.frame, 1).add(row * ls_u);
+                let src = frame_data_ptr(self.frame, 1).add(row * chroma_row_stride * ls_u);
                 std::ptr::copy_nonoverlapping(src, u_plane[row * row_uv..].as_mut_ptr(), row_uv);
             }
         }
@@ -903,8 +1396,9 @@ impl FfmpegFrame {
         let mut v_plane = vec![0u8; row_uv * h_uv];
         for row in 0..h_uv {
             // SAFETY: frame->data[2] aponta para plano V válido após receive_frame.
+            // Em 4:2:2, `chroma_row_stride == 2` salta uma linha (subsampling vertical).
             unsafe {
-                let src = frame_data_ptr(self.frame, 2).add(row * ls_v);
+                let src = frame_data_ptr(self.frame, 2).add(row * chroma_row_stride * ls_v);
                 std::ptr::copy_nonoverlapping(src, v_plane[row * row_uv..].as_mut_ptr(), row_uv);
             }
         }
@@ -1144,6 +1638,113 @@ impl FfmpegFrame {
     pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.frame
     }
+
+    /// Retorna `true` se o frame contém uma surface de hardware D3D11VA
+    /// (`format == AV_PIX_FMT_D3D11`).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[inline]
+    pub(crate) fn is_hw(&self) -> bool {
+        // SAFETY: frame é não-nulo; frame_format lê offset 116 (int).
+        unsafe { frame_format(self.frame) == AV_PIX_FMT_D3D11 }
+    }
+
+    /// Extrai o ponteiro bruto `ID3D11Texture2D*` e metadados de um frame HW
+    /// **sem** chamar `av_hwframe_transfer_data` — zero cópia CPU.
+    ///
+    /// No D3D11VA o AVFrame armazena:
+    /// - `data[0]` → `ID3D11Texture2D*` (textura array, COM não AddRef'd)
+    /// - `data[1]` → índice de slice do array (cast de inteiro para ponteiro)
+    ///
+    /// O chamador é responsável por chamar `AddRef` na textura se precisar
+    /// armazená-la além do tempo de vida do `FfmpegFrame`.
+    ///
+    /// Retorna `Err` se o frame não for HW (`!is_hw()`).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn hw_frame_info(
+        &self,
+    ) -> Result<(*mut c_void, u32, u32, u32, i64, (u32, u32), i32, i32, i32), crate::error::AvError>
+    {
+        if !self.is_hw() {
+            return Err(crate::error::AvError::FfmpegError { code: -22 });
+        }
+        // SAFETY: frame HW D3D11VA válido; data[0]/[1] preenchidos pelo decoder.
+        unsafe {
+            let tex_ptr = frame_data_ptr(self.frame, 0) as *mut c_void;
+            // data[1] é o índice do array armazenado como ponteiro (cast de usize).
+            let slice = frame_data_ptr(self.frame, 1) as usize as u32;
+            let width = frame_width(self.frame) as u32;
+            let height = frame_height(self.frame) as u32;
+            let pts = frame_pts(self.frame);
+            let raw_sar = frame_sar(self.frame);
+            let sar = if raw_sar.0 > 0 && raw_sar.1 > 0 {
+                (raw_sar.0 as u32, raw_sar.1 as u32)
+            } else {
+                (1u32, 1u32)
+            };
+            let color_trc = frame_color_trc(self.frame);
+            let colorspace = frame_colorspace(self.frame);
+            let color_range = frame_color_range(self.frame);
+            Ok((
+                tex_ptr,
+                slice,
+                width,
+                height,
+                pts,
+                sar,
+                color_trc,
+                colorspace,
+                color_range,
+            ))
+        }
+    }
+
+    /// Baixa um frame HW (D3D11VA, `AV_PIX_FMT_D3D11`) para CPU via
+    /// `av_hwframe_transfer_data` e extrai os planos YUV.
+    ///
+    /// Suporta formatos de saída `AV_PIX_FMT_NV12` (semi-planar, nativo D3D11VA)
+    /// e `AV_PIX_FMT_YUV420P` (planar, caso o driver suporte).
+    /// Para NV12, o plano UV interleaved é desinterlaceado em U/V separados.
+    ///
+    /// Retorna os mesmos campos que `to_yuv_planes()`, com `ten_bit = false`
+    /// (D3D11VA 8-bit não usa o caminho 10-bit via este método).
+    ///
+    /// SPEC-AV-HW-DEC-001
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn download_to_yuv_planes(
+        &self,
+    ) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {
+        // Aloca frame SW destino — av_hwframe_transfer_data aloca os buffers de
+        // dados automaticamente (não precisamos chamar av_frame_get_buffer).
+        // SAFETY: av_frame_alloc aloca com av_malloc e zera o struct.
+        let sw_frame = unsafe { (self.lib.av_frame_alloc)() };
+        if sw_frame.is_null() {
+            return Err(AvError::FfmpegError { code: -12 });
+        }
+
+        // Copia dados da surface D3D11 para memória do host.
+        // O formato do sw_frame é determinado pelo sw_format configurado no
+        // AVHWFramesContext interno do FFmpeg (normalmente NV12 para H.264/HEVC).
+        // SAFETY: self.frame é um frame HW válido retornado por avcodec_receive_frame.
+        let ret = unsafe { (self.lib.av_hwframe_transfer_data)(sw_frame, self.frame, 0) };
+        if ret < 0 {
+            let mut p = sw_frame;
+            unsafe { (self.lib.av_frame_free)(&mut p) };
+            return Err(AvError::FfmpegError { code: ret });
+        }
+
+        // Extrai planos YUV do frame SW (NV12 ou YUV420P).
+        // SAFETY: av_hwframe_transfer_data preencheu sw_frame com dados válidos.
+        let result = unsafe { extract_sw_yuv_planes(sw_frame, self.frame) };
+
+        // Libera o sw_frame (dados já copiados para Vec<u8>).
+        let mut p = sw_frame;
+        unsafe { (self.lib.av_frame_free)(&mut p) };
+
+        result
+    }
 }
 
 impl Drop for FfmpegFrame {
@@ -1151,6 +1752,154 @@ impl Drop for FfmpegFrame {
         // SAFETY: frame foi alocado por av_frame_alloc; é o único dono.
         unsafe { (self.lib.av_frame_free)(&mut self.frame) };
     }
+}
+
+// ─── Extração de planos YUV de frames SW ──────────────────────────────────────
+
+/// Extrai planos YUV de um `AVFrame*` SW (YUV420P ou NV12).
+///
+/// Para `AV_PIX_FMT_NV12`: desinterlaça o plano UV (UVUVUV…) em U e V separados.
+/// Para `AV_PIX_FMT_YUV420P`: copia diretamente os três planos planares.
+///
+/// SAFETY: `frame` deve ser um `AVFrame*` SW válido com buffers preenchidos.
+#[allow(clippy::type_complexity)]
+#[allow(dead_code)]
+unsafe fn extract_sw_yuv_planes(
+    frame: *mut c_void,
+    props_frame: *mut c_void,
+) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {
+    let fmt = frame_format(frame);
+    let width = {
+        let transferred = frame_width(frame);
+        if transferred > 0 {
+            transferred
+        } else {
+            frame_width(props_frame)
+        }
+    };
+    let height = {
+        let transferred = frame_height(frame);
+        if transferred > 0 {
+            transferred
+        } else {
+            frame_height(props_frame)
+        }
+    };
+    let pts = frame_pts(props_frame);
+    let raw_sar = frame_sar(props_frame);
+    let raw_colorspace = frame_colorspace(props_frame);
+    let raw_color_range = frame_color_range(props_frame);
+
+    if width <= 0 || height <= 0 {
+        return Err(AvError::FfmpegError { code: -22 }); // EINVAL
+    }
+
+    let w = width as usize;
+    let h = height as usize;
+    let sar = if raw_sar.0 > 0 && raw_sar.1 > 0 {
+        (raw_sar.0 as u32, raw_sar.1 as u32)
+    } else {
+        (1u32, 1u32)
+    };
+
+    let (planes, ten_bit) = if fmt == AV_PIX_FMT_YUV420P {
+        (extract_yuv420p_planes(frame, w, h, 1)?, false)
+    } else if fmt == AV_PIX_FMT_YUV420P10LE {
+        (extract_yuv420p_planes(frame, w, h, 2)?, true)
+    } else if fmt == AV_PIX_FMT_NV12 {
+        (extract_nv12_planes(frame, w, h)?, false)
+    } else {
+        tracing::warn!(fmt, "download_to_yuv_planes: formato SW inesperado");
+        return Err(AvError::FfmpegError { code: -22 });
+    };
+
+    Ok((
+        width as u32,
+        height as u32,
+        pts,
+        planes,
+        sar,
+        raw_colorspace,
+        raw_color_range,
+        ten_bit,
+    ))
+}
+
+/// Extrai planos YUV420P planares de um `AVFrame*`.
+///
+/// SAFETY: `frame` deve ser um AVFrame* com dados YUV420P válidos.
+#[allow(dead_code)]
+unsafe fn extract_yuv420p_planes(
+    frame: *mut c_void,
+    w: usize,
+    h: usize,
+    bytes_per_sample: usize,
+) -> Result<[Vec<u8>; 3], AvError> {
+    let w_uv = w / 2;
+    let h_uv = h / 2;
+    let ls_y = frame_linesize(frame, 0) as usize;
+    let ls_u = frame_linesize(frame, 1) as usize;
+    let ls_v = frame_linesize(frame, 2) as usize;
+
+    let row_y = w * bytes_per_sample;
+    let row_uv = w_uv * bytes_per_sample;
+    let mut y = vec![0u8; row_y * h];
+    let mut u = vec![0u8; row_uv * h_uv];
+    let mut v = vec![0u8; row_uv * h_uv];
+
+    for row in 0..h {
+        let src = frame_data_ptr(frame, 0).add(row * ls_y);
+        std::ptr::copy_nonoverlapping(src, y[row * row_y..].as_mut_ptr(), row_y);
+    }
+    for row in 0..h_uv {
+        let src_u = frame_data_ptr(frame, 1).add(row * ls_u);
+        let src_v = frame_data_ptr(frame, 2).add(row * ls_v);
+        std::ptr::copy_nonoverlapping(src_u, u[row * row_uv..].as_mut_ptr(), row_uv);
+        std::ptr::copy_nonoverlapping(src_v, v[row * row_uv..].as_mut_ptr(), row_uv);
+    }
+
+    Ok([y, u, v])
+}
+
+/// Extrai e desinterlaça planos NV12 (semi-planar UV) de um `AVFrame*`.
+///
+/// NV12: data[0] = Y planar, data[1] = UV interleaved (UVUV…).
+/// Converte para YUV420P planar separando U e V.
+///
+/// SAFETY: `frame` deve ser um AVFrame* com dados NV12 válidos.
+#[allow(dead_code)]
+unsafe fn extract_nv12_planes(
+    frame: *mut c_void,
+    w: usize,
+    h: usize,
+) -> Result<[Vec<u8>; 3], AvError> {
+    let w_uv = w / 2;
+    let h_uv = h / 2;
+    let ls_y = frame_linesize(frame, 0) as usize;
+    let ls_uv = frame_linesize(frame, 1) as usize;
+
+    let mut y = vec![0u8; w * h];
+    let mut u = vec![0u8; w_uv * h_uv];
+    let mut v = vec![0u8; w_uv * h_uv];
+
+    // Plano Y (igual a YUV420P)
+    for row in 0..h {
+        let src = frame_data_ptr(frame, 0).add(row * ls_y);
+        std::ptr::copy_nonoverlapping(src, y[row * w..].as_mut_ptr(), w);
+    }
+
+    // Desinterlaça UV: cada linha de UV tem w/2 pares UVUV…
+    for row in 0..h_uv {
+        let src_uv = frame_data_ptr(frame, 1).add(row * ls_uv);
+        let u_row = &mut u[row * w_uv..(row + 1) * w_uv];
+        let v_row = &mut v[row * w_uv..(row + 1) * w_uv];
+        for col in 0..w_uv {
+            u_row[col] = *src_uv.add(col * 2);
+            v_row[col] = *src_uv.add(col * 2 + 1);
+        }
+    }
+
+    Ok([y, u, v])
 }
 
 // ─── Utilitários de busca e carregamento ──────────────────────────────────────
@@ -1161,6 +1910,10 @@ impl Drop for FfmpegFrame {
 /// 1. Variável de ambiente `FFMPEG_DLL_DIR`
 /// 2. `{exe_dir}/ffmpeg/`
 /// 3. `{exe_dir}/`
+/// 4. `{cwd}/ffmpeg/` e `{cwd}/` (útil em `cargo run` a partir da raiz do
+///    workspace, onde o DLL bundle vive em `ffmpeg/` ao lado de `Cargo.toml`)
+/// 5. Ancestrais de `exe_dir` contendo subpasta `ffmpeg/` com `DLL_AVCODEC`
+///    (cobre `target/debug` → workspace root)
 ///
 /// SPEC-AV-002b
 pub fn find_ffmpeg_dll_dir() -> Option<std::path::PathBuf> {
@@ -1183,6 +1936,27 @@ pub fn find_ffmpeg_dll_dir() -> Option<std::path::PathBuf> {
             if exe_dir.join(DLL_AVCODEC).exists() {
                 return Some(exe_dir.to_path_buf());
             }
+
+            // 5. Ancestrais do exe_dir (cobre target/debug/<bin>.exe →
+            // <workspace>/ffmpeg/).  Limite de 5 níveis para evitar varredura
+            // patológica em layouts inesperados.
+            for ancestor in exe_dir.ancestors().take(5) {
+                let sub = ancestor.join("ffmpeg");
+                if sub.join(DLL_AVCODEC).exists() {
+                    return Some(sub);
+                }
+            }
+        }
+    }
+
+    // 4. Diretório de trabalho corrente
+    if let Ok(cwd) = std::env::current_dir() {
+        let sub = cwd.join("ffmpeg");
+        if sub.join(DLL_AVCODEC).exists() {
+            return Some(sub);
+        }
+        if cwd.join(DLL_AVCODEC).exists() {
+            return Some(cwd);
         }
     }
 

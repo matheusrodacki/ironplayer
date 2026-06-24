@@ -8,18 +8,33 @@ use std::sync::Arc;
 
 use tracing::{debug, info};
 use windows::{
-    core::Interface,
+    core::{Error as WinError, Interface},
     Win32::Graphics::{
-        Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+        Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
         Direct3D11::{
-            D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+            D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+            D3D11_BIND_FLAG, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_RESOURCE_MISC_FLAG, D3D11_SDK_VERSION,
+            D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
         },
-        Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1},
+        Dxgi::{
+            Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC},
+            CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1,
+            DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+        },
     },
 };
 
 use crate::error::AvError;
+
+fn map_d3d11_error(context: &str, error: WinError) -> AvError {
+    let code = error.code();
+    if code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET {
+        AvError::HwDeviceRemoved(format!("{context}: {error}"))
+    } else {
+        AvError::HwInitFailed(format!("{context}: {error}"))
+    }
+}
 
 // ── Tipos públicos ─────────────────────────────────────────────────────────────
 
@@ -77,6 +92,15 @@ pub struct D3d11Device {
     adapter_luid: AdapterLuid,
     adapter_desc: String,
     vendor_id: u32,
+}
+
+impl std::fmt::Debug for D3d11Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("D3d11Device")
+            .field("adapter", &self.adapter_desc)
+            .field("luid", &self.adapter_luid)
+            .finish()
+    }
 }
 
 // SAFETY: ID3D11Device com SetMultithreadProtected(true) é seguro para Send+Sync.
@@ -142,7 +166,9 @@ impl D3d11Device {
         unsafe {
             D3D11CreateDevice(
                 Some(&adapter),
-                D3D_DRIVER_TYPE_HARDWARE,
+                // Microsoft requer DRIVER_TYPE_UNKNOWN quando o adapter é
+                // passado explicitamente; HARDWARE+adapter causa E_INVALIDARG.
+                D3D_DRIVER_TYPE_UNKNOWN,
                 None, // software rasterizer module (não usado com adapter explícito)
                 flags,
                 None, // feature levels (usa default D3D11_0+)
@@ -216,6 +242,33 @@ impl D3d11Device {
     pub unsafe fn as_raw(&self) -> *mut std::ffi::c_void {
         self.device.as_raw()
     }
+
+    /// Ponteiro bruto para o `ID3D11DeviceContext` imediato.
+    ///
+    /// # Safety
+    ///
+    /// O chamador deve chamar `AddRef` se armazenar o ponteiro além do tempo de
+    /// vida deste `D3d11Device`.
+    ///
+    /// SPEC-AV-HW-001
+    pub unsafe fn as_raw_context(&self) -> *mut std::ffi::c_void {
+        self.context.as_raw()
+    }
+}
+
+/// Incrementa o refcount COM de um ponteiro `IUnknown` (usado ao injetar
+/// `ID3D11Device` / `ID3D11DeviceContext` no `AVD3D11VADeviceContext` do FFmpeg).
+///
+/// # Safety
+///
+/// `ptr` deve ser um ponteiro COM válido ou nulo (nulo é ignorado).
+pub(crate) unsafe fn com_addref(ptr: *mut std::ffi::c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    let borrowed =
+        std::mem::ManuallyDrop::new(windows::core::IUnknown::from_raw(ptr as *mut _));
+    let _ = borrowed.clone();
 }
 
 impl Drop for D3d11Device {
@@ -240,6 +293,18 @@ pub enum ColorSpace {
     Bt2020,
 }
 
+impl ColorSpace {
+    /// Converte o `colorspace` avutil (inteiro) para `ColorSpace`.
+    /// Valores: 1=BT.709, 5/6=BT.601, 9=BT.2020; padrão BT.709.
+    pub fn from_avutil(cs: i32) -> Self {
+        match cs {
+            5 | 6 => Self::Bt601,
+            9 => Self::Bt2020,
+            _ => Self::Bt709,
+        }
+    }
+}
+
 /// Função de transferência (curva eletro-óptica).
 ///
 /// SPEC-AV-HW-001
@@ -249,6 +314,18 @@ pub enum TransferFunction {
     Pq,
     Hlg,
     Srgb,
+}
+
+impl TransferFunction {
+    /// Converte `AVColorTransferCharacteristic` bruto para a TRC usada no shader.
+    pub fn from_avutil(trc: i32) -> Self {
+        match trc {
+            16 => Self::Pq,
+            18 => Self::Hlg,
+            13 => Self::Srgb,
+            _ => Self::Bt1886,
+        }
+    }
 }
 
 /// Referência a uma textura D3D11VA produzida pelo decoder FFmpeg.
@@ -279,6 +356,17 @@ pub struct D3d11Texture {
 // o acesso é serializado pelo device multithread.
 unsafe impl Send for D3d11Texture {}
 unsafe impl Sync for D3d11Texture {}
+
+impl std::fmt::Debug for D3d11Texture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("D3d11Texture")
+            .field("array_slice", &self.array_slice)
+            .field("format", &self.format)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
 
 impl D3d11Texture {
     /// Cria um `D3d11Texture` a partir de um `ID3D11Texture2D` e metadados de frame.
@@ -319,6 +407,51 @@ impl D3d11Texture {
         ))
     }
 
+    /// Cria um `D3d11Texture` a partir de um ponteiro bruto `ID3D11Texture2D*`
+    /// proveniente do AVFrame HW D3D11VA, chamando `AddRef` para garantir
+    /// que a textura permanece válida após o `FfmpegFrame::unref()`.
+    ///
+    /// # Safety
+    ///
+    /// `tex_ptr` deve ser um ponteiro válido para um `ID3D11Texture2D` vivo,
+    /// com o formato `DXGI_FORMAT_NV12` ou `DXGI_FORMAT_P010`.
+    ///
+    /// SPEC-AV-HW-TEX-001
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn from_raw_addref(
+        tex_ptr: *mut std::ffi::c_void,
+        array_slice: u32,
+        width: u32,
+        height: u32,
+        color_space: ColorSpace,
+        transfer: TransferFunction,
+        full_range: bool,
+    ) -> Result<Self, AvError> {
+        if tex_ptr.is_null() {
+            return Err(AvError::HwInitFailed(
+                "ponteiro de textura HW é nulo".into(),
+            ));
+        }
+        // ManuallyDrop evita o Release automático do temporário criado por from_raw;
+        // em seguida clone() chama AddRef e retorna nossa referência própria.
+        let texture = {
+            let borrowed =
+                std::mem::ManuallyDrop::new(ID3D11Texture2D::from_raw(tex_ptr as *mut _));
+            (*borrowed).clone()
+        };
+        let format = detect_texture_format(&texture)?;
+        Ok(Self::new(
+            texture,
+            array_slice,
+            format,
+            width,
+            height,
+            color_space,
+            transfer,
+            full_range,
+        ))
+    }
+
     /// Ponteiro bruto para o `ID3D11Texture2D` (consumido pelo FFmpeg hwaccel context).
     ///
     /// # Safety
@@ -330,7 +463,196 @@ impl D3d11Texture {
     }
 }
 
-// ── Testes ────────────────────────────────────────────────────────────────────
+fn detect_texture_format(texture: &ID3D11Texture2D) -> Result<HwPixelFormat, AvError> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut desc) };
+    if desc.Format == DXGI_FORMAT_NV12 {
+        Ok(HwPixelFormat::Nv12)
+    } else if desc.Format == DXGI_FORMAT_P010 {
+        Ok(HwPixelFormat::P010)
+    } else {
+        Err(AvError::HwInitFailed(format!(
+            "formato D3D11VA não suportado: {:?}",
+            desc.Format
+        )))
+    }
+}
+
+// ── NvPlanes + extração via staging ──────────────────────────────────────────
+
+/// Planos NV12 extraídos via textura D3D11 staging (GPU→CPU).
+///
+/// Dados compactados (sem padding de row alignment do driver).
+///
+/// SPEC-AV-HW-TEX-001
+pub struct NvPlanes {
+    /// Plano luma Y compactado (`width × height × bytes_per_sample`).
+    pub y_data: Vec<u8>,
+    /// Plano croma UV interleaved (`width × ceil(height/2) × bytes_per_sample`).
+    /// Layout: U0 V0 U1 V1 … por linha, `width/2` pares por linha.
+    pub uv_data: Vec<u8>,
+    /// Largura em pixels.
+    pub width: u32,
+    /// Altura em pixels.
+    pub height: u32,
+    /// `true` quando a textura origem é P010.
+    pub ten_bit: bool,
+}
+
+impl D3d11Device {
+    /// Extrai os planos NV12 de uma textura HW D3D11VA via textura staging.
+    ///
+    /// Fluxo GPU (sem CPU round-trip FFmpeg):
+    /// 1. Cria textura NV12 `D3D11_USAGE_STAGING` (CPU-readable).
+    /// 2. `CopySubresourceRegion` — copia Y e UV do slice do array para staging.
+    /// 3. `Map` subresource 0 (Y) e subresource 1 (UV) — lê dados do driver.
+    /// 4. Compacta em `Vec<u8>` sem padding de linha.
+    /// 5. `Unmap` ambos os subresources.
+    ///
+    /// Não chama `av_hwframe_transfer_data` em nenhum momento.
+    ///
+    /// SPEC-AV-HW-TEX-001
+    pub fn extract_nv12_planes(&self, tex: &D3d11Texture) -> Result<NvPlanes, AvError> {
+        let width = tex.width;
+        let height = tex.height;
+        if width == 0 || height == 0 {
+            return Err(AvError::HwInitFailed(
+                "extract_nv12_planes: dimensões inválidas".into(),
+            ));
+        }
+
+        // ── 1. Obtém ArraySize da textura fonte para calcular o índice UV ─────
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { tex.texture.GetDesc(&mut src_desc) };
+        let array_size = src_desc.ArraySize;
+
+        // ── 2. Cria textura staging NV12 (tamanho do frame individual) ────────
+        let is_p010 = matches!(tex.format, HwPixelFormat::P010);
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: if is_p010 {
+                DXGI_FORMAT_P010
+            } else {
+                DXGI_FORMAT_NV12
+            },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: D3D11_BIND_FLAG(0).0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: D3D11_RESOURCE_MISC_FLAG(0).0 as u32,
+        };
+        let mut staging_opt: Option<ID3D11Texture2D> = None;
+        unsafe {
+            self.device
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging_opt))
+                .map_err(|e| map_d3d11_error("CreateTexture2D staging", e))?;
+        }
+        let staging =
+            staging_opt.ok_or_else(|| AvError::HwInitFailed("staging texture nula".into()))?;
+
+        // ── 3. Copia Y e UV do array slice para o staging ──────────────────────
+        let staging_res: ID3D11Resource = staging
+            .cast()
+            .map_err(|e| AvError::HwInitFailed(format!("cast staging→Resource: {e}")))?;
+        let src_res: ID3D11Resource = tex
+            .texture
+            .cast()
+            .map_err(|e| AvError::HwInitFailed(format!("cast src→Resource: {e}")))?;
+
+        unsafe {
+            // Subresource Y do array: slice_index × MipLevels (=1) + mip_level (=0)
+            self.context.CopySubresourceRegion(
+                &staging_res,
+                0,
+                0,
+                0,
+                0,
+                &src_res,
+                tex.array_slice,
+                None,
+            );
+            // Subresource UV do array: array_size + slice_index
+            self.context.CopySubresourceRegion(
+                &staging_res,
+                1,
+                0,
+                0,
+                0,
+                &src_res,
+                array_size + tex.array_slice,
+                None,
+            );
+        }
+
+        // ── 4. Map + extração compacta ─────────────────────────────────────────
+        //
+        // NV12/P010 são uma única allocation: o plano UV segue o plano Y.
+        // Formatos planares NÃO suportam `Map` por plane-subresource (apenas
+        // `CopySubresourceRegion`/SRV aceitam plane slices). A textura staging
+        // tem ArraySize=1 e MipLevels=1, portanto o único subresource mapeável
+        // é o índice 0 — mapear o índice 1 retorna E_INVALIDARG (0x80070057).
+        //
+        // `Map(0)` expõe a surface inteira: o plano UV fica em
+        // `pData + RowPitch * Height` (layout NV12/P010 canônico).
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.context
+                .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| map_d3d11_error("Map NV12", e))?;
+        }
+
+        // Copia Y/UV compactados (sem row padding do driver).
+        let w = width as usize;
+        let h = height as usize;
+        let h_uv = h.div_ceil(2);
+        let bytes_per_sample = if is_p010 { 2 } else { 1 };
+        let row_bytes = w * bytes_per_sample;
+        let mut y_data = vec![0u8; row_bytes * h];
+        let mut uv_data = vec![0u8; row_bytes * h_uv];
+
+        let row_pitch = mapped.RowPitch as usize;
+        // Offset do plano UV dentro da surface NV12/P010 mapeada.
+        let uv_plane_offset = row_pitch * h;
+
+        unsafe {
+            let base = mapped.pData as *const u8;
+            for row in 0..h {
+                let src = base.add(row * row_pitch);
+                let dst = y_data[row * row_bytes..].as_mut_ptr();
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+            }
+
+            let uv_base = base.add(uv_plane_offset);
+            for row in 0..h_uv {
+                // Cada linha UV tem `width × bytes_per_sample` bytes compactados.
+                let src = uv_base.add(row * row_pitch);
+                let dst = uv_data[row * row_bytes..].as_mut_ptr();
+                std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+            }
+        }
+
+        // ── 5. Unmap ───────────────────────────────────────────────────────────
+        unsafe {
+            self.context.Unmap(&staging_res, 0);
+        }
+
+        Ok(NvPlanes {
+            y_data,
+            uv_data,
+            width,
+            height,
+            ten_bit: is_p010,
+        })
+    }
+}
+
+// ─── Testes ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -369,6 +691,13 @@ mod tests {
         // high_part -1 como u32 = 0xFFFFFFFF
         assert_eq!(u >> 32, 0xFFFF_FFFFu64);
         assert_eq!(u & 0xFFFF_FFFF, 0xDEAD_BEEFu64);
+    }
+
+    #[test]
+    fn spec_av_hw_001_transfer_function_from_avutil_maps_hdr_values() {
+        assert_eq!(TransferFunction::from_avutil(16), TransferFunction::Pq);
+        assert_eq!(TransferFunction::from_avutil(18), TransferFunction::Hlg);
+        assert_eq!(TransferFunction::from_avutil(1), TransferFunction::Bt1886);
     }
 
     /// Valida que D3d11Device pode ser criado em ambiente Windows com GPU real.

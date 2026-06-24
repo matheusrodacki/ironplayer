@@ -6,9 +6,9 @@ use std::collections::VecDeque;
 
 use crossbeam_channel::Sender;
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Corner, Line, Plot, PlotPoints};
 
-use crate::state::{AppState, AudioOperationalState};
+use crate::state::{AppState, AudioOperationalState, HwAccelChoice};
 use crate::AppCommand;
 
 // ---------------------------------------------------------------------------
@@ -23,6 +23,12 @@ const PCR_JITTER_THRESHOLD_US: f64 = 500.0;
 
 /// Janela do gráfico de bitrate e jitter em segundos.
 const PLOT_WINDOW_SECS: f64 = 60.0;
+
+/// Número de colunas na faixa inferior de métricas.
+const METRICS_STRIP_COLUMNS: usize = 4;
+
+const PLOT_STROKE_WIDTH_MAIN: f32 = 2.0;
+const PLOT_STROKE_WIDTH_GUIDE: f32 = 1.0;
 
 // ---------------------------------------------------------------------------
 // MetricsPanel
@@ -40,6 +46,10 @@ pub struct MetricsPanel {
     seen_jitter: usize,
     /// Número de eventos de descontinuidade PCR já absorvidos do snapshot atual.
     seen_discontinuity: usize,
+    /// Seleção corrente de hwaccel no painel "Debug A/V" (espelha o backend).
+    ///
+    /// SPEC-CFG-HW-001
+    hwaccel_choice: HwAccelChoice,
 }
 
 impl MetricsPanel {
@@ -55,6 +65,10 @@ impl MetricsPanel {
         self.error_log.clear();
         self.seen_jitter = 0;
         self.seen_discontinuity = 0;
+    }
+
+    pub(crate) fn set_hwaccel_choice(&mut self, choice: HwAccelChoice) {
+        self.hwaccel_choice = choice;
     }
 
     /// Renderiza o painel de métricas completo dentro de `ui`.
@@ -84,8 +98,102 @@ impl MetricsPanel {
         self.show_pipeline_panel(ui, state);
         ui.add_space(6.0);
 
+        // ── Debug A/V (hwaccel) ────────────────────────────────────────────
+        self.show_debug_av_panel(ui, state, cmd_tx);
+        ui.add_space(6.0);
+
         // ── Log de erros ───────────────────────────────────────────────────
         self.show_error_log(ui, cmd_tx);
+    }
+
+    /// Renderiza a faixa inferior de métricas em painéis colunares.
+    pub fn show_columnar_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        state: &AppState,
+        cmd_tx: &Sender<AppCommand>,
+    ) {
+        self.drain_errors(state);
+
+        let spacing_x = ui.spacing().item_spacing.x;
+        let column_width = ((ui.available_width()
+            - spacing_x * (METRICS_STRIP_COLUMNS.saturating_sub(1) as f32))
+            .max(0.0))
+            / METRICS_STRIP_COLUMNS as f32;
+        let column_height = ui.available_height().max(0.0);
+
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(column_width, column_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    Self::show_metric_column_frame(ui, |ui| self.show_audio_summary(ui, state));
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(column_width, column_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    Self::show_metric_column_frame(ui, |ui| {
+                        self.show_bitrate_plot(ui, state);
+                        ui.add_space(6.0);
+                        self.show_av_sync_panel(ui, state);
+                    });
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(column_width, column_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    Self::show_metric_column_frame(ui, |ui| {
+                        self.show_jitter_plot(ui, state);
+                        ui.add_space(6.0);
+                        self.show_pipeline_panel(ui, state);
+                    });
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(column_width, column_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    Self::show_metric_column_frame(ui, |ui| {
+                        self.show_debug_av_panel(ui, state, cmd_tx);
+                        ui.add_space(6.0);
+                        self.show_error_log(ui, cmd_tx);
+                    });
+                },
+            );
+        });
+    }
+
+    fn show_metric_column_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+        let max_height = ui.available_height().max(0.0);
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(8.0))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(ui.next_auto_id())
+                    .max_height(max_height)
+                    .show(ui, |ui| add_contents(ui));
+            });
+    }
+
+    fn monitor_plot(id: &'static str) -> Plot<'static> {
+        Plot::new(id)
+            .allow_scroll(false)
+            .allow_zoom(false)
+            .allow_drag(false)
+            .allow_boxed_zoom(false)
+            .allow_double_click_reset(false)
+            .show_axes([false, false])
+            .show_grid([true, true])
+            .sharp_grid_lines(false)
+            .clamp_grid(true)
+            .show_background(true)
+            .legend(egui_plot::Legend::default().position(Corner::LeftTop))
     }
 
     // -----------------------------------------------------------------------
@@ -145,6 +253,85 @@ impl MetricsPanel {
                     ui.end_row();
                 }
             });
+    }
+
+    // -----------------------------------------------------------------------
+    // Painel Debug A/V — SPEC-METRICS-HW-001 · SPEC-CFG-HW-001
+    // -----------------------------------------------------------------------
+
+    /// Exibe o painel "Debug A/V": estado da aceleração de hardware do decoder
+    /// (D3D11VA), adapter GPU em uso, contadores TDR e seletor runtime de
+    /// hwaccel (Auto / D3D11VA / Off).
+    ///
+    /// O seletor envia `AppCommand::SetHwAccel` quando o usuário muda a opção;
+    /// o backend é responsável por aplicar o modo ao `FfmpegDecoder` na
+    /// próxima reabertura de stream.
+    ///
+    /// SPEC-METRICS-HW-001 · SPEC-CFG-HW-001
+    fn show_debug_av_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        state: &AppState,
+        cmd_tx: &Sender<AppCommand>,
+    ) {
+        let p = &state.metrics.pipeline;
+        ui.label("Debug A/V");
+        egui::Grid::new("debug_av_grid")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label("Hwaccel");
+                let badge = if p.hw_decode_active {
+                    format!(
+                        "GPU ({})",
+                        p.hw_decode_codec.as_deref().unwrap_or("d3d11va")
+                    )
+                } else if let Some(reason) = p.hw_decode_fallback_reason.as_deref() {
+                    format!("CPU fallback: {reason}")
+                } else {
+                    "CPU".to_string()
+                };
+                ui.label(badge);
+                ui.end_row();
+
+                ui.label("Adapter");
+                ui.label(p.gpu_adapter_name.as_deref().unwrap_or("-"));
+                ui.end_row();
+
+                ui.label("Adapter LUID");
+                if p.gpu_adapter_luid != 0 {
+                    ui.label(format!("{:#018x}", p.gpu_adapter_luid));
+                } else {
+                    ui.label("-");
+                }
+                ui.end_row();
+
+                ui.label("Pool frames");
+                ui.label(p.hw_frame_pool_in_use.to_string());
+                ui.end_row();
+
+                ui.label("TDR recoveries");
+                ui.label(p.tdr_recoveries.to_string());
+                ui.end_row();
+            });
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Modo:");
+            let mut choice = self.hwaccel_choice;
+            egui::ComboBox::from_id_salt("hwaccel_choice_combo")
+                .selected_text(choice.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut choice, HwAccelChoice::Auto, "auto");
+                    ui.selectable_value(&mut choice, HwAccelChoice::D3d11va, "d3d11va");
+                    ui.selectable_value(&mut choice, HwAccelChoice::None, "none");
+                });
+            if choice != self.hwaccel_choice {
+                self.hwaccel_choice = choice;
+                let _ = cmd_tx.try_send(AppCommand::SetHwAccel { choice });
+            }
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -322,22 +509,24 @@ impl MetricsPanel {
             }
         });
 
-        Plot::new("bitrate_plot")
+        Self::monitor_plot("bitrate_plot")
             .height(120.0)
             .include_y(0.0)
-            .x_axis_label("s")
-            .y_axis_label("kbps")
+            .include_x(-PLOT_WINDOW_SECS)
+            .include_x(0.0)
             .show(ui, |plot_ui| {
                 plot_ui.line(
                     Line::new(total_points)
                         .name("Total")
-                        .color(egui::Color32::from_rgb(100, 200, 100)),
+                        .width(PLOT_STROKE_WIDTH_MAIN)
+                        .color(egui::Color32::from_rgb(108, 214, 141)),
                 );
                 if let Some(pts) = pid_points {
                     plot_ui.line(
                         Line::new(pts)
                             .name("PID sel.")
-                            .color(egui::Color32::from_rgb(230, 160, 50)),
+                            .width(PLOT_STROKE_WIDTH_GUIDE)
+                            .color(egui::Color32::from_rgb(244, 188, 68)),
                     );
                 }
             });
@@ -400,31 +589,35 @@ impl MetricsPanel {
         let drop_line = PlotPoints::from(vec![[-PLOT_WINDOW_SECS, -100.0], [0.0, -100.0]]);
         let zero_line = PlotPoints::from(vec![[-PLOT_WINDOW_SECS, 0.0], [0.0, 0.0]]);
 
-        Plot::new("av_sync_plot")
+        Self::monitor_plot("av_sync_plot")
             .height(100.0)
             .include_y(0.0)
-            .x_axis_label("s")
-            .y_axis_label("ms")
+            .include_x(-PLOT_WINDOW_SECS)
+            .include_x(0.0)
             .show(ui, |plot_ui| {
                 plot_ui.line(
                     Line::new(zero_line)
                         .name("0 ms")
-                        .color(egui::Color32::from_rgb(120, 120, 120)),
+                        .width(PLOT_STROKE_WIDTH_GUIDE)
+                        .color(egui::Color32::from_rgb(95, 108, 122)),
                 );
                 plot_ui.line(
                     Line::new(hold_line)
                         .name("+20 ms (hold)")
-                        .color(egui::Color32::from_rgb(230, 160, 50)),
+                        .width(PLOT_STROKE_WIDTH_GUIDE)
+                        .color(egui::Color32::from_rgb(244, 188, 68)),
                 );
                 plot_ui.line(
                     Line::new(drop_line)
                         .name("-100 ms (drop)")
-                        .color(egui::Color32::from_rgb(255, 80, 80)),
+                        .width(PLOT_STROKE_WIDTH_GUIDE)
+                        .color(egui::Color32::from_rgb(255, 107, 107)),
                 );
                 plot_ui.line(
                     Line::new(sync_points)
                         .name("Offset A/V")
-                        .color(egui::Color32::from_rgb(100, 200, 255)),
+                        .width(PLOT_STROKE_WIDTH_MAIN)
+                        .color(egui::Color32::from_rgb(111, 198, 255)),
                 );
             });
     }
@@ -461,25 +654,28 @@ impl MetricsPanel {
             [0.0, -PCR_JITTER_THRESHOLD_US],
         ]);
 
-        Plot::new("jitter_plot")
+        Self::monitor_plot("jitter_plot")
             .height(100.0)
-            .x_axis_label("s")
-            .y_axis_label("µs")
+            .include_x(-PLOT_WINDOW_SECS)
+            .include_x(0.0)
             .show(ui, |plot_ui| {
                 plot_ui.line(
                     Line::new(jitter_points)
                         .name("Jitter")
-                        .color(egui::Color32::from_rgb(100, 180, 255)),
+                        .width(PLOT_STROKE_WIDTH_MAIN)
+                        .color(egui::Color32::from_rgb(111, 198, 255)),
                 );
                 plot_ui.line(
                     Line::new(threshold_pos)
                         .name("+500 µs")
-                        .color(egui::Color32::from_rgb(255, 80, 80)),
+                        .width(PLOT_STROKE_WIDTH_GUIDE)
+                        .color(egui::Color32::from_rgb(255, 107, 107)),
                 );
                 plot_ui.line(
                     Line::new(threshold_neg)
                         .name("-500 µs")
-                        .color(egui::Color32::from_rgb(255, 80, 80)),
+                        .width(PLOT_STROKE_WIDTH_GUIDE)
+                        .color(egui::Color32::from_rgb(255, 107, 107)),
                 );
             });
     }
@@ -635,5 +831,12 @@ mod tests {
         assert_eq!(history[0].1, 0);
         assert_eq!(history[1].1, -10);
         assert_eq!(history[2].1, 8);
+    }
+
+    #[test]
+    fn spec_cfg_hw_001_set_hwaccel_choice_updates_panel_state() {
+        let mut panel = MetricsPanel::new();
+        panel.set_hwaccel_choice(HwAccelChoice::D3d11va);
+        assert_eq!(panel.hwaccel_choice, HwAccelChoice::D3d11va);
     }
 }

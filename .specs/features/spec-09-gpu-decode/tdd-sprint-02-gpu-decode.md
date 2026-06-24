@@ -515,3 +515,18 @@ Critérios quantitativos, alinhados com §10 do roadmap:
 - Rec. ITU-R BT.601, BT.709, BT.2020, BT.2100
 - SMPTE ST 2084 (PQ), ARIB STD-B67 (HLG)
 - mpv source — `video/out/gpu/video_shaders.c` (referência de matriz YUV→RGB e curvas TRC)
+
+---
+
+## 16. Debug — armadilhas D3D11VA (anti-regressão)
+
+> Consolidado em [.specs/project/STATE.md](../../project/STATE.md) como **L-001**. Consultar antes de alterar o caminho HW.
+
+Resumo para implementadores:
+
+1. **NV12 `Map`**: nunca `Map(1)` em staging NV12/P010; UV via offset no buffer mapeado em subresource 0.
+2. **Pool FFmpeg**: não transportar `D3d11Texture` pelo canal com cópia tardia — slice é reutilizada após `unref`.
+3. **AudioClock**: após `AudioCommand::Reset` ou troca de trilha, a UI deve re-adotar o novo `AudioClockHandle` (id via `samples_played` Arc ptr).
+4. **Clock wall→áudio**: upgrade para `AudioClock` não pode depender de `video_clock_initialized` sozinho.
+
+Testes de sanidade: `cargo test -p av spec_av_hw` + `cargo test -p ui` + reprodução multicast com painel Sync A/V (offset abaixo de 100 ms, sem zig-zag).

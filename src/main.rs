@@ -5,7 +5,7 @@ mod table_dispatcher;
 
 use bytes::Bytes;
 use channels::BoundedSender;
-use config::AppConfig;
+use config::{AppConfig, HwAccelChoice};
 use net::{
     ReceiverConfig, RtpStripper, StopHandle as NetStopHandle, StopToken as NetStopToken, StreamUrl,
     UdpReceiver,
@@ -22,7 +22,50 @@ use ts::{
 };
 use ui::IronPlayerApp;
 
-// ── SenderGuard ───────────────────────────────────────────────────────────────
+// ── CLI parsing ───────────────────────────────────────────────────────────────
+
+/// Argumentos de linha de comando reconhecidos pelo IronPlayer.
+///
+/// Faz parsing manual para evitar dependência de `clap`.  Suporta:
+/// - `--hwaccel <auto|d3d11va|none>` (SPEC-CFG-HW-001)
+/// - `--help` / `-h`
+///
+/// Valores ausentes mantêm o `HwAccelChoice` lido do `ironstream.toml`.
+struct CliArgs {
+    hwaccel_override: Option<HwAccelChoice>,
+}
+
+impl CliArgs {
+    fn parse_from(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut hwaccel_override = None;
+        let mut iter = args.into_iter().skip(1); // pula nome do binário
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    eprintln!(
+                        "IronPlayer — uso:\n  \
+                         ironplayer [--hwaccel auto|d3d11va|none]\n"
+                    );
+                    std::process::exit(0);
+                }
+                "--hwaccel" => {
+                    let v = iter
+                        .next()
+                        .ok_or_else(|| "--hwaccel requer um valor".to_string())?;
+                    hwaccel_override = Some(HwAccelChoice::parse_cli(&v)?);
+                }
+                other if other.starts_with("--hwaccel=") => {
+                    let v = &other["--hwaccel=".len()..];
+                    hwaccel_override = Some(HwAccelChoice::parse_cli(v)?);
+                }
+                other => {
+                    return Err(format!("argumento desconhecido: '{other}' (use --help)"));
+                }
+            }
+        }
+        Ok(Self { hwaccel_override })
+    }
+}
 
 /// Mantém os senders do pipeline vivos até o shutdown limpo.
 ///
@@ -39,6 +82,11 @@ struct SenderGuard {
     section_data_tx: BoundedSender<SectionData>,
     complete_sections_tx: BoundedSender<CompleteSection>,
     ts_events_tx: BoundedSender<ts::TsEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioCommand {
+    Reset,
 }
 
 // ── PipelineGuard ─────────────────────────────────────────────────────────────
@@ -101,6 +149,7 @@ impl eframe::App for IronPlayerAppWithPipeline {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.inner.close_command_channel();
         self.guard.shutdown();
     }
 }
@@ -151,35 +200,95 @@ fn refresh_audio_status_from_output(
     }
 }
 
-fn reset_stream_routing(
-    selected_service: &Arc<std::sync::RwLock<Option<u16>>>,
-    selected_audio_pid: &Arc<std::sync::RwLock<Option<u16>>>,
-    table_cmd_tx: &crossbeam_channel::Sender<TableCommand>,
-    agg_net_tx: &crossbeam_channel::Sender<AggregatorNetEvent>,
-    demux_cmd_tx: &crossbeam_channel::Sender<DemuxCommand>,
-    pes_cmd_tx: &crossbeam_channel::Sender<PesCommand>,
-    decode_cmd_tx: &crossbeam_channel::Sender<DecodeCommand>,
-) {
-    if let Ok(mut service) = selected_service.write() {
+struct StreamResetTargets<'a> {
+    selected_service: &'a Arc<std::sync::RwLock<Option<u16>>>,
+    selected_audio_pid: &'a Arc<std::sync::RwLock<Option<u16>>>,
+    table_cmd_tx: &'a crossbeam_channel::Sender<TableCommand>,
+    agg_net_tx: &'a crossbeam_channel::Sender<AggregatorNetEvent>,
+    demux_cmd_tx: &'a crossbeam_channel::Sender<DemuxCommand>,
+    pes_cmd_tx: &'a crossbeam_channel::Sender<PesCommand>,
+    decode_cmd_tx: &'a crossbeam_channel::Sender<DecodeCommand>,
+    audio_cmd_tx: &'a crossbeam_channel::Sender<AudioCommand>,
+}
+
+fn reset_stream_routing(targets: StreamResetTargets<'_>) {
+    if let Ok(mut service) = targets.selected_service.write() {
         *service = None;
     }
-    if let Ok(mut audio_pid) = selected_audio_pid.write() {
+    if let Ok(mut audio_pid) = targets.selected_audio_pid.write() {
         *audio_pid = None;
     }
-    if table_cmd_tx.try_send(TableCommand::Reset).is_err() {
+    if targets.table_cmd_tx.try_send(TableCommand::Reset).is_err() {
         tracing::warn!("canal table-control cheio — Reset descartado");
     }
-    if agg_net_tx.try_send(AggregatorNetEvent::Reset).is_err() {
+    if targets
+        .agg_net_tx
+        .try_send(AggregatorNetEvent::Reset)
+        .is_err()
+    {
         tracing::warn!("canal metrics-control cheio — Reset descartado");
     }
-    if demux_cmd_tx.try_send(DemuxCommand::Reset).is_err() {
+    if targets.demux_cmd_tx.try_send(DemuxCommand::Reset).is_err() {
         tracing::warn!("canal demux-control cheio — Reset descartado");
     }
-    if pes_cmd_tx.try_send(PesCommand::Reset).is_err() {
+    if targets.pes_cmd_tx.try_send(PesCommand::Reset).is_err() {
         tracing::warn!("canal pes-control cheio — Reset descartado");
     }
-    if decode_cmd_tx.try_send(DecodeCommand::Reset).is_err() {
+    if targets
+        .decode_cmd_tx
+        .try_send(DecodeCommand::Reset)
+        .is_err()
+    {
         tracing::warn!("canal decode-control cheio — Reset descartado");
+    }
+    if targets.audio_cmd_tx.try_send(AudioCommand::Reset).is_err() {
+        tracing::warn!("canal audio-control cheio — Reset descartado");
+    }
+}
+
+fn bootstrap_d3d11_device(
+    hwaccel_choice: HwAccelChoice,
+    pipeline_metrics: &Arc<std::sync::RwLock<ts::metrics::PipelineMetrics>>,
+) -> Option<std::sync::Arc<av::D3d11Device>> {
+    let hwaccel_request_active = !matches!(hwaccel_choice, HwAccelChoice::None);
+
+    #[cfg(windows)]
+    {
+        if !hwaccel_request_active {
+            tracing::info!("hw: --hwaccel=none — bootstrap D3D11 ignorado; decode 100% CPU");
+            return None;
+        }
+
+        match av::D3d11Device::new() {
+            Ok(dev) => {
+                tracing::info!(
+                    adapter = dev.adapter_description(),
+                    luid = dev.adapter_luid().as_u64(),
+                    vendor_id = format!("{:#06x}", dev.vendor_id()),
+                    hwaccel_choice = hwaccel_choice.label(),
+                    "hw: D3d11Device bootstrap OK (Fase E)"
+                );
+                if let Ok(mut metrics) = pipeline_metrics.write() {
+                    av::AdapterInfo::from_device(&dev).apply_to_metrics(&mut metrics);
+                }
+                Some(dev)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    hwaccel_choice = hwaccel_choice.label(),
+                    "hw: D3d11Device bootstrap falhou — hwaccel desabilitado; usando decode CPU"
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = hwaccel_request_active;
+        let _ = pipeline_metrics;
+        None
     }
 }
 
@@ -212,8 +321,27 @@ fn main() -> eframe::Result<()> {
     }
 
     // 3. Carrega AppConfig (ironstream.toml ou defaults)
-    let cfg = AppConfig::load_or_default();
-    tracing::info!("IronPlayer iniciado");
+    let mut cfg = AppConfig::load_or_default();
+
+    // 3.1 CLI override (SPEC-CFG-HW-001) — --hwaccel sobrescreve [player].hwaccel
+    match CliArgs::parse_from(std::env::args()) {
+        Ok(cli) => {
+            if let Some(choice) = cli.hwaccel_override {
+                tracing::info!(
+                    cli = choice.label(),
+                    cfg = cfg.player.hwaccel.label(),
+                    "CLI: --hwaccel sobrescreve [player].hwaccel"
+                );
+                cfg.player.hwaccel = choice;
+            }
+        }
+        Err(e) => {
+            eprintln!("[IronPlayer] {e}");
+            std::process::exit(2);
+        }
+    }
+
+    tracing::info!(hwaccel = cfg.player.hwaccel.label(), "IronPlayer iniciado");
 
     // 4. Cria todos os canais bounded do pipeline
     let ch = channels::AppChannels::create();
@@ -224,6 +352,7 @@ fn main() -> eframe::Result<()> {
     let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded::<DemuxCommand>(64);
     let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded::<PesCommand>(64);
     let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded::<DecodeCommand>(16);
+    let (audio_cmd_tx, audio_cmd_rx) = crossbeam_channel::bounded::<AudioCommand>(16);
 
     // 6. Token de parada do MetricsAggregator
     let (metrics_stop_token, metrics_stop_handle): (MetricsStopToken, MetricsStopHandle) =
@@ -460,12 +589,14 @@ fn main() -> eframe::Result<()> {
             ts::metrics::PipelineMetrics::default(),
         ));
     let pipeline_metrics_ui = std::sync::Arc::clone(&pipeline_metrics_shared);
+    let d3d11_device_arc = bootstrap_d3d11_device(cfg.player.hwaccel, &pipeline_metrics_shared);
 
     {
         let pes_packets_rx = ch.pes_packets_rx;
         let video_frames_tx = ch.video_frames_tx;
         let video_frames_rx_for_drop = ch.video_frames_rx.clone();
         let audio_frames_tx = ch.audio_frames_tx;
+        let audio_frames_rx_for_drop = ch.audio_frames_rx.clone();
         let audio_status = audio_status.clone();
         // Constrói CodecConfig a partir do DecoderConfig lido do ironstream.toml.
         //
@@ -503,6 +634,8 @@ fn main() -> eframe::Result<()> {
             },
         };
         let pipeline_metrics_decode = std::sync::Arc::clone(&pipeline_metrics_shared);
+        let d3d11_device_for_decode = d3d11_device_arc.clone();
+        let initial_hwaccel_choice = cfg.player.hwaccel;
         handles.push(
             std::thread::Builder::new()
                 .name("av-decode".into())
@@ -519,6 +652,18 @@ fn main() -> eframe::Result<()> {
                             return;
                         }
                     };
+
+                    match (initial_hwaccel_choice, d3d11_device_for_decode.as_ref()) {
+                        (config::HwAccelChoice::None, _) => {
+                            let _ = decoder.enable_hwaccel(av::HwAccelMode::Off);
+                        }
+                        (config::HwAccelChoice::Auto | config::HwAccelChoice::D3d11va, Some(dev)) => {
+                            let _ = decoder.enable_hwaccel(av::HwAccelMode::D3d11Va(Arc::clone(dev)));
+                        }
+                        (config::HwAccelChoice::Auto | config::HwAccelChoice::D3d11va, None) => {
+                            decoder.fallback_to_sw("D3D11 indisponível no bootstrap");
+                        }
+                    }
 
                     tracing::info!("av-decode: iniciado");
 
@@ -546,6 +691,45 @@ fn main() -> eframe::Result<()> {
                                         "av-decode: contextos resetados (troca de serviço)"
                                     );
                                 }
+                                DecodeCommand::SetHwAccel { choice } => {
+                                    match choice {
+                                        config::HwAccelChoice::None => {
+                                            let _ = decoder.enable_hwaccel(av::HwAccelMode::Off);
+                                            decoder.reset_with_hw_state();
+                                            decode_times.clear();
+                                            tracing::info!(
+                                                hwaccel = choice.label(),
+                                                "av-decode: hwaccel desativado em runtime"
+                                            );
+                                        }
+                                        config::HwAccelChoice::Auto
+                                        | config::HwAccelChoice::D3d11va => {
+                                            if let Some(dev) = d3d11_device_for_decode.as_ref() {
+                                                let _ = decoder.enable_hwaccel(av::HwAccelMode::D3d11Va(Arc::clone(dev)));
+                                                decoder.reset_with_hw_state();
+                                                decode_times.clear();
+                                                tracing::info!(
+                                                    hwaccel = choice.label(),
+                                                    "av-decode: hwaccel ativado em runtime"
+                                                );
+                                            } else {
+                                                decoder.fallback_to_sw("D3D11 indisponível para runtime toggle");
+                                                tracing::warn!(
+                                                    hwaccel = choice.label(),
+                                                    "av-decode: runtime toggle para hwaccel ignorado por falta de D3D11"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                DecodeCommand::HandleDeviceRemoved => {
+                                    decoder.fallback_to_sw("DXGI_ERROR_DEVICE_REMOVED");
+                                    decoder.reset();
+                                    decode_times.clear();
+                                    tracing::warn!(
+                                        "av-decode: device removed reportado pela UI; decoder rebaixado para SW"
+                                    );
+                                }
                             }
                         }
 
@@ -570,6 +754,10 @@ fn main() -> eframe::Result<()> {
                                     if let Ok(mut m) = pipeline_metrics_decode.write() {
                                         m.decoder_threads_used = decoder.threads_used();
                                         m.deinterlacer_active = decoder.has_deinterlacer_active();
+                                        m.hw_decode_active = decoder.is_hwaccel_active();
+                                        m.hw_decode_codec = decoder.hw_decode_codec().map(str::to_owned);
+                                        m.hw_decode_fallback_reason = decoder.fallback_reason().map(str::to_owned);
+                                        m.hw_frame_pool_in_use = decoder.hw_frame_pool_in_use();
                                         m.decode_time_ms_p50.clear();
                                         m.decode_time_ms_p99.clear();
                                         for (&vpid, times) in &decode_times {
@@ -603,7 +791,10 @@ fn main() -> eframe::Result<()> {
                                                     );
                                                 }
                                                 av::DecodedFrame::Audio(af) => {
-                                                    audio_frames_tx.try_send(af);
+                                                    audio_frames_tx.try_send_latest(
+                                                        &audio_frames_rx_for_drop,
+                                                        af,
+                                                    );
                                                 }
                                             }
                                         }
@@ -668,14 +859,33 @@ fn main() -> eframe::Result<()> {
         let initial_volume = cfg.player.volume;
         let audio_status = audio_status.clone();
         let audio_clock_tx = audio_clock_for_audio_out;
+        let selected_audio_pid_rx = selected_audio_pid.clone();
         handles.push(
             std::thread::Builder::new()
                 .name("audio-out".into())
                 .spawn(move || {
                     let mut audio_out: Option<av::AudioOutput> = None;
+                    let mut active_audio_pid: Option<u16> = None;
+                    let mut clock_published = false;
                     let mut rebuild_failures = 0u64;
 
                     loop {
+                        while let Ok(command) = audio_cmd_rx.try_recv() {
+                            match command {
+                                AudioCommand::Reset => {
+                                    audio_out = None;
+                                    active_audio_pid = None;
+                                    clock_published = false;
+                                    rebuild_failures = 0;
+                                    while audio_frames_rx.try_recv().is_ok() {}
+                                    if let Ok(mut guard) = audio_clock_tx.write() {
+                                        *guard = None;
+                                    }
+                                    tracing::info!("audio-out: estado resetado e fila drenada");
+                                }
+                            }
+                        }
+
                         if let Some(out) = audio_out.as_mut() {
                             if out.needs_rebuild() {
                                 if let Ok(mut status) = audio_status.write() {
@@ -718,13 +928,39 @@ fn main() -> eframe::Result<()> {
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         };
 
+                        let selected_audio_pid = selected_audio_pid_rx
+                            .read()
+                            .map(|g| *g)
+                            .unwrap_or(None);
+                        if selected_audio_pid.is_some_and(|pid| pid != frame.pid) {
+                            tracing::debug!(
+                                frame_pid = frame.pid,
+                                selected_pid = ?selected_audio_pid,
+                                "audio-out: frame de áudio obsoleto descartado"
+                            );
+                            continue;
+                        }
+
                         // Lazy-init: cria AudioOutput na primeira frame (ou quando
                         // sample_rate/channels mudam, reiniciando o stream).
+                        let pid_changed = active_audio_pid.is_some_and(|pid| pid != frame.pid);
                         let needs_reinit = audio_out.as_ref().is_none_or(|out| {
                             out.sample_rate != frame.sample_rate || out.channels != frame.channels
-                        });
+                        }) || pid_changed;
 
                         if needs_reinit {
+                            if pid_changed {
+                                audio_out = None;
+                                clock_published = false;
+                                if let Ok(mut guard) = audio_clock_tx.write() {
+                                    *guard = None;
+                                }
+                                tracing::info!(
+                                    old_pid = ?active_audio_pid,
+                                    new_pid = frame.pid,
+                                    "audio-out: trilha de áudio mudou; recriando saída e clock"
+                                );
+                            }
                             match av::AudioOutput::new(
                                 frame.sample_rate,
                                 frame.channels,
@@ -745,18 +981,7 @@ fn main() -> eframe::Result<()> {
                                         channels = frame.channels,
                                         "audio-out: AudioOutput inicializado"
                                     );
-                                    // Publica o AudioClockHandle para a UI usar como
-                                    // clock master do vídeo (A/V sync via AudioClock).
-                                    // anchor_pts = PTS do primeiro frame de áudio, que
-                                    // corresponde a samples_played = 0.
-                                    let anchor = frame.pts.map(|p| p as i64).unwrap_or(0);
-                                    if let Ok(mut guard) = audio_clock_tx.write() {
-                                        *guard = Some(out.clock_handle(anchor));
-                                        tracing::debug!(
-                                            anchor_pts = anchor,
-                                            "audio-out: AudioClockHandle publicado"
-                                        );
-                                    }
+                                    active_audio_pid = Some(frame.pid);
                                     audio_out = Some(out);
                                 }
                                 Err(e) => {
@@ -779,6 +1004,23 @@ fn main() -> eframe::Result<()> {
                         if let Some(ref out) = audio_out {
                             out.push_samples(&frame);
                             refresh_audio_status_from_output(&audio_status, out);
+
+                            // Publica o AudioClockHandle somente quando o primeiro frame
+                            // tiver PTS válido — AC-3 pode emitir frames iniciais sem PTS
+                            // do decoder, mas com PTS no PES (via resolve_audio_pts).
+                            if !clock_published {
+                                if let Some(pts) = frame.pts {
+                                    let anchor = pts as i64;
+                                    if let Ok(mut guard) = audio_clock_tx.write() {
+                                        *guard = Some(out.clock_handle(anchor));
+                                        clock_published = true;
+                                        tracing::debug!(
+                                            anchor_pts = anchor,
+                                            "audio-out: AudioClockHandle publicado"
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -824,7 +1066,7 @@ fn main() -> eframe::Result<()> {
             timeout_ms: cfg.network.timeout_ms,
         };
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("cmd-handler".into())
             .spawn(move || {
                 for cmd in cmd_rx.iter() {
@@ -834,15 +1076,16 @@ fn main() -> eframe::Result<()> {
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
                                 h.stop();
                             }
-                            reset_stream_routing(
-                                &selected_service,
-                                &selected_audio_pid,
-                                &table_cmd_tx,
-                                &agg_net_tx,
-                                &demux_cmd_tx,
-                                &pes_cmd_tx,
-                                &decode_cmd_tx,
-                            );
+                            reset_stream_routing(StreamResetTargets {
+                                selected_service: &selected_service,
+                                selected_audio_pid: &selected_audio_pid,
+                                table_cmd_tx: &table_cmd_tx,
+                                agg_net_tx: &agg_net_tx,
+                                demux_cmd_tx: &demux_cmd_tx,
+                                pes_cmd_tx: &pes_cmd_tx,
+                                decode_cmd_tx: &decode_cmd_tx,
+                                audio_cmd_tx: &audio_cmd_tx,
+                            });
 
                             match StreamUrl::parse(&url) {
                                 Err(e) => {
@@ -917,15 +1160,16 @@ fn main() -> eframe::Result<()> {
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
                                 h.stop();
                             }
-                            reset_stream_routing(
-                                &selected_service,
-                                &selected_audio_pid,
-                                &table_cmd_tx,
-                                &agg_net_tx,
-                                &demux_cmd_tx,
-                                &pes_cmd_tx,
-                                &decode_cmd_tx,
-                            );
+                            reset_stream_routing(StreamResetTargets {
+                                selected_service: &selected_service,
+                                selected_audio_pid: &selected_audio_pid,
+                                table_cmd_tx: &table_cmd_tx,
+                                agg_net_tx: &agg_net_tx,
+                                demux_cmd_tx: &demux_cmd_tx,
+                                pes_cmd_tx: &pes_cmd_tx,
+                                decode_cmd_tx: &decode_cmd_tx,
+                                audio_cmd_tx: &audio_cmd_tx,
+                            });
                             if let Ok(mut status) = audio_status.write() {
                                 status.reset_stream_runtime(ui::AudioOperationalState::Idle);
                             }
@@ -943,6 +1187,9 @@ fn main() -> eframe::Result<()> {
                             if let Ok(mut audio_pid) = selected_audio_pid.write() {
                                 *audio_pid = None;
                             }
+                            if audio_cmd_tx.try_send(AudioCommand::Reset).is_err() {
+                                tracing::warn!("canal audio-control cheio — Reset descartado");
+                            }
                             *selected_service.write().unwrap() = Some(service_id);
                             tracing::info!(service_id, "serviço selecionado pelo usuário");
                         }
@@ -956,46 +1203,49 @@ fn main() -> eframe::Result<()> {
                             }
                             *selected_service.write().unwrap() = Some(service_id);
                             *selected_audio_pid.write().unwrap() = Some(pid);
+                            if audio_cmd_tx.try_send(AudioCommand::Reset).is_err() {
+                                tracing::warn!("canal audio-control cheio — Reset descartado");
+                            }
                             tracing::info!(service_id, pid, "trilha de áudio selecionada pelo usuário");
+                        }
+                        ui::AppCommand::SetHwAccel { choice } => {
+                            let cfg_choice: config::HwAccelChoice = choice.into();
+                            if decode_cmd_tx
+                                .try_send(DecodeCommand::SetHwAccel { choice: cfg_choice })
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    hwaccel = cfg_choice.label(),
+                                    "cmd-handler: canal decode_cmd cheio; SetHwAccel descartado"
+                                );
+                            } else {
+                                tracing::info!(
+                                    hwaccel = cfg_choice.label(),
+                                    "cmd-handler: SetHwAccel enviado ao decoder"
+                                );
+                            }
+                        }
+                        ui::AppCommand::GpuDeviceRemoved => {
+                            if decode_cmd_tx
+                                .try_send(DecodeCommand::HandleDeviceRemoved)
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "cmd-handler: canal decode_cmd cheio; HandleDeviceRemoved descartado"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "cmd-handler: HandleDeviceRemoved enviado ao decoder"
+                                );
+                            }
                         }
                         _ => {}
                     }
                 }
             })
             .expect("falha ao criar thread cmd-handler");
+        handles.push(handle);
     }
-
-    // 15. Bootstrap D3D11 (Fase A — SPEC-AV-HW-001)
-    //
-    // Cria o ID3D11Device standalone para validar o adapter disponível e obter o
-    // LUID.  O device é compartilhado via `Arc` com o FfmpegDecoder (Fase B) e
-    // com o renderer (Fase C).  Nesta Fase A, apenas configuramos o wgpu para
-    // selecionar o mesmo adapter físico (via PowerPreference::HighPerformance em
-    // sistemas com iGPU+dGPU) e registramos o LUID no log.
-    //
-    // Risco R1: eframe 0.29 não expõe API para injetar wgpu::Device pré-criado;
-    // a sincronização de adapter é feita por LUID no CreationContext callback.
-    #[cfg(windows)]
-    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = match av::D3d11Device::new() {
-        Ok(dev) => {
-            tracing::info!(
-                adapter = dev.adapter_description(),
-                luid = dev.adapter_luid().as_u64(),
-                vendor_id = format!("{:#06x}", dev.vendor_id()),
-                "hw: D3d11Device bootstrap OK (Fase A)"
-            );
-            Some(dev)
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "hw: D3d11Device bootstrap falhou — hwaccel desabilitado; usando decode CPU"
-            );
-            None
-        }
-    };
-    #[cfg(not(windows))]
-    let d3d11_device_arc: Option<std::sync::Arc<av::D3d11Device>> = None;
 
     // Usa PowerPreference::HighPerformance para que wgpu e D3D11 selecionem
     // o mesmo adapter físico em sistemas com múltiplas GPUs (iGPU + dGPU).
@@ -1022,6 +1272,30 @@ fn main() -> eframe::Result<()> {
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             present_mode: eframe::wgpu::PresentMode::Fifo,
             power_preference: wgpu_power_pref,
+            // Pede TEXTURE_FORMAT_16BIT_NORM para suportar upload R16Unorm dos
+            // planos YUV 10-bit (HEVC Main10/Rext, comum em broadcast). Quando
+            // o adapter não expõe a feature, cai silenciosamente para o default
+            // — o renderer ainda funciona em streams 8-bit.
+            device_descriptor: std::sync::Arc::new(|adapter| {
+                let base_limits = if adapter.get_info().backend == eframe::wgpu::Backend::Gl {
+                    eframe::wgpu::Limits::downlevel_webgl2_defaults()
+                } else {
+                    eframe::wgpu::Limits::default()
+                };
+
+                let wanted = eframe::wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+                let required_features = wanted & adapter.features();
+
+                eframe::wgpu::DeviceDescriptor {
+                    label: Some("ironplayer wgpu device"),
+                    required_features,
+                    required_limits: eframe::wgpu::Limits {
+                        max_texture_dimension_2d: 8192,
+                        ..base_limits
+                    },
+                    memory_hints: eframe::wgpu::MemoryHints::default(),
+                }
+            }),
             ..Default::default()
         },
         ..Default::default()
@@ -1029,7 +1303,8 @@ fn main() -> eframe::Result<()> {
 
     // Clona `d3d11_device_arc` para uso dentro do closure (o Arc original pode
     // ser movido para o FfmpegDecoder na Fase B).
-    let d3d11_for_cc = d3d11_device_arc;
+    let d3d11_for_cc = d3d11_device_arc.clone();
+    let d3d11_for_ui = d3d11_device_arc;
 
     eframe::run_native(
         "IronPlayer",
@@ -1074,9 +1349,11 @@ fn main() -> eframe::Result<()> {
                 Some(selected_service),
                 Some(table_events_rx.clone()),
                 Some(video_frames_rx),
+                d3d11_for_ui.clone(),
             );
             inner.set_pipeline_metrics_rx(pipeline_metrics_ui);
             inner.set_audio_clock_rx(audio_clock_for_ui);
+            inner.set_hwaccel_choice(cfg.player.hwaccel.into());
             Ok(Box::new(IronPlayerAppWithPipeline { inner, guard }))
         }),
     )

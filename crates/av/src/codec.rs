@@ -208,6 +208,20 @@ pub enum ThreadType {
     Slice,
 }
 
+/// Modo de deinterlacing configurável.
+///
+/// SPEC-AV-005
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeinterlaceMode {
+    /// Detecta automaticamente via SPS / field_order / flags de frame.
+    #[default]
+    Auto,
+    /// Força deinterlacing em todo vídeo (útil para streams mal marcados).
+    Force,
+    /// Desativa deinterlacing.
+    Off,
+}
+
 /// Configuração do decodificador FFmpeg.
 ///
 /// Controla threading, skip de loop filter e flags de qualidade/velocidade.
@@ -237,6 +251,10 @@ pub struct CodecConfig {
     ///
     /// Desabilitado por padrão (conservador).
     pub flag2_fast: bool,
+    /// Modo de deinterlacing para streams de vídeo.
+    ///
+    /// SPEC-AV-005
+    pub deinterlace: DeinterlaceMode,
 }
 
 impl Default for CodecConfig {
@@ -254,6 +272,7 @@ impl Default for CodecConfig {
             thread_type: ThreadType::Auto,
             skip_loop_filter: false,
             flag2_fast: false,
+            deinterlace: DeinterlaceMode::Auto,
         }
     }
 }
@@ -415,6 +434,7 @@ mod tests {
             thread_type: ThreadType::Frame,
             skip_loop_filter: true,
             flag2_fast: false,
+            deinterlace: DeinterlaceMode::Auto,
         };
         assert_eq!(cfg.thread_count, 4);
         assert_eq!(cfg.thread_type, ThreadType::Frame);

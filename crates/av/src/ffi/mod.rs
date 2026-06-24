@@ -112,6 +112,8 @@ pub(crate) const AV_CTX_HW_DEVICE_CTX_OFFSET: usize = 560;
 pub(crate) const AVCTX_CODEC_ID_OFFSET: usize = 24;
 pub(crate) const AVCTX_BIT_RATE_OFFSET: usize = 104;
 pub(crate) const AVCTX_PROFILE_OFFSET: usize = 192;
+/// `AVCodecContext::field_order` — FFmpeg 8.x x86-64 (layout com campos deprecated).
+pub(crate) const AVCTX_FIELD_ORDER_OFFSET: usize = 568;
 
 // ─── Tipos opacos FFmpeg ──────────────────────────────────────────────────────
 
@@ -387,7 +389,10 @@ pub(crate) unsafe fn frame_flags(frame: *mut c_void) -> c_int {
     *((frame as *const u8).add(276) as *const c_int)
 }
 
-// ─── Tipos de ponteiro de função ──────────────────────────────────────────────
+#[inline]
+pub(crate) unsafe fn ctx_field_order(ctx: *mut AvCodecContext) -> c_int {
+    *((ctx as *const u8).add(AVCTX_FIELD_ORDER_OFFSET) as *const c_int)
+}
 
 type FnAvcodecFindDecoder = unsafe extern "C" fn(id: u32) -> *mut AvCodec;
 type FnAvcodecAllocContext3 = unsafe extern "C" fn(codec: *const AvCodec) -> *mut AvCodecContext;
@@ -1057,6 +1062,14 @@ impl FfmpegCodecContext {
 
         tracing::debug!(codec_id, "decodificador FFmpeg aberto com D3D11VA");
         Ok(Self { ctx, lib })
+    }
+
+    /// Lê `field_order` do contexto de codec (progressivo / entrelaçado).
+    ///
+    /// SPEC-AV-005
+    pub(crate) fn field_order(&self) -> c_int {
+        // SAFETY: ctx é um AVCodecContext válido enquanto self existir.
+        unsafe { ctx_field_order(self.ctx) }
     }
 
     /// Envia um `AvPacket` para o decodificador.
@@ -2205,14 +2218,16 @@ impl FfmpegFilterGraph {
     ///
     /// `pix_fmt`: formato de pixel AVPixelFormat
     /// (`AV_PIX_FMT_YUV420P = 0`, `AV_PIX_FMT_YUV420P10LE = 63`).
+    /// `deint_all`: quando `true`, usa `deint=all` (força em todos os frames).
     ///
-    /// SPEC-AV-004
+    /// SPEC-AV-005
     pub(crate) fn new_bwdif(
         filter_lib: Arc<FilterLib>,
         ffmpeg_lib: Arc<FfmpegLib>,
         width: u32,
         height: u32,
         pix_fmt: c_int,
+        deint_all: bool,
     ) -> Result<Self, AvError> {
         // SAFETY: avfilter_graph_alloc usa av_malloc internamente.
         let graph = unsafe { (filter_lib.avfilter_graph_alloc)() };
@@ -2272,12 +2287,17 @@ impl FfmpegFilterGraph {
         }
 
         let mut bwdif_ctx: *mut AvFilterContext = std::ptr::null_mut();
+        let bwdif_args = if deint_all {
+            c"mode=send_frame:parity=auto:deint=all"
+        } else {
+            c"mode=send_frame:parity=auto:deint=interlaced"
+        };
         let ret = unsafe {
             (filter_lib.avfilter_graph_create_filter)(
                 &mut bwdif_ctx,
                 bwdif_filt,
                 c"bwdif".as_ptr(),
-                c"mode=send_frame:parity=auto:deint=interlaced".as_ptr(),
+                bwdif_args.as_ptr(),
                 std::ptr::null_mut(),
                 graph,
             )

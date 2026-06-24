@@ -21,6 +21,7 @@ pub mod clock;
 pub mod codec;
 pub mod decoder;
 pub(crate) mod deinterlace;
+pub mod scan_type;
 pub mod error;
 pub mod ffi;
 pub mod hw;
@@ -32,7 +33,8 @@ pub mod video_queue;
 
 pub use audio::{AudioFrame, AudioOutput, AudioRingBuffer, AudioStreamInfo};
 pub use clock::{AudioClockHandle, Clock, MasterClock, Pts90, WallClockHandle};
-pub use codec::{AudioCodec, CodecConfig, MediaCodec, ThreadType, VideoCodec};
+pub use codec::{AudioCodec, CodecConfig, DeinterlaceMode, MediaCodec, ThreadType, VideoCodec};
+pub use scan_type::{DeinterlaceReason, ScanType};
 pub use decoder::{DecodedFrame, FfmpegDecoder};
 pub use error::AvError;
 pub use hw::{

@@ -225,6 +225,28 @@ impl MetricsPanel {
                 });
                 ui.end_row();
 
+                ui.label("Scan type");
+                ui.label(p.scan_type.as_deref().unwrap_or("-"));
+                ui.end_row();
+
+                ui.label("Deinterlace motivo");
+                ui.label(p.deinterlace_reason.as_deref().unwrap_or("-"));
+                ui.end_row();
+
+                ui.label("avfilter DLL");
+                ui.label(if p.avfilter_available {
+                    "Disponível"
+                } else {
+                    "Ausente"
+                });
+                ui.end_row();
+
+                if p.deinterlace_drops > 0 {
+                    ui.label("Deinterlace drops");
+                    ui.label(p.deinterlace_drops.to_string());
+                    ui.end_row();
+                }
+
                 ui.label("Colorspace");
                 ui.label(p.colorspace.as_deref().unwrap_or("-"));
                 ui.end_row();

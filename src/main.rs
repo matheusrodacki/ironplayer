@@ -333,6 +333,9 @@ fn main() -> eframe::Result<()> {
         std::process::exit(1);
     }
 
+    // 2.1 Verifica avfilter para deinterlacing (SPEC-AV-005, não fatal).
+    let avfilter_ok = ffmpeg_check::check_avfilter_available();
+
     // 3. Carrega AppConfig (ironstream.toml ou defaults)
     let mut cfg = AppConfig::load_or_default();
 
@@ -598,9 +601,11 @@ fn main() -> eframe::Result<()> {
 
     // Arc compartilhado para expor métricas do pipeline de decode à UI.
     let pipeline_metrics_shared: std::sync::Arc<std::sync::RwLock<ts::metrics::PipelineMetrics>> =
-        std::sync::Arc::new(std::sync::RwLock::new(
-            ts::metrics::PipelineMetrics::default(),
-        ));
+        std::sync::Arc::new(std::sync::RwLock::new({
+            let mut m = ts::metrics::PipelineMetrics::default();
+            m.avfilter_available = avfilter_ok;
+            m
+        }));
     let pipeline_metrics_ui = std::sync::Arc::clone(&pipeline_metrics_shared);
     let d3d11_device_arc = bootstrap_d3d11_device(cfg.player.hwaccel, &pipeline_metrics_shared);
 
@@ -644,6 +649,11 @@ fn main() -> eframe::Result<()> {
                 config::DecoderProfile::Fast => true,
                 config::DecoderProfile::Accurate => false,
                 config::DecoderProfile::Default => cfg.decoder.flag2_fast,
+            },
+            deinterlace: match cfg.decoder.deinterlace {
+                config::DeinterlaceChoice::Auto => av::DeinterlaceMode::Auto,
+                config::DeinterlaceChoice::Force => av::DeinterlaceMode::Force,
+                config::DeinterlaceChoice::Off => av::DeinterlaceMode::Off,
             },
         };
         let pipeline_metrics_decode = std::sync::Arc::clone(&pipeline_metrics_shared);
@@ -767,6 +777,14 @@ fn main() -> eframe::Result<()> {
                                     if let Ok(mut m) = pipeline_metrics_decode.write() {
                                         m.decoder_threads_used = decoder.threads_used();
                                         m.deinterlacer_active = decoder.has_deinterlacer_active();
+                                        m.scan_type = Some(
+                                            decoder.video_scan_type().label().to_string(),
+                                        );
+                                        m.deinterlace_reason = Some(
+                                            decoder.deinterlace_reason().label().to_string(),
+                                        );
+                                        m.avfilter_available = decoder.filter_lib_available();
+                                        m.deinterlace_drops = decoder.deinterlace_drops();
                                         m.hw_decode_active = decoder.is_hwaccel_active();
                                         m.hw_decode_codec = decoder.hw_decode_codec().map(str::to_owned);
                                         m.hw_decode_fallback_reason = decoder.fallback_reason().map(str::to_owned);

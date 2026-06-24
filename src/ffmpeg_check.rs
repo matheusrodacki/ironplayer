@@ -20,6 +20,60 @@ const AVCODEC_DLL: &str = "avcodec-62.dll";
 #[cfg(not(windows))]
 const AVCODEC_DLL: &str = "libavcodec.so.62";
 
+#[cfg(windows)]
+const AVFILTER_DLL: &str = "avfilter-11.dll";
+
+#[cfg(not(windows))]
+const AVFILTER_DLL: &str = "libavfilter.so.11";
+
+/// Verifica se `avfilter` está disponível para deinterlacing bwdif.
+///
+/// Não é fatal — retorna `false` se a DLL estiver ausente.
+///
+/// SPEC-AV-005
+pub fn check_avfilter_available() -> bool {
+    let Some(dir) = avfilter_search_dir() else {
+        return false;
+    };
+
+    #[cfg(windows)]
+    set_dll_search_dir(Some(&dir));
+
+    let path = dir.join(AVFILTER_DLL);
+    let ok = std::path::Path::new(&path).exists()
+        && unsafe { libloading::Library::new(&path) }.is_ok();
+
+    #[cfg(windows)]
+    set_dll_search_dir(None);
+
+    if ok {
+        tracing::info!(path = %path.display(), "avfilter verificado — deinterlacing bwdif disponível");
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            "avfilter não encontrado — deinterlacing bwdif desabilitado; \
+             copie {AVFILTER_DLL} para a pasta ffmpeg/"
+        );
+    }
+
+    ok
+}
+
+fn avfilter_search_dir() -> Option<std::path::PathBuf> {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let ffmpeg_dir = exe_dir.join("ffmpeg");
+            if ffmpeg_dir.join(AVFILTER_DLL).exists() {
+                return Some(ffmpeg_dir);
+            }
+            if exe_dir.join(AVFILTER_DLL).exists() {
+                return Some(exe_dir.to_path_buf());
+            }
+        }
+    }
+    None
+}
+
 /// Verifica se as DLLs FFmpeg são compatíveis com a versão esperada.
 ///
 /// SPEC-AV-CHECK-001 — deve ser chamada em `main()` antes de qualquer
@@ -123,7 +177,8 @@ pub fn check_ffmpeg_compatibility() -> Result<(), String> {
          Caminhos pesquisados:\n{paths_str}\n\n\
          Solução:\n\
          1. Baixe FFmpeg 8.x para Windows em https://ffmpeg.org/download.html\n\
-         2. Copie as DLLs ({AVCODEC_DLL}, avformat-62.dll, avutil-60.dll, swresample-6.dll, swscale-9.dll)\n\
+         2. Copie as DLLs ({AVCODEC_DLL}, avformat-62.dll, avutil-60.dll, avfilter-11.dll, \
+            swresample-6.dll, swscale-9.dll)\n\
             para a pasta 'ffmpeg/' ao lado do executável ironplayer.exe"
     ))
 }

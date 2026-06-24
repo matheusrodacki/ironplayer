@@ -1,13 +1,9 @@
 //! Deinterlacing via bwdif da libavfilter.
 //!
-//! Ativado automaticamente quando `AVFrame::flags & AV_FRAME_FLAG_INTERLACED != 0`.
-//! Cria um grafo avfilter `buffer → bwdif=mode=send_frame:parity=auto:deint=interlaced → buffersink`
-//! para cada PID de vídeo na primeira aparição de frame interlaced.
+//! Ativado quando o stream é detectado como entrelaçado (SPS / field_order /
+//! `AV_FRAME_FLAG_INTERLACED`) ou quando `[decoder] deinterlace = force`.
 //!
-//! O grafo é recriado automaticamente se as dimensões ou o formato de pixel
-//! mudarem (raro em transmissão ao vivo, mas suportado para robustez).
-//!
-//! SPEC-AV-004
+//! SPEC-AV-005
 
 use std::sync::Arc;
 
@@ -18,16 +14,18 @@ use crate::ffi::{
 
 /// Deinterlacador baseado em bwdif da libavfilter.
 ///
-/// Criado por PID de vídeo quando o primeiro frame interlaced é detectado.
+/// Criado por PID de vídeo quando o stream é entrelaçado ou forçado via config.
 /// Recria o grafo automaticamente se as dimensões do frame mudarem.
 ///
-/// SPEC-AV-004
+/// SPEC-AV-005
 pub(crate) struct Deinterlacer {
     filter_lib: Arc<FilterLib>,
     ffmpeg_lib: Arc<FfmpegLib>,
     graph: Option<FfmpegFilterGraph>,
     /// Dimensões e formato do grafo atual: `(width, height, pix_fmt)`.
     graph_dims: Option<(u32, u32, i32)>,
+    /// Quando `true`, o grafo usa `deint=all`.
+    deint_all: bool,
 }
 
 impl Deinterlacer {
@@ -35,24 +33,29 @@ impl Deinterlacer {
     ///
     /// O grafo é criado lazily na primeira chamada a `process`.
     ///
-    /// SPEC-AV-004
-    pub(crate) fn new(filter_lib: Arc<FilterLib>, ffmpeg_lib: Arc<FfmpegLib>) -> Self {
+    /// SPEC-AV-005
+    pub(crate) fn new(
+        filter_lib: Arc<FilterLib>,
+        ffmpeg_lib: Arc<FfmpegLib>,
+        deint_all: bool,
+    ) -> Self {
         Self {
             filter_lib,
             ffmpeg_lib,
             graph: None,
             graph_dims: None,
+            deint_all,
         }
     }
 
-    /// Processa um frame interlaced através do bwdif.
+    /// Processa um frame através do bwdif.
     ///
     /// Cria o grafo lazily na primeira chamada ou quando as dimensões mudam.
     ///
     /// Retorna `Ok(Some(frame))` com o frame deinterlaced, ou `Ok(None)` se o
     /// filtro bwdif ainda estiver acumulando contexto temporal (AVERROR_EAGAIN).
     ///
-    /// SPEC-AV-004
+    /// SPEC-AV-005
     pub(crate) fn process(&mut self, frame: &FfmpegFrame) -> Result<Option<FfmpegFrame>, AvError> {
         // SAFETY: frame.as_ptr() aponta para um AVFrame válido e preenchido.
         let (width, height, pix_fmt) = unsafe {
@@ -70,6 +73,7 @@ impl Deinterlacer {
                 width,
                 height,
                 pix_fmt,
+                deint_all = self.deint_all,
                 "deinterlacer: (re)criando grafo bwdif"
             );
             self.graph = None;
@@ -79,6 +83,7 @@ impl Deinterlacer {
                 width,
                 height,
                 pix_fmt,
+                self.deint_all,
             )?;
             self.graph = Some(g);
             self.graph_dims = Some(dims);

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioFrame;
-use crate::codec::{AudioCodec, CodecConfig, MediaCodec, ThreadType, VideoCodec};
+use crate::codec::{AudioCodec, CodecConfig, DeinterlaceMode, MediaCodec, ThreadType, VideoCodec};
 use crate::deinterlace::Deinterlacer;
 use crate::error::AvError;
 use crate::ffi::{
@@ -18,6 +18,9 @@ use crate::ffi::{
     FfmpegParser, FilterLib, AV_CODEC_ID_AAC, AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3,
     AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
     AV_COL_RANGE_JPEG, AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
+};
+use crate::scan_type::{
+    detect_h264_scan_type, update_scan_type, DeinterlaceReason, ScanType,
 };
 use crate::hw::{D3d11Device, HwAccelMode, HwAccelState};
 #[cfg(windows)]
@@ -98,12 +101,22 @@ struct CodecState {
     /// interlaced. `None` se o stream não for interlaced ou se `FilterLib`
     /// não estiver disponível.
     deinterlacer: Option<Deinterlacer>,
+    /// Tipo de varredura detectado para este PID (latched após primeira detecção).
+    scan_type: ScanType,
+    /// `true` quando o codec de vídeo é H.264 (para parse de SPS).
+    is_h264: bool,
+    /// Frames descartados por EAGAIN ou erro do bwdif neste PID.
+    deinterlace_drops: u64,
     /// Deadline para o primeiro frame HW (2 s após abertura do contexto).
     /// `None` quando em modo SW ou após receber o primeiro frame D3D11.
     /// Expirar sem receber frame HW dispara fallback para SW.
     ///
     /// SPEC-AV-HW-DEC-001
     hw_init_deadline: Option<Instant>,
+    /// `true` quando este PID foi aberto com decoder D3D11VA (não SW).
+    ///
+    /// SPEC-AV-005
+    hw_decode: bool,
 }
 
 // ─── FfmpegDecoder ────────────────────────────────────────────────────────────
@@ -145,6 +158,8 @@ pub struct FfmpegDecoder {
     hw_state: HwAccelState,
     /// Codec do último decoder HW aberto com sucesso (telemetria/UI).
     last_hw_codec: Option<String>,
+    /// Total de frames descartados pelo bwdif (todos os PIDs).
+    deinterlace_drops: u64,
 }
 
 impl FfmpegDecoder {
@@ -182,11 +197,11 @@ impl FfmpegDecoder {
         // são entregues sem processamento mas o pipeline continua funcional.
         let filter_lib = FilterLib::load(&dll_dir)
             .map_err(|e| {
-                tracing::debug!(%e, "avfilter não disponível — deinterlacing desabilitado");
+                tracing::warn!(%e, "avfilter não disponível — deinterlacing bwdif desabilitado");
             })
             .ok();
         if filter_lib.is_some() {
-            tracing::debug!("avfilter carregado — deinterlacing bwdif habilitado");
+            tracing::info!("avfilter carregado — deinterlacing bwdif habilitado");
         }
 
         Ok(Self {
@@ -197,6 +212,7 @@ impl FfmpegDecoder {
             hwaccel: HwAccelMode::Off,
             hw_state: HwAccelState::new(),
             last_hw_codec: None,
+            deinterlace_drops: 0,
         })
     }
 
@@ -223,6 +239,7 @@ impl FfmpegDecoder {
             hwaccel: HwAccelMode::Off,
             hw_state: HwAccelState::new(),
             last_hw_codec: None,
+            deinterlace_drops: 0,
         }
     }
 
@@ -238,11 +255,61 @@ impl FfmpegDecoder {
 
     /// Retorna `true` se pelo menos um PID de vídeo tem o deinterlacador bwdif ativo.
     ///
-    /// SPEC-AV-004
+    /// SPEC-AV-005
     pub fn has_deinterlacer_active(&self) -> bool {
         self.states
             .values()
             .any(|s| s.is_video && s.deinterlacer.is_some())
+    }
+
+    /// Retorna `true` quando `avfilter` foi carregado com sucesso.
+    ///
+    /// SPEC-AV-005
+    pub fn filter_lib_available(&self) -> bool {
+        self.filter_lib.is_some()
+    }
+
+    /// Scan type do primeiro PID de vídeo com tipo resolvido, ou `Unknown`.
+    ///
+    /// SPEC-AV-005
+    pub fn video_scan_type(&self) -> ScanType {
+        self.states
+            .values()
+            .find(|s| s.is_video && s.scan_type.is_resolved())
+            .map(|s| s.scan_type)
+            .unwrap_or_else(|| {
+                self.states
+                    .values()
+                    .find(|s| s.is_video)
+                    .map(|s| s.scan_type)
+                    .unwrap_or(ScanType::Unknown)
+            })
+    }
+
+    /// Motivo do estado atual do deinterlacer (diagnóstico / métricas).
+    ///
+    /// SPEC-AV-005
+    pub fn deinterlace_reason(&self) -> DeinterlaceReason {
+        if self.codec_config.deinterlace == DeinterlaceMode::Off {
+            return DeinterlaceReason::Off;
+        }
+        if self.filter_lib.is_none() {
+            return DeinterlaceReason::NoAvfilter;
+        }
+        if self.has_deinterlacer_active() {
+            if self.codec_config.deinterlace == DeinterlaceMode::Force {
+                return DeinterlaceReason::Forced;
+            }
+            return DeinterlaceReason::Active;
+        }
+        DeinterlaceReason::NotDetected
+    }
+
+    /// Total de frames descartados pelo pipeline bwdif.
+    ///
+    /// SPEC-AV-005
+    pub fn deinterlace_drops(&self) -> u64 {
+        self.deinterlace_drops
     }
 
     /// Retorna o número de threads de decodificação configurado.
@@ -382,9 +449,24 @@ impl FfmpegDecoder {
         if !self.states.contains_key(&pid_raw) {
             let avid = codec_to_avid(pes.codec)?;
             let is_video = matches!(pes.codec, MediaCodec::Video(_));
+            let is_h264 = matches!(pes.codec, MediaCodec::Video(VideoCodec::H264));
+
+            let initial_scan = if self.codec_config.deinterlace == DeinterlaceMode::Force {
+                ScanType::Interlaced
+            } else if is_h264 {
+                detect_h264_scan_type(&pes.payload).unwrap_or(ScanType::Unknown)
+            } else {
+                ScanType::Unknown
+            };
+
+            // Vídeo entrelaçado requer decoder SW + bwdif — não abrir D3D11VA.
+            let skip_hw_for_deinterlace = is_video
+                && (initial_scan.is_interlaced()
+                    || self.codec_config.deinterlace == DeinterlaceMode::Force);
 
             // Tenta abrir com hwaccel se for vídeo e o estado estiver ativo.
-            let codec_ctx = if is_video && self.hw_state.is_active() {
+            let mut hw_decode = false;
+            let codec_ctx = if is_video && self.hw_state.is_active() && !skip_hw_for_deinterlace {
                 let hw_codec_config = CodecConfig {
                     thread_count: 1,
                     thread_type: ThreadType::Auto,
@@ -401,6 +483,7 @@ impl FfmpegDecoder {
                     external_d3d11,
                 ) {
                     Ok(ctx) => {
+                        hw_decode = true;
                         self.last_hw_codec = hw_codec_label(pes.codec).map(str::to_owned);
                         tracing::debug!(pid = pid_raw, "hwaccel D3D11VA aberto para PID");
                         ctx
@@ -432,9 +515,20 @@ impl FfmpegDecoder {
                 )?
             };
 
+            if skip_hw_for_deinterlace && self.hw_state.is_active() {
+                tracing::info!(
+                    pid = pid_raw,
+                    scan = initial_scan.label(),
+                    "vídeo entrelaçado detectado — decoder SW para bwdif"
+                );
+            }
+
             // Deadline para o primeiro frame HW quando em modo D3D11VA.
             // 2 s (spec §4.3): tempo para o primeiro frame HW antes de fallback SW.
-            let hw_init_deadline = if is_video && self.hw_state.is_active() {
+            let hw_init_deadline = if is_video
+                && self.hw_state.is_active()
+                && !skip_hw_for_deinterlace
+            {
                 Some(Instant::now() + Duration::from_secs(2))
             } else {
                 None
@@ -456,7 +550,11 @@ impl FfmpegDecoder {
                     is_video,
                     parser,
                     deinterlacer: None,
+                    scan_type: initial_scan,
+                    is_h264,
+                    deinterlace_drops: 0,
                     hw_init_deadline,
+                    hw_decode,
                 },
             );
         }
@@ -563,13 +661,34 @@ impl FfmpegDecoder {
         // Flag para acionar fallback SW após sair do loop (evita borrow duplo
         // de `self` dentro do loop onde `state` já emprestou `self.states`).
         let mut hw_download_failed = false;
-        let mut hw_interlaced_requires_sw = false;
         let mut hw_frames_ok: usize = 0;
 
-        'pkt_loop: for (pkt_bytes, pkt_pts) in parsed_packets {
+        for (pkt_bytes, pkt_pts) in parsed_packets {
             if pkt_bytes.is_empty() {
                 continue;
             }
+
+            if state.is_video {
+                state.scan_type = update_scan_type(
+                    state.scan_type,
+                    self.codec_config.deinterlace,
+                    state.is_h264,
+                    &pkt_bytes,
+                    false,
+                    state.codec_ctx.field_order(),
+                );
+
+                if state.hw_decode && state.scan_type.is_interlaced() {
+                    reopen_sw_codec_for_deinterlace(
+                        &self.lib,
+                        &self.codec_config,
+                        state,
+                        pes.codec,
+                        pid_raw,
+                    )?;
+                }
+            }
+
             let pkt = FfmpegPacket::from_bytes(Arc::clone(&self.lib), &pkt_bytes, pkt_pts)?;
             if let Err(e) = state.codec_ctx.send_packet(&pkt) {
                 tracing::debug!(%e, pid = pid_raw, "send_packet: erro transitório (aguardando IDR?)");
@@ -583,18 +702,39 @@ impl FfmpegDecoder {
                         let decoded = if state.is_video {
                             // ── Caminho HW: frame D3D11VA — download seguro via FFmpeg ──
                             if state.frame.is_hw() {
-                                let is_interlaced = unsafe {
-                                    frame_flags(state.frame.as_ptr()) & AV_FRAME_FLAG_INTERLACED
-                                        != 0
-                                };
-                                if is_interlaced {
-                                    tracing::warn!(
-                                    pid = pid_raw,
-                                    "frame HW interlaced detectado — reabrindo decoder em SW para bwdif"
+                                let field_order = state.codec_ctx.field_order();
+                                let frame_interlaced = frame_is_interlaced(&state.frame);
+                                state.scan_type = update_scan_type(
+                                    state.scan_type,
+                                    self.codec_config.deinterlace,
+                                    state.is_h264,
+                                    &pkt_bytes,
+                                    frame_interlaced,
+                                    field_order,
                                 );
+
+                                let needs_di = needs_deinterlace(
+                                    state.scan_type,
+                                    self.codec_config.deinterlace,
+                                );
+                                if needs_di || frame_interlaced {
+                                    tracing::debug!(
+                                        pid = pid_raw,
+                                        scan = state.scan_type.label(),
+                                        "frame HW em stream entrelaçado — migrando para SW"
+                                    );
                                     state.frame.unref();
-                                    hw_interlaced_requires_sw = true;
-                                    break 'pkt_loop;
+                                    reopen_sw_codec_for_deinterlace(
+                                        &self.lib,
+                                        &self.codec_config,
+                                        state,
+                                        pes.codec,
+                                        pid_raw,
+                                    )?;
+                                    if let Err(e) = state.codec_ctx.send_packet(&pkt) {
+                                        tracing::debug!(%e, pid = pid_raw, "re-send após migração HW→SW");
+                                    }
+                                    continue;
                                 }
 
                                 // Cancela o deadline de init — recebemos o primeiro frame HW.
@@ -645,52 +785,86 @@ impl FfmpegDecoder {
                                 }
                             } else {
                                 // ── Caminho SW: YUV420P / YUV420P10LE ────────────────
-                                // Verifica se o frame é interlaced (FFmpeg 8.x: flags bit 0).
-                                // SAFETY: state.frame.as_ptr() aponta para AVFrame válido e preenchido.
-                                let is_interlaced = unsafe {
-                                    frame_flags(state.frame.as_ptr()) & AV_FRAME_FLAG_INTERLACED
-                                        != 0
-                                };
+                                let field_order = state.codec_ctx.field_order();
+                                let frame_interlaced = frame_is_interlaced(&state.frame);
+                                state.scan_type = update_scan_type(
+                                    state.scan_type,
+                                    self.codec_config.deinterlace,
+                                    state.is_h264,
+                                    &pkt_bytes,
+                                    frame_interlaced,
+                                    field_order,
+                                );
 
-                                // Aplica bwdif se interlaced e FilterLib disponível.
-                                let di_frame: Option<FfmpegFrame> =
-                                    if is_interlaced && state.deinterlacer.is_none() {
-                                        if let Some(fl) = &self.filter_lib {
+                                let needs_di = needs_deinterlace(
+                                    state.scan_type,
+                                    self.codec_config.deinterlace,
+                                );
+                                let deint_all = state.scan_type.is_interlaced()
+                                    || self.codec_config.deinterlace == DeinterlaceMode::Force;
+
+                                if needs_di {
+                                    if let Some(fl) = &self.filter_lib {
+                                        if state.deinterlacer.is_none() {
                                             state.deinterlacer = Some(Deinterlacer::new(
                                                 Arc::clone(fl),
                                                 Arc::clone(&self.lib),
+                                                deint_all,
                                             ));
+                                            tracing::info!(
+                                                pid = pid_raw,
+                                                scan = state.scan_type.label(),
+                                                "deinterlacer bwdif ativado"
+                                            );
                                         }
-                                        None
-                                    } else {
-                                        None
-                                    };
+                                    }
+                                }
 
-                                let di_frame = if is_interlaced {
+                                let di_output: Option<FfmpegFrame> = if needs_di {
                                     if let Some(di) = state.deinterlacer.as_mut() {
                                         match di.process(&state.frame) {
-                                            Ok(f) => f,
+                                            Ok(Some(f)) => Some(f),
+                                            Ok(None) => {
+                                                state.frame.unref();
+                                                continue;
+                                            }
                                             Err(e) => {
-                                                tracing::warn!(%e, pid = pid_raw, "bwdif: erro; usando frame original");
-                                                None
+                                                tracing::warn!(
+                                                    %e,
+                                                    pid = pid_raw,
+                                                    "bwdif: erro — frame descartado"
+                                                );
+                                                state.deinterlace_drops += 1;
+                                                self.deinterlace_drops += 1;
+                                                state.frame.unref();
+                                                continue;
                                             }
                                         }
+                                    } else if state.scan_type.is_interlaced() {
+                                        state.frame.unref();
+                                        continue;
                                     } else {
-                                        di_frame
+                                        None
                                     }
                                 } else {
-                                    di_frame
+                                    None
                                 };
 
-                                // Se bwdif retornou EAGAIN (precisando de mais contexto),
-                                // descarta o frame e aguarda o próximo.
-                                let source = di_frame.as_ref().unwrap_or(&state.frame);
+                                let yuv_result = if let Some(ref out) = di_output {
+                                    out.to_yuv_planes()
+                                } else {
+                                    state.frame.to_yuv_planes()
+                                };
 
                                 let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, ten_bit) =
-                            source.to_yuv_planes().map_err(|e| {
-                                tracing::warn!(%e, pid = pid_raw, "falha ao extrair planos YUV");
-                                e
-                            })?;
+                                    yuv_result.map_err(|e| {
+                                        tracing::warn!(
+                                            %e,
+                                            pid = pid_raw,
+                                            "falha ao extrair planos YUV"
+                                        );
+                                        e
+                                    })?;
                                 let pts = pts_raw_to_option(pts_raw);
                                 Some(DecodedFrame::Video(VideoFrame::Sw(YuvFrame {
                                     planes,
@@ -749,11 +923,6 @@ impl FfmpegDecoder {
         if hw_frames_ok > 0 {
             self.record_hw_success();
         }
-        if hw_interlaced_requires_sw {
-            self.fallback_to_sw("frame HW interlaced requer bwdif SW");
-            self.states.remove(&pid_raw);
-            return Ok(frames);
-        }
         if hw_download_failed && self.record_hw_failure() {
             tracing::warn!(
                 pid = pid_raw,
@@ -786,6 +955,52 @@ impl FfmpegDecoder {
             HwAccelMode::D3d11Va(_) if self.hw_state.is_active() => None,
             _ => None,
         }
+    }
+}
+
+/// Reabre o decoder de vídeo em SW quando entrelaçamento exige bwdif.
+///
+/// Preserva `scan_type` e o parser; descarta o contexto D3D11VA.
+///
+/// SPEC-AV-005
+fn reopen_sw_codec_for_deinterlace(
+    lib: &Arc<FfmpegLib>,
+    config: &CodecConfig,
+    state: &mut CodecState,
+    codec: MediaCodec,
+    pid: u16,
+) -> Result<(), AvError> {
+    if !state.hw_decode {
+        return Ok(());
+    }
+    let avid = codec_to_avid(codec)?;
+    tracing::warn!(
+        pid,
+        scan = state.scan_type.label(),
+        "migrando decoder HW → SW para deinterlacing bwdif"
+    );
+    state.codec_ctx = FfmpegCodecContext::open(Arc::clone(lib), avid, config)?;
+    state.hw_decode = false;
+    state.hw_init_deadline = None;
+    state.deinterlacer = None;
+    Ok(())
+}
+
+/// Retorna `true` quando o `AVFrame` está marcado como entrelaçado.
+///
+/// SPEC-AV-005
+fn frame_is_interlaced(frame: &FfmpegFrame) -> bool {
+    unsafe { frame_flags(frame.as_ptr()) & AV_FRAME_FLAG_INTERLACED != 0 }
+}
+
+/// Retorna `true` quando o pipeline deve aplicar bwdif neste stream.
+///
+/// SPEC-AV-005
+fn needs_deinterlace(scan_type: ScanType, mode: DeinterlaceMode) -> bool {
+    match mode {
+        DeinterlaceMode::Off => false,
+        DeinterlaceMode::Force => true,
+        DeinterlaceMode::Auto => scan_type.is_interlaced(),
     }
 }
 
@@ -1281,6 +1496,27 @@ mod tests {
     }
 
     // ── Hwaccel API (Fase B) ────────────────────────────────────────────────
+
+    /// SPEC-AV-005: `needs_deinterlace` respeita modo Off / Force / Auto.
+    #[test]
+    fn spec_av_005_needs_deinterlace_modes() {
+        assert!(!super::needs_deinterlace(
+            ScanType::Interlaced,
+            DeinterlaceMode::Off
+        ));
+        assert!(super::needs_deinterlace(
+            ScanType::Unknown,
+            DeinterlaceMode::Force
+        ));
+        assert!(super::needs_deinterlace(
+            ScanType::Interlaced,
+            DeinterlaceMode::Auto
+        ));
+        assert!(!super::needs_deinterlace(
+            ScanType::Progressive,
+            DeinterlaceMode::Auto
+        ));
+    }
 
     /// Constrói um decoder isolado, sem DLLs FFmpeg, para testar a superfície
     /// pública de hwaccel.

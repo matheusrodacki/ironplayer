@@ -285,6 +285,22 @@ pub struct PipelineMetrics {
     pub decoder_threads_used: u32,
     /// `true` quando o deinterlacador bwdif está ativo em pelo menos um PID.
     pub deinterlacer_active: bool,
+    /// Tipo de varredura do vídeo (`"Interlaced"`, `"Progressive"`, `"Unknown"`).
+    ///
+    /// SPEC-AV-005
+    pub scan_type: Option<String>,
+    /// Motivo do estado do deinterlacer (`Active`, `NoAvfilter`, etc.).
+    ///
+    /// SPEC-AV-005
+    pub deinterlace_reason: Option<String>,
+    /// `true` quando `avfilter-11.dll` foi carregada com sucesso.
+    ///
+    /// SPEC-AV-005
+    pub avfilter_available: bool,
+    /// Frames descartados por EAGAIN/erro do bwdif.
+    ///
+    /// SPEC-AV-005
+    pub deinterlace_drops: u64,
     /// Latência de decode P50 (mediana) por PID de vídeo, em milissegundos.
     ///
     /// Calculado sobre janela deslizante dos últimos 100 frames por PID.

@@ -183,6 +183,23 @@ impl AudioClockHandle {
         submitted.saturating_sub(latency)
     }
 
+    /// PTS de âncora atual em 90 kHz.
+    ///
+    /// SPEC-AV-CLOCK-002
+    pub fn anchor_pts(&self) -> Pts90 {
+        self.anchor_pts.load(Ordering::Relaxed)
+    }
+
+    /// Ajusta a âncora sem zerar `samples_played` (correção de drift em runtime).
+    ///
+    /// Usado pela UI para puxar o clock de áudio em direção ao PTS do vídeo
+    /// sem interromper a reprodução WASAPI.
+    ///
+    /// SPEC-AV-CLOCK-002
+    pub fn shift_anchor(&self, new_anchor: Pts90) {
+        self.anchor_pts.store(new_anchor, Ordering::Relaxed);
+    }
+
     /// Identificador estável do handle — ponteiro do contador de samples.
     ///
     /// Clones do mesmo handle (mesma `AudioOutput`) retornam o mesmo id; um
@@ -342,6 +359,15 @@ impl MasterClock {
             MasterClock::Wall(_) => None,
         }
     }
+
+    /// Ajusta a âncora do relógio de áudio sem resetar samples (no-op para Wall).
+    ///
+    /// SPEC-AV-CLOCK-001
+    pub fn shift_anchor(&self, new_anchor: Pts90) {
+        if let MasterClock::Audio(h) = self {
+            h.shift_anchor(new_anchor);
+        }
+    }
 }
 
 impl Clock for MasterClock {
@@ -448,6 +474,19 @@ mod tests {
         assert_eq!(clock.samples_played.load(Ordering::Relaxed), 0);
         assert_eq!(clock.playback_latency_counter().load(Ordering::Relaxed), 0);
         assert_eq!(clock.now_pts90(), 180_000);
+    }
+
+    /// `shift_anchor()` ajusta PTS sem zerar samples (drift correction).
+    ///
+    /// SPEC-AV-CLOCK-002
+    #[test]
+    fn spec_av_clock_002_shift_anchor_preserves_samples() {
+        let clock = AudioClockHandle::new(48_000, 2, 0);
+        clock.samples_played.store(48_000 * 2, Ordering::Relaxed);
+        assert_eq!(clock.now_pts90(), 90_000);
+        clock.shift_anchor(180_000);
+        assert_eq!(clock.samples_played.load(Ordering::Relaxed), 48_000 * 2);
+        assert_eq!(clock.now_pts90(), 270_000);
     }
 
     /// `samples_counter()` retorna um `Arc` compartilhado com o contador

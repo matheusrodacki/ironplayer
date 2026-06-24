@@ -269,8 +269,14 @@ pub const WRAP_THRESHOLD: i64 = 1i64 << 32;
 
 /// Capacidade padrão da fila em frames.
 ///
+/// Dimensionada para absorver o *lead* de startup: o vídeo só decodifica após
+/// o primeiro IDR (~1,5-2 s depois do áudio) e chega em burst. Com o áudio como
+/// clock master verdadeiro (sem deslocar a âncora), a fila precisa segurar esse
+/// lead via hold-early/drop-late sem descartar frames antes do clock alcançá-los.
+/// 64 frames ≈ 2,1 s a 30 fps.
+///
 /// SPEC-AV-VQ-001
-pub const DEFAULT_CAPACITY: usize = 16;
+pub const DEFAULT_CAPACITY: usize = 64;
 
 // ─── PopResult ────────────────────────────────────────────────────────────────
 

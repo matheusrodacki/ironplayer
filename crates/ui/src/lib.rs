@@ -365,7 +365,9 @@ impl IronPlayerApp {
     ///    clock master, o vídeo é sincronizado contra o PTS real de reprodução
     ///    WASAPI, eliminando o drift causado pela latência do decoder multi-thread.
     /// 2. Drena até 16 frames do canal `video_frames_rx` e os insere na
-    ///    `VideoQueue` com as políticas drop/hold/resync/wrap.
+    ///    `VideoQueue` com as políticas drop/hold/resync/wrap. O skew de mux no
+    ///    startup (vídeo após o 1º IDR) é absorvido pela fila — a âncora do
+    ///    `AudioClock` nunca é deslocada (cf. STATE.md L-002).
     /// 3. Fallback: se ainda sem AudioClock, ancora o `WallClock` no PTS do
     ///    primeiro frame de vídeo recebido (`reset(anchor)`).
     /// 4. Chama `pop_ready(clock.now_pts90())` para extrair o próximo frame
@@ -430,25 +432,26 @@ impl IronPlayerApp {
             self.video_queue.push(frame);
         }
 
-        // 2. Extrai o próximo frame pronto para exibição.
-        let clock_pts = self.video_clock.now_pts90();
+        // 3. Extrai o próximo frame pronto (um por tick — pop_ready já descarta
+        // frames tardios internamente; multi-pop avançava o vídeo à frente do áudio).
         let allow_clock_resync = self.video_clock.audio_handle().is_none();
+        let clock_pts = self.video_clock.now_pts90();
         let ready_frame = match self
             .video_queue
             .pop_ready_with_resync(clock_pts, allow_clock_resync)
         {
             PopResult::Ready(f) => Some(f),
             PopResult::Resync { frame, new_anchor } => {
-                // Resincroniza o clock ao novo âncora de PTS.
                 if allow_clock_resync {
                     self.video_clock.reset(new_anchor);
                 }
                 Some(frame)
             }
-            PopResult::TooEarly | PopResult::Empty => None,
+            PopResult::TooEarly => None,
+            PopResult::Empty => None,
         };
 
-        // 3. Faz upload do frame ao renderer.
+        // 4. Faz upload do frame ao renderer.
         if let Some(frame) = ready_frame {
             if let Some(renderer) = &mut self.video_renderer {
                 let (frame_w, frame_h, sar_num, sar_den) = (

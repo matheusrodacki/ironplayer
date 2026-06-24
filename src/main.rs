@@ -187,9 +187,11 @@ fn refresh_audio_status_from_output(
     audio_out: &av::AudioOutput,
 ) {
     if let Ok(mut status) = audio_status.write() {
+        let source = status.source_channels.unwrap_or(audio_out.channels);
         status.sample_rate_hz = Some(audio_out.sample_rate);
-        status.channels = Some(audio_out.channels);
+        status.set_channel_counts(source, audio_out.channels);
         status.buffer_level = audio_out.buffer_level();
+        status.output_latency_ms = audio_out.output_latency_ms();
         status.errors.underruns = audio_out.underrun_count();
         status.errors.overruns = audio_out.overrun_count();
         status.state = if status.buffer_level >= 0.5 {
@@ -198,6 +200,17 @@ fn refresh_audio_status_from_output(
             ui::AudioOperationalState::Buffering
         };
     }
+}
+
+fn apply_audio_frame_metadata(status: &mut ui::AudioStatusSnapshot, frame: &av::AudioFrame) {
+    status.sample_rate_hz = Some(frame.sample_rate);
+    status.set_channel_counts(frame.source_channels, frame.channels);
+    status.codec_profile = frame.stream_info.profile_label.clone();
+    status.encoded_bitrate_kbps = frame
+        .stream_info
+        .encoded_bitrate_bps
+        .filter(|bps| *bps > 0)
+        .map(|bps| bps as f64 / 1000.0);
 }
 
 struct StreamResetTargets<'a> {
@@ -971,8 +984,7 @@ fn main() -> eframe::Result<()> {
                                     out.set_volume(initial_volume);
                                     if let Ok(mut status) = audio_status.write() {
                                         status.set_volume(initial_volume);
-                                        status.sample_rate_hz = Some(frame.sample_rate);
-                                        status.channels = Some(frame.channels);
+                                        apply_audio_frame_metadata(&mut status, &frame);
                                         status.buffer_level = 0.0;
                                         status.state = ui::AudioOperationalState::Buffering;
                                     }
@@ -1003,6 +1015,9 @@ fn main() -> eframe::Result<()> {
 
                         if let Some(ref out) = audio_out {
                             out.push_samples(&frame);
+                            if let Ok(mut status) = audio_status.write() {
+                                apply_audio_frame_metadata(&mut status, &frame);
+                            }
                             refresh_audio_status_from_output(&audio_status, out);
 
                             // Publica o AudioClockHandle somente quando o primeiro frame
@@ -1179,7 +1194,12 @@ fn main() -> eframe::Result<()> {
                         ui::AppCommand::SelectService { service_id } => {
                             if let Ok(mut status) = audio_status.write() {
                                 status.sample_rate_hz = None;
+                                status.source_channels = None;
+                                status.output_channels = None;
                                 status.channels = None;
+                                status.codec_profile = None;
+                                status.encoded_bitrate_kbps = None;
+                                status.stream_bitrate_kbps = None;
                                 status.buffer_level = 0.0;
                                 status.state = ui::AudioOperationalState::Buffering;
                                 status.errors.last_error = None;
@@ -1196,7 +1216,12 @@ fn main() -> eframe::Result<()> {
                         ui::AppCommand::SelectAudio { service_id, pid } => {
                             if let Ok(mut status) = audio_status.write() {
                                 status.sample_rate_hz = None;
+                                status.source_channels = None;
+                                status.output_channels = None;
                                 status.channels = None;
+                                status.codec_profile = None;
+                                status.encoded_bitrate_kbps = None;
+                                status.stream_bitrate_kbps = None;
                                 status.buffer_level = 0.0;
                                 status.state = ui::AudioOperationalState::Buffering;
                                 status.errors.last_error = None;

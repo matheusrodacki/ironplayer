@@ -30,7 +30,7 @@ pub mod video_queue;
 
 // ── Re-exportações públicas ───────────────────────────────────────────────────
 
-pub use audio::{AudioFrame, AudioOutput, AudioRingBuffer};
+pub use audio::{AudioFrame, AudioOutput, AudioRingBuffer, AudioStreamInfo};
 pub use clock::{AudioClockHandle, Clock, MasterClock, Pts90, WallClockHandle};
 pub use codec::{AudioCodec, CodecConfig, MediaCodec, ThreadType, VideoCodec};
 pub use decoder::{DecodedFrame, FfmpegDecoder};

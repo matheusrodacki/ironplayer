@@ -4,7 +4,10 @@
 
 use egui::Ui;
 
-use crate::state::{AppState, AudioOperationalState, AudioStatusSnapshot, ConnectionState};
+use crate::state::{
+    format_status_bar_channels, AppState, AudioOperationalState, AudioStatusSnapshot,
+    ConnectionState,
+};
 
 /// Retorna `(ícone, texto)` para o estado de conexão.
 ///
@@ -48,8 +51,12 @@ fn audio_status_text(audio: &AudioStatusSnapshot) -> String {
     if let Some(sample_rate_hz) = audio.sample_rate_hz {
         parts.push(format!("{:.1} kHz", sample_rate_hz as f32 / 1000.0));
     }
-    if let Some(channels) = audio.channels {
-        parts.push(format!("{channels} ch"));
+    if let (Some(source), Some(output)) = (audio.source_channels, audio.output_channels) {
+        parts.push(format_status_bar_channels(source, output));
+    } else if let Some(source) = audio.source_channels {
+        parts.push(format!("{source}ch"));
+    } else if let Some(output) = audio.output_channels.or(audio.channels) {
+        parts.push(format!("{output}ch"));
     }
 
     parts.push(format!("buf {:.0}%", audio.buffer_level * 100.0));
@@ -162,9 +169,10 @@ mod tests {
             pid: 0x0120,
             codec_label: "AAC (ADTS)".to_string(),
             language: Some("por".to_string()),
+            ..Default::default()
         });
         audio.sample_rate_hz = Some(48_000);
-        audio.channels = Some(2);
+        audio.set_channel_counts(2, 2);
         audio.buffer_level = 0.42;
 
         let text = audio_status_text(&audio);
@@ -172,8 +180,19 @@ mod tests {
         assert!(text.contains("AAC (ADTS) PID 288/0x0120"));
         assert!(text.contains("POR"));
         assert!(text.contains("48.0 kHz"));
-        assert!(text.contains("2 ch"));
+        assert!(text.contains("2ch"));
+        assert!(!text.contains("2 ch"));
         assert!(text.contains("buf 42%"));
+    }
+
+    #[test]
+    fn spec_ui_006_audio_status_text_downmix() {
+        let mut audio = AudioStatusSnapshot::default();
+        audio.state = AudioOperationalState::Playing;
+        audio.set_channel_counts(6, 2);
+
+        let text = audio_status_text(&audio);
+        assert!(text.contains("6ch > 2ch"));
     }
 
     #[test]

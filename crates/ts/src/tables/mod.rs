@@ -19,7 +19,10 @@ pub mod tot;
 
 pub use bat::{Bat, BatTransportStream};
 pub use cat::{Cat, CatCaDescriptor};
-pub use descriptor::{Descriptor, KnownDescriptor};
+pub use descriptor::{
+    aac_descriptor_profile_hint, ac3_descriptor_channel_hint, descriptor_aac_profile_hint,
+    descriptor_audio_channel_hint, Descriptor, KnownDescriptor,
+};
 pub use eit::{Eit, EitEvent};
 pub use nit::{Nit, NitTransportStream};
 pub use pat::{Pat, PatProgram};

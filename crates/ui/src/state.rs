@@ -69,17 +69,23 @@ pub enum AudioOperationalState {
 
 /// Metadados da trilha de áudio atualmente ativa.
 ///
-/// SPEC-UI-002
+/// SPEC-UI-002 · SPEC-UI-009
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AudioTrackInfo {
     /// Serviço DVB ao qual a trilha pertence.
     pub service_id: u16,
     /// PID elementar do áudio.
     pub pid: Pid,
+    /// `stream_type` da PMT (decimal), quando conhecido.
+    pub stream_type: Option<u8>,
     /// Nome legível do codec atual.
     pub codec_label: String,
     /// Idioma ISO-639 quando disponível.
     pub language: Option<String>,
+    /// Hint de canais do descriptor DVB (ex. AC-3 0x6A), antes do decode.
+    pub descriptor_channel_hint: Option<u16>,
+    /// Hint de perfil do descriptor DVB (ex. HE-AAC via 0x7C), antes do decode.
+    pub descriptor_profile_hint: Option<String>,
 }
 
 /// Snapshot dos contadores de erro observados pelo pipeline de áudio.
@@ -101,7 +107,7 @@ pub struct AudioErrorSnapshot {
 
 /// Snapshot imutável das métricas e estado operacional do áudio.
 ///
-/// SPEC-UI-002
+/// SPEC-UI-002 · SPEC-UI-009
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioStatusSnapshot {
     /// Volume atual normalizado em `[0.0, 1.0]`.
@@ -112,8 +118,18 @@ pub struct AudioStatusSnapshot {
     pub active_track: Option<AudioTrackInfo>,
     /// Taxa de amostragem efetiva da saída em Hz.
     pub sample_rate_hz: Option<u32>,
-    /// Número de canais efetivos da saída.
+    /// Canais do elementary stream (antes de downmix).
+    pub source_channels: Option<u16>,
+    /// Canais efetivos da saída WASAPI.
+    pub output_channels: Option<u16>,
+    /// Número de canais efetivos da saída (alias de `output_channels`).
     pub channels: Option<u16>,
+    /// Perfil do codec detectado pelo decoder (ex. `HE-AAC`).
+    pub codec_profile: Option<String>,
+    /// Bitrate codificado reportado pelo decoder, em kbps.
+    pub encoded_bitrate_kbps: Option<f64>,
+    /// Bitrate ao vivo do PID ativo (aggregator), em kbps.
+    pub stream_bitrate_kbps: Option<f64>,
     /// Nível atual do jitter buffer em `[0.0, 1.0]`.
     pub buffer_level: f32,
     /// Latência estimada entre callback de áudio e playback audível.
@@ -124,6 +140,28 @@ pub struct AudioStatusSnapshot {
     pub errors: AudioErrorSnapshot,
 }
 
+/// SPEC-UI-006b — texto compacto de canais para a status bar (`6ch > 2ch`).
+pub fn format_status_bar_channels(source: u16, output: u16) -> String {
+    if source != output {
+        format!("{source}ch > {output}ch")
+    } else {
+        format!("{source}ch")
+    }
+}
+
+/// SPEC-UI-009 — formata contagem de canais para o card (`6 ch`).
+pub fn format_card_channels(channels: u16) -> String {
+    format!("{channels} ch")
+}
+
+/// `true` quando o playback usa menos canais que o stream de origem.
+pub fn audio_downmix_active(source: Option<u16>, output: Option<u16>) -> bool {
+    match (source, output) {
+        (Some(src), Some(out)) => src != out,
+        _ => false,
+    }
+}
+
 impl Default for AudioStatusSnapshot {
     fn default() -> Self {
         Self {
@@ -131,7 +169,12 @@ impl Default for AudioStatusSnapshot {
             muted: false,
             active_track: None,
             sample_rate_hz: None,
+            source_channels: None,
+            output_channels: None,
             channels: None,
+            codec_profile: None,
+            encoded_bitrate_kbps: None,
+            stream_bitrate_kbps: None,
             buffer_level: 0.0,
             output_latency_ms: 0,
             state: AudioOperationalState::Idle,
@@ -147,11 +190,23 @@ impl AudioStatusSnapshot {
         self.muted = self.volume <= f32::EPSILON;
     }
 
+    /// Sincroniza canais de origem/saída e o alias legado `channels`.
+    pub fn set_channel_counts(&mut self, source: u16, output: u16) {
+        self.source_channels = Some(source);
+        self.output_channels = Some(output);
+        self.channels = Some(output);
+    }
+
     /// Limpa os dados transitórios do stream mantendo preferências do usuário.
     pub fn reset_stream_runtime(&mut self, state: AudioOperationalState) {
         self.active_track = None;
         self.sample_rate_hz = None;
+        self.source_channels = None;
+        self.output_channels = None;
         self.channels = None;
+        self.codec_profile = None;
+        self.encoded_bitrate_kbps = None;
+        self.stream_bitrate_kbps = None;
         self.buffer_level = 0.0;
         self.output_latency_ms = 0;
         self.state = state;
@@ -438,6 +493,20 @@ mod tests {
     }
 
     #[test]
+    fn spec_ui_002_format_status_bar_channels_downmix() {
+        assert_eq!(format_status_bar_channels(6, 2), "6ch > 2ch");
+        assert_eq!(format_status_bar_channels(2, 2), "2ch");
+        assert_eq!(format_card_channels(6), "6 ch");
+    }
+
+    #[test]
+    fn spec_ui_005_audio_card_channels_downmix_active() {
+        let mut audio = AudioStatusSnapshot::default();
+        audio.set_channel_counts(6, 2);
+        assert!(audio_downmix_active(audio.source_channels, audio.output_channels));
+    }
+
+    #[test]
     fn spec_ui_002_audio_status_snapshot_default_is_idle() {
         let audio = AudioStatusSnapshot::default();
         assert_eq!(audio.volume, 1.0);
@@ -568,6 +637,8 @@ mod tests {
             pid: 0x0112,
             codec_label: "AAC".to_owned(),
             language: Some("por".to_owned()),
+            stream_type: Some(0x11),
+            ..Default::default()
         });
         state.tables.pat = Some(Pat {
             transport_stream_id: 1,

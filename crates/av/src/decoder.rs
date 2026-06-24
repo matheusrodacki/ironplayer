@@ -513,10 +513,14 @@ impl FfmpegDecoder {
                             })?;
                             let (pts_raw, out_sr, out_ch, samples) =
                                 state.frame.to_pcm_f32(sr, ch)?;
+                            let stream_info = state.codec_ctx.audio_stream_info();
                             frames.push(DecodedFrame::Audio(AudioFrame::new(
                                 pid_raw,
                                 out_sr,
                                 out_ch,
+                                sr,
+                                ch,
+                                stream_info,
                                 resolve_audio_pts(pts_raw, None, pes.pts),
                                 samples,
                             )));
@@ -708,8 +712,16 @@ impl FfmpegDecoder {
                             let (pts_raw, out_sr, out_ch, samples) =
                                 state.frame.to_pcm_f32(sr, ch)?;
                             let pts = resolve_audio_pts(pts_raw, pkt_pts, pes.pts);
+                            let stream_info = state.codec_ctx.audio_stream_info();
                             Some(DecodedFrame::Audio(AudioFrame::new(
-                                pid_raw, out_sr, out_ch, pts, samples,
+                                pid_raw,
+                                out_sr,
+                                out_ch,
+                                sr,
+                                ch,
+                                stream_info,
+                                pts,
+                                samples,
                             )))
                         };
                         if let Some(f) = decoded {

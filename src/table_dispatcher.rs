@@ -10,7 +10,10 @@ use av::MediaCodec;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tracing::{trace, warn};
-use ts::tables::{Bat, Cat, Descriptor, Eit, Nit, Pat, Pmt, Sdt, Tdt, Tot};
+use ts::tables::{
+    descriptor_aac_profile_hint, descriptor_audio_channel_hint, Bat, Cat, Descriptor, Eit, Nit,
+    Pat, Pmt, Sdt, Tdt, Tot,
+};
 use ts::{CompleteSection, Pid};
 use ui::{AudioOperationalState, AudioStatusSnapshot, AudioTrackInfo, TableEvent};
 
@@ -533,13 +536,26 @@ impl TableDispatcher {
             audio_status.active_track = active_track;
             if audio_status.active_track.is_none() {
                 audio_status.sample_rate_hz = None;
+                audio_status.source_channels = None;
+                audio_status.output_channels = None;
                 audio_status.channels = None;
+                audio_status.codec_profile = None;
+                audio_status.encoded_bitrate_kbps = None;
+                audio_status.stream_bitrate_kbps = None;
                 audio_status.buffer_level = 0.0;
                 if !matches!(audio_status.state, AudioOperationalState::Recovering) {
                     audio_status.state = AudioOperationalState::Idle;
                 }
             } else if matches!(audio_status.state, AudioOperationalState::Idle) {
                 audio_status.state = AudioOperationalState::Buffering;
+                if let Some(track) = audio_status.active_track.clone() {
+                    if audio_status.source_channels.is_none() {
+                        audio_status.source_channels = track.descriptor_channel_hint;
+                    }
+                    if audio_status.codec_profile.is_none() {
+                        audio_status.codec_profile = track.descriptor_profile_hint;
+                    }
+                }
             }
         }
     }
@@ -692,6 +708,23 @@ fn first_audio_track_from_pmt(pmt: &Pmt) -> Option<AudioTrackInfo> {
     active_audio_track_from_pmt(pmt, None)
 }
 
+fn build_audio_track_info(
+    service_id: u16,
+    stream: &ts::tables::PmtStream,
+    audio_codec: &av::AudioCodec,
+) -> AudioTrackInfo {
+    AudioTrackInfo {
+        service_id,
+        pid: stream.elementary_pid,
+        stream_type: Some(stream.stream_type),
+        codec_label: audio_codec.name().to_string(),
+        language: audio_language(&stream.descriptors),
+        descriptor_channel_hint: descriptor_audio_channel_hint(&stream.descriptors),
+        descriptor_profile_hint: descriptor_aac_profile_hint(&stream.descriptors)
+            .map(str::to_string),
+    }
+}
+
 fn active_audio_track_from_pmt(
     pmt: &Pmt,
     selected_audio_pid: Option<Pid>,
@@ -708,12 +741,11 @@ fn active_audio_track_from_pmt(
             return None;
         };
 
-        Some(AudioTrackInfo {
-            service_id: pmt.program_number,
-            pid: stream.elementary_pid,
-            codec_label: audio_codec.name().to_string(),
-            language: audio_language(&stream.descriptors),
-        })
+        Some(build_audio_track_info(
+            pmt.program_number,
+            stream,
+            &audio_codec,
+        ))
     })
 }
 
@@ -727,12 +759,11 @@ fn audio_track_by_pid(pmt: &Pmt, pid: Pid) -> Option<AudioTrackInfo> {
             return None;
         };
 
-        Some(AudioTrackInfo {
-            service_id: pmt.program_number,
-            pid: stream.elementary_pid,
-            codec_label: audio_codec.name().to_string(),
-            language: audio_language(&stream.descriptors),
-        })
+        Some(build_audio_track_info(
+            pmt.program_number,
+            stream,
+            &audio_codec,
+        ))
     })
 }
 
@@ -975,6 +1006,7 @@ mod tests {
                 pid: 0x0101,
                 codec_label: "H.264".to_owned(),
                 language: None,
+                ..Default::default()
             });
         }
 
@@ -1820,6 +1852,8 @@ mod tests {
                 pid: 0x320,
                 codec_label: av::AudioCodec::AacLatm.name().to_string(),
                 language: Some("spa".to_string()),
+                stream_type: Some(0x06),
+                ..Default::default()
             })
         );
         assert_eq!(snapshot.state, AudioOperationalState::Buffering);
@@ -1905,6 +1939,8 @@ mod tests {
                 pid: 0x120,
                 codec_label: av::AudioCodec::Mp2.name().to_string(),
                 language: Some("por".to_string()),
+                stream_type: Some(0x03),
+                ..Default::default()
             })
         );
         assert_eq!(initial_snapshot.state, AudioOperationalState::Buffering);
@@ -1975,6 +2011,8 @@ mod tests {
                 pid: 0x121,
                 codec_label: av::AudioCodec::AacAdts.name().to_string(),
                 language: Some("eng".to_string()),
+                stream_type: Some(0x0F),
+                ..Default::default()
             })
         );
         assert_eq!(updated_snapshot.state, AudioOperationalState::Buffering);
@@ -2072,6 +2110,8 @@ mod tests {
                 pid: 0x121,
                 codec_label: av::AudioCodec::AacLatm.name().to_string(),
                 language: Some("eng".to_string()),
+                stream_type: Some(0x11),
+                ..Default::default()
             })
         );
         assert_eq!(snapshot.state, AudioOperationalState::Buffering);

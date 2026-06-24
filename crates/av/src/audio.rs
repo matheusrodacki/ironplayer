@@ -15,6 +15,17 @@ use crate::error::AvError;
 
 // ─── AudioFrame ──────────────────────────────────────────────────────────────
 
+/// Metadados técnicos do elementary stream de áudio (decoder/PMT).
+///
+/// SPEC-AV-006
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioStreamInfo {
+    /// Perfil detectado pelo decoder (ex.: `HE-AAC`, `AAC-LC`).
+    pub profile_label: Option<String>,
+    /// Bitrate codificado reportado pelo `AVCodecContext`, em bps.
+    pub encoded_bitrate_bps: Option<i64>,
+}
+
 /// Frame de áudio decodificado em PCM f32 interleaved.
 ///
 /// As amostras estão em formato interleaved: para 2 canais, a ordem é
@@ -25,10 +36,16 @@ use crate::error::AvError;
 pub struct AudioFrame {
     /// PID do elementary stream de origem.
     pub pid: Pid,
-    /// Taxa de amostragem em Hz (e.g. 48000, 44100).
+    /// Taxa de amostragem do PCM entregue ao `AudioOutput` (Hz).
     pub sample_rate: u32,
-    /// Número de canais (1 = mono, 2 = estéreo, …).
+    /// Número de canais do PCM entregue ao `AudioOutput`.
     pub channels: u16,
+    /// Taxa de amostragem do stream antes de downmix/conversão.
+    pub source_sample_rate: u32,
+    /// Número de canais do stream antes de downmix/conversão.
+    pub source_channels: u16,
+    /// Metadados técnicos do codec (perfil, bitrate codificado).
+    pub stream_info: AudioStreamInfo,
     /// Presentation Timestamp em unidades de 90 kHz.
     pub pts: Option<u64>,
     /// Amostras PCM f32 interleaved: `samples.len() == frames * channels`.
@@ -38,11 +55,18 @@ pub struct AudioFrame {
 impl AudioFrame {
     /// Cria um `AudioFrame` a partir de amostras PCM f32 interleaved.
     ///
-    /// SPEC-AV-004
+    /// `channels`/`sample_rate` descrevem o PCM de saída; `source_*` o stream
+    /// decodificado antes de downmix.
+    ///
+    /// SPEC-AV-004 · SPEC-AV-006
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pid: Pid,
         sample_rate: u32,
         channels: u16,
+        source_sample_rate: u32,
+        source_channels: u16,
+        stream_info: AudioStreamInfo,
         pts: Option<u64>,
         samples: Vec<f32>,
     ) -> Self {
@@ -50,6 +74,9 @@ impl AudioFrame {
             pid,
             sample_rate,
             channels,
+            source_sample_rate,
+            source_channels,
+            stream_info,
             pts,
             samples,
         }
@@ -613,6 +640,24 @@ mod tests {
     use super::*;
 
     // ── AudioRingBuffer ──────────────────────────────────────────────────────
+
+    /// SPEC-AV-004
+    #[test]
+    fn spec_av_002_source_channels_preserved_in_audio_frame() {
+        let frame = AudioFrame::new(
+            0x0115,
+            48_000,
+            2,
+            48_000,
+            6,
+            AudioStreamInfo::default(),
+            Some(90_000),
+            vec![0.0; 4],
+        );
+        assert_eq!(frame.source_channels, 6);
+        assert_eq!(frame.channels, 2);
+        assert_eq!(frame.frame_count(), 2);
+    }
 
     /// Push/pop básico: o que entra deve sair na mesma ordem (FIFO).
     ///

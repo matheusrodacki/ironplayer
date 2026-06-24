@@ -108,6 +108,11 @@ pub(crate) const AV_COL_RANGE_JPEG: i32 = 2;
 /// portanto o ponteiro `AVBufferRef*` imediatamente anterior fica em +560.
 pub(crate) const AV_CTX_HW_DEVICE_CTX_OFFSET: usize = 560;
 
+// AVCodecContext — FFmpeg 8.x x86-64 (campos deprecated incluídos).
+pub(crate) const AVCTX_CODEC_ID_OFFSET: usize = 24;
+pub(crate) const AVCTX_BIT_RATE_OFFSET: usize = 104;
+pub(crate) const AVCTX_PROFILE_OFFSET: usize = 192;
+
 // ─── Tipos opacos FFmpeg ──────────────────────────────────────────────────────
 
 /// Tipo opaco para `AVCodec*`.
@@ -302,6 +307,30 @@ pub(crate) unsafe fn frame_channel_count(frame: *mut c_void) -> c_int {
     *((frame as *const u8).add(388) as *const c_int)
 }
 
+/// Lê `codec_id` de um `AVCodecContext*` opaco.
+///
+/// SAFETY: `ctx` deve ser um ponteiro válido para `AVCodecContext` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn ctx_codec_id(ctx: *mut AvCodecContext) -> u32 {
+    *((ctx as *const u8).add(AVCTX_CODEC_ID_OFFSET) as *const u32)
+}
+
+/// Lê `bit_rate` de um `AVCodecContext*` opaco.
+///
+/// SAFETY: `ctx` deve ser um ponteiro válido para `AVCodecContext` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn ctx_bit_rate(ctx: *mut AvCodecContext) -> i64 {
+    *((ctx as *const u8).add(AVCTX_BIT_RATE_OFFSET) as *const i64)
+}
+
+/// Lê `profile` de um `AVCodecContext*` opaco.
+///
+/// SAFETY: `ctx` deve ser um ponteiro válido para `AVCodecContext` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn ctx_profile(ctx: *mut AvCodecContext) -> i32 {
+    *((ctx as *const u8).add(AVCTX_PROFILE_OFFSET) as *const i32)
+}
+
 /// Lê `color_range` de um `AVFrame*` opaco (offset 280).
 ///
 /// Valores: `0` = não especificado, `1` = MPEG/TV range (16..235),
@@ -372,6 +401,8 @@ type FnAvcodecSendPacket =
     unsafe extern "C" fn(avctx: *mut AvCodecContext, avpkt: *const AvPacket) -> c_int;
 type FnAvcodecReceiveFrame =
     unsafe extern "C" fn(avctx: *mut AvCodecContext, frame: *mut c_void) -> c_int;
+type FnAvcodecProfileName =
+    unsafe extern "C" fn(codec_id: u32, profile: i32) -> *const i8;
 
 type FnAvPacketAlloc = unsafe extern "C" fn() -> *mut AvPacket;
 type FnAvPacketFree = unsafe extern "C" fn(pkt: *mut *mut AvPacket);
@@ -497,6 +528,7 @@ pub struct FfmpegLib {
     pub(crate) avcodec_open2: FnAvcodecOpen2,
     pub(crate) avcodec_send_packet: FnAvcodecSendPacket,
     pub(crate) avcodec_receive_frame: FnAvcodecReceiveFrame,
+    pub(crate) avcodec_profile_name: FnAvcodecProfileName,
 
     // Parser de bitstream (av_parser_*)
     pub(crate) av_parser_init: FnAvParserInit,
@@ -605,6 +637,8 @@ impl FfmpegLib {
         let avcodec_send_packet = sym!(avcodec, b"avcodec_send_packet\0", FnAvcodecSendPacket);
         let avcodec_receive_frame =
             sym!(avcodec, b"avcodec_receive_frame\0", FnAvcodecReceiveFrame);
+        let avcodec_profile_name =
+            sym!(avcodec, b"avcodec_profile_name\0", FnAvcodecProfileName);
 
         let av_parser_init = sym!(avcodec, b"av_parser_init\0", FnAvParserInit);
         let av_parser_parse2 = sym!(avcodec, b"av_parser_parse2\0", FnAvParserParse2);
@@ -660,6 +694,7 @@ impl FfmpegLib {
             avcodec_open2,
             avcodec_send_packet,
             avcodec_receive_frame,
+            avcodec_profile_name,
             av_parser_init,
             av_parser_parse2,
             av_parser_close,
@@ -1041,6 +1076,41 @@ impl FfmpegCodecContext {
     #[inline]
     pub(crate) fn as_ptr(&self) -> *mut AvCodecContext {
         self.ctx
+    }
+
+    /// Lê metadados técnicos do stream de áudio aberto neste contexto.
+    ///
+    /// SPEC-AV-006
+    pub(crate) fn audio_stream_info(&self) -> crate::audio::AudioStreamInfo {
+        use std::ffi::CStr;
+
+        let (codec_id, profile, bit_rate) = unsafe {
+            (
+                ctx_codec_id(self.ctx),
+                ctx_profile(self.ctx),
+                ctx_bit_rate(self.ctx),
+            )
+        };
+
+        let profile_label = {
+            let name_ptr = unsafe { (self.lib.avcodec_profile_name)(codec_id, profile) };
+            if name_ptr.is_null() {
+                None
+            } else {
+                unsafe { CStr::from_ptr(name_ptr) }
+                    .to_str()
+                    .ok()
+                    .filter(|name| !name.is_empty())
+                    .map(|s| s.to_string())
+            }
+        };
+
+        let encoded_bitrate_bps = if bit_rate > 0 { Some(bit_rate) } else { None };
+
+        crate::audio::AudioStreamInfo {
+            profile_label,
+            encoded_bitrate_bps,
+        }
     }
 
     /// Recebe um frame decodificado do contexto.
@@ -2403,6 +2473,24 @@ mod tests {
 
         assert_eq!(sample_rate, 48_000);
         assert_eq!(channels, 2);
+    }
+
+    /// SPEC-AV-006 — offsets do `AVCodecContext` para FFmpeg 8.x x86-64.
+    #[test]
+    fn spec_av_006_codec_context_audio_metadata_offsets() {
+        let mut ctx = vec![0u8; 256];
+        ctx[AVCTX_CODEC_ID_OFFSET..AVCTX_CODEC_ID_OFFSET + 4]
+            .copy_from_slice(&AV_CODEC_ID_AC3.to_ne_bytes());
+        ctx[AVCTX_BIT_RATE_OFFSET..AVCTX_BIT_RATE_OFFSET + 8]
+            .copy_from_slice(&384_000i64.to_ne_bytes());
+        ctx[AVCTX_PROFILE_OFFSET..AVCTX_PROFILE_OFFSET + 4].copy_from_slice(&1i32.to_ne_bytes());
+
+        let ctx_ptr = ctx.as_mut_ptr().cast::<AvCodecContext>();
+        unsafe {
+            assert_eq!(ctx_codec_id(ctx_ptr), AV_CODEC_ID_AC3);
+            assert_eq!(ctx_bit_rate(ctx_ptr), 384_000);
+            assert_eq!(ctx_profile(ctx_ptr), 1);
+        }
     }
 
     /// SPEC-AV-002b: constantes de codec ID devem corresponder aos valores

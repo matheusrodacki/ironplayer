@@ -371,6 +371,72 @@ impl Descriptor {
     }
 }
 
+/// Hint de contagem de canais do AC-3 descriptor DVB (tag `0x6A`).
+///
+/// SPEC-TABLE-009
+pub fn ac3_descriptor_channel_hint(data: &[u8]) -> Option<u16> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let component_type = data[0];
+    let mode = (component_type >> 6) & 0x03;
+    match mode {
+        0b00 => Some(1),
+        0b01 | 0b10 => Some(2),
+        0b11 => {
+            let ch_code = component_type & 0x07;
+            Some(match ch_code {
+                0 => 2,
+                1 => 3,
+                2 => 4,
+                3 => 5,
+                4 | 7 => 6,
+                5 => 7,
+                6 => 8,
+                _ => 6,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Hint de perfil AAC/HE-AAC do descriptor DVB (tag `0x7C`).
+///
+/// SPEC-TABLE-009
+pub fn aac_descriptor_profile_hint(data: &[u8]) -> Option<&'static str> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let profile = (data[0] >> 5) & 0x03;
+    match profile {
+        1 => Some("HE-AAC"),
+        2 => Some("HE-AAC v2"),
+        _ => None,
+    }
+}
+
+/// Procura hint de canais em descriptors de áudio conhecidos.
+///
+/// SPEC-TABLE-009
+pub fn descriptor_audio_channel_hint(descriptors: &[Descriptor]) -> Option<u16> {
+    descriptors
+        .iter()
+        .find(|descriptor| descriptor.tag == 0x6A)
+        .and_then(|descriptor| ac3_descriptor_channel_hint(&descriptor.data))
+}
+
+/// Procura hint de perfil AAC em descriptors conhecidos.
+///
+/// SPEC-TABLE-009
+pub fn descriptor_aac_profile_hint(descriptors: &[Descriptor]) -> Option<&'static str> {
+    descriptors
+        .iter()
+        .find(|descriptor| descriptor.tag == 0x7C)
+        .and_then(|descriptor| aac_descriptor_profile_hint(&descriptor.data))
+}
+
 // ── Helpers BCD ───────────────────────────────────────────────────────────────
 
 /// Converte um valor BCD empacotado em 32 bits para `u64` decimal.
@@ -600,6 +666,25 @@ mod tests {
     fn bcd32_known_value() {
         // 0x00000123 em BCD: nibbles 3,2,1,0,0,0,0,0 → 3*1 + 2*10 + 1*100 = 123
         assert_eq!(super::bcd32_to_u64(0x00000123), 123);
+    }
+
+    // ── AC-3 / AAC descriptors (SPEC-TABLE-009) ────────────────────────────
+
+    #[test]
+    fn spec_table_009_ac3_descriptor_channel_hint_multichannel() {
+        // component_type: mode=11 (multichannel), ch_code=100 (6 ch)
+        assert_eq!(ac3_descriptor_channel_hint(&[0xC4]), Some(6));
+    }
+
+    #[test]
+    fn spec_table_009_ac3_descriptor_channel_hint_stereo() {
+        assert_eq!(ac3_descriptor_channel_hint(&[0x40]), Some(2));
+    }
+
+    #[test]
+    fn spec_table_009_aac_descriptor_profile_hint_he_aac() {
+        // profile bits 01 at positions 6-5 => 0x20
+        assert_eq!(aac_descriptor_profile_hint(&[0x20]), Some("HE-AAC"));
     }
 
     // ── CableDelivery (0x44) ─────────────────────────────────────────────────

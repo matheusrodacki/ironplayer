@@ -8,7 +8,9 @@ use crossbeam_channel::Sender;
 use eframe::egui;
 use egui_plot::{Corner, Line, Plot, PlotPoints};
 
-use crate::state::{AppState, AudioOperationalState, HwAccelChoice};
+use crate::state::{
+    audio_downmix_active, format_card_channels, AppState, AudioOperationalState, HwAccelChoice,
+};
 use crate::AppCommand;
 
 // ---------------------------------------------------------------------------
@@ -374,6 +376,16 @@ impl MetricsPanel {
 
     fn show_audio_summary(&self, ui: &mut egui::Ui, state: &AppState) {
         let audio = &state.audio;
+        let stream_bitrate_kbps = audio.active_track.as_ref().and_then(|track| {
+            state
+                .metrics
+                .pid_table
+                .iter()
+                .find(|entry| entry.pid == track.pid)
+                .map(|entry| entry.bitrate_kbps)
+                .filter(|kbps| *kbps > 0.0)
+        });
+
         ui.label("Áudio");
         egui::Grid::new("audio_summary_grid")
             .num_columns(2)
@@ -391,12 +403,32 @@ impl MetricsPanel {
                 });
                 ui.end_row();
 
-                ui.label("Trilha ativa");
+                ui.label("Codec");
                 ui.label(
                     audio
                         .active_track
                         .as_ref()
                         .map(|track| track.codec_label.clone())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.end_row();
+
+                ui.label("Codec ID");
+                ui.label(
+                    audio
+                        .active_track
+                        .as_ref()
+                        .and_then(|track| track.stream_type)
+                        .map(|stream_type| format!("{stream_type} (0x{stream_type:02X})"))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                ui.end_row();
+
+                ui.label("Perfil");
+                ui.label(
+                    audio
+                        .codec_profile
+                        .clone()
                         .unwrap_or_else(|| "-".to_string()),
                 );
                 ui.end_row();
@@ -430,13 +462,41 @@ impl MetricsPanel {
                 );
                 ui.end_row();
 
-                ui.label("Canais");
+                ui.label("Canais (stream)");
                 ui.label(
                     audio
-                        .channels
-                        .map(|channels| channels.to_string())
+                        .source_channels
+                        .map(format_card_channels)
                         .unwrap_or_else(|| "-".to_string()),
                 );
+                ui.end_row();
+
+                if audio_downmix_active(audio.source_channels, audio.output_channels) {
+                    ui.label("Playback");
+                    ui.label(
+                        audio
+                            .output_channels
+                            .map(format_card_channels)
+                            .unwrap_or_else(|| "-".to_string()),
+                    );
+                    ui.end_row();
+                }
+
+                ui.label("Bitrate");
+                ui.label(match (audio.encoded_bitrate_kbps, stream_bitrate_kbps) {
+                    (Some(encoded), Some(live)) => format!("{live:.0} kbps (cod. {encoded:.0} kbps)"),
+                    (None, Some(live)) => format!("{live:.0} kbps"),
+                    (Some(encoded), None) => format!("{encoded:.0} kbps (cod.)"),
+                    (None, None) => "-".to_string(),
+                });
+                ui.end_row();
+
+                ui.label("Latência saída");
+                ui.label(if audio.output_latency_ms > 0 {
+                    format!("{} ms", audio.output_latency_ms)
+                } else {
+                    "-".to_string()
+                });
                 ui.end_row();
 
                 ui.label("Erros");

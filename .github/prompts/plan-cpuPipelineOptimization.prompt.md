@@ -71,6 +71,12 @@ Não fazer deinterlace no shader (qualidade inaceitável para conteúdo broadcas
 
 _Toca em_: `crates/av/src/deinterlace.rs` (novo), [crates/av/src/decoder.rs](crates/av/src/decoder.rs).
 
+**Invariantes pós-implementação (L-003, não regredir):**
+
+- Buffer source do grafo: incluir `colorspace` e `range` do frame de entrada (evita reconfiguração do link e perda de contexto temporal do bwdif).
+- PTS de saída: dividir por 2 via `rescale_bwdif_output_pts` — o filtro dobra o tick count; sem isso a `VideoQueue` retém todos os frames (`TooEarly` vs `AudioClock` 90 kHz).
+- Teste de regressão: `cargo test -p av spec_av_005_bwdif_output_pts_halved`.
+
 ### Fase 5 — Métricas de pipeline _(depende das Fases 1+2)_
 
 Expor em `crates/ts/src/metrics.rs` e no painel UI:

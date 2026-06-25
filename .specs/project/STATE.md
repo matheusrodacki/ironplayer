@@ -89,6 +89,25 @@ Deslocar `anchor_pts` adianta o relógio sem adiantar o áudio no DAC. A UI comp
 
 Refs: `crates/ui/src/lib.rs` (`poll_video_frames`), `crates/av/src/video_queue.rs`, `crates/av/src/clock.rs`, `.specs/features/spec-08-av-sync/tdd-sprint-01-av-sync.md` §4.1.
 
+### L-003 — Deinterlace bwdif: colorspace do grafo e PTS 2× (2026-06-25)
+
+Sessão de debug em stream multicast H.264 1080i MBAFF (Globo/SKY, `udp://@239.0.0.1:1234`). Sintomas e **invariantes que não podem regredir**:
+
+| Sintoma | Causa raiz | Invariante obrigatória |
+| ------- | ---------- | ---------------------- |
+| Vídeo congela no 1º frame com deinterlace ativo; log FFmpeg `Changing video frame properties on the fly` (csp/range) | Filtro `buffer` criado sem `colorspace`/`range`; frames decodificados chegam `bt709/tv` | `FfmpegFilterGraph::new_bwdif` declara `colorspace` e `range` no buffer source; chave de recriação do grafo inclui ambos (`deinterlace.rs`) |
+| Vídeo congela no 1º frame; métricas `early_frames_held` ↑, `av_sync_offset_ms` ~12,8M; pop `TOO_EARLY_no_resync` | bwdif/yadif divide `time_base` de saída por 2 → PTS bruto 2× maior que 90 kHz; `VideoQueue` vs `AudioClock` nunca alinha | Após `av_buffersink_get_frame`, aplicar `rescale_bwdif_output_pts` (÷2). Teste: `spec_av_005_bwdif_output_pts_halved_to_90khz` |
+| Caminho HW ok, SW+deinterlace travado | HW não passa pelo bwdif; só streams que migram para SW (1080i) sofrem | Não remover rescale PTS ao otimizar filtro; validar 1080i interlaced após mudanças em `ffi/mod.rs` ou `deinterlace.rs` |
+
+**Checklist rápido em regressão deinterlace:**
+
+1. Painel: `Deinterlace (bwdif) Ativo`, `Scan type Interlaced`, vídeo **fluindo** (não só 1º frame).
+2. `early_frames_held` estável/baixo; `av_sync_offset_ms` na ordem de dezenas de ms, não milhões.
+3. Log FFmpeg sem `Changing video frame properties on the fly` repetido por frame.
+4. Comparar PTS vídeo ÷ 2 com clock áudio se suspeitar de rescale ausente (`frame_pts` pós-bwdif).
+
+Refs: `crates/av/src/deinterlace.rs`, `crates/av/src/ffi/mod.rs` (`new_bwdif`, `rescale_bwdif_output_pts`, `FfmpegFilterGraph::process`), `crates/av/src/video_queue.rs` (`pop_ready_with_resync`).
+
 ---
 
 ## Pendências

@@ -280,6 +280,33 @@ pub(crate) unsafe fn frame_pts(frame: *mut c_void) -> i64 {
     *((frame as *const u8).add(136) as *const i64)
 }
 
+/// Escreve `pts` em um `AVFrame*` opaco (offset 136).
+///
+/// Usado para reescalar o PTS de saída do bwdif, cujo `time_base` de saída é
+/// metade do de entrada (ver `rescale_bwdif_output_pts`).
+///
+/// SAFETY: `frame` deve ser um ponteiro válido e mutável para `AVFrame`.
+#[inline]
+pub(crate) unsafe fn frame_set_pts(frame: *mut c_void, pts: i64) {
+    *((frame as *mut u8).add(136) as *mut i64) = pts;
+}
+
+/// Reescala PTS bruto de saída do bwdif para a escala 90 kHz do pipeline MPEG-TS.
+///
+/// O filtro bwdif/yadif divide o `time_base` de saída por 2 (de `1/90000` para
+/// `1/180000`), dobrando o tick count. O IronPlayer compara vídeo com o
+/// `AudioClock` em 90 kHz — sem esta divisão, todo frame fica `TooEarly`.
+///
+/// SPEC-AV-005
+#[inline]
+pub(crate) fn rescale_bwdif_output_pts(raw_pts: i64) -> Option<i64> {
+    if raw_pts == i64::MIN {
+        None
+    } else {
+        Some(raw_pts / 2)
+    }
+}
+
 /// Lê `sample_aspect_ratio` de um `AVFrame*` opaco (offset 128).
 ///
 /// Retorna `(num, den)`.  Quando `den == 0` ou `num <= 0`, o SAR não está
@@ -2221,12 +2248,15 @@ impl FfmpegFilterGraph {
     /// `deint_all`: quando `true`, usa `deint=all` (força em todos os frames).
     ///
     /// SPEC-AV-005
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_bwdif(
         filter_lib: Arc<FilterLib>,
         ffmpeg_lib: Arc<FfmpegLib>,
         width: u32,
         height: u32,
         pix_fmt: c_int,
+        colorspace: i32,
+        color_range: i32,
         deint_all: bool,
     ) -> Result<Self, AvError> {
         // SAFETY: avfilter_graph_alloc usa av_malloc internamente.
@@ -2247,10 +2277,13 @@ impl FfmpegFilterGraph {
             });
         }
 
-        // Formato: "video_size=WxH:pix_fmt=N:time_base=1/90000:pixel_aspect=0/1"
+        // Declara colorspace/range no buffer source para casar com os frames de
+        // entrada. Sem isso, libavfilter detecta "changing properties on the fly"
+        // a cada frame e reconfigura o grafo, zerando o contexto temporal do bwdif
+        // (que então fica preso em EAGAIN e nunca emite frames). SPEC-AV-005.
         let src_args = CString::new(format!(
-            "video_size={}x{}:pix_fmt={}:time_base=1/90000:pixel_aspect=0/1",
-            width, height, pix_fmt
+            "video_size={width}x{height}:pix_fmt={pix_fmt}:time_base=1/90000:\
+             pixel_aspect=0/1:colorspace={colorspace}:range={color_range}"
         ))
         .map_err(|_| AvError::Other(anyhow::anyhow!("CString inválida para buffer args")))?;
 
@@ -2404,6 +2437,13 @@ impl FfmpegFilterGraph {
             unsafe { (self.filter_lib.av_buffersink_get_frame)(self.sink_ctx, output.as_ptr()) };
 
         if ret == 0 {
+            // Ver `rescale_bwdif_output_pts` — não remover sem revalidar A/V sync.
+            // SAFETY: output.as_ptr() é um AVFrame válido recém-preenchido.
+            unsafe {
+                if let Some(pts) = rescale_bwdif_output_pts(frame_pts(output.as_ptr())) {
+                    frame_set_pts(output.as_ptr(), pts);
+                }
+            }
             Ok(Some(output))
         } else if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
             // bwdif precisa de mais contexto temporal; frame de entrada ignorado.
@@ -2590,5 +2630,16 @@ mod tests {
             "esperava Ok após encontrar DLLs em {}: {err_str}",
             dir.display()
         );
+    }
+
+    /// SPEC-AV-005: PTS de saída do bwdif deve ser dividido por 2 para 90 kHz.
+    ///
+    /// Evidência de regressão (sessão 93d177): PTS bruto `2317107750` vs clock
+    /// áudio `1158552057` → diff ~12,8M ms e `TOO_EARLY_no_resync` permanente.
+    #[test]
+    fn spec_av_005_bwdif_output_pts_halved_to_90khz() {
+        assert_eq!(rescale_bwdif_output_pts(2_317_107_750), Some(1_158_553_875));
+        assert_eq!(rescale_bwdif_output_pts(i64::MIN), None);
+        assert_eq!(rescale_bwdif_output_pts(-4), Some(-2));
     }
 }

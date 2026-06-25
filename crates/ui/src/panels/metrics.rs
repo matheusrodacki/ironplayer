@@ -506,7 +506,9 @@ impl MetricsPanel {
 
                 ui.label("Bitrate");
                 ui.label(match (audio.encoded_bitrate_kbps, stream_bitrate_kbps) {
-                    (Some(encoded), Some(live)) => format!("{live:.0} kbps (cod. {encoded:.0} kbps)"),
+                    (Some(encoded), Some(live)) => {
+                        format!("{live:.0} kbps (cod. {encoded:.0} kbps)")
+                    }
                     (None, Some(live)) => format!("{live:.0} kbps"),
                     (Some(encoded), None) => format!("{encoded:.0} kbps (cod.)"),
                     (None, None) => "-".to_string(),

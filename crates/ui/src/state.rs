@@ -8,6 +8,8 @@ use std::time::Instant;
 
 use ts::metrics::{MetricsSnapshot, PcrJitterRecord};
 use ts::tables::{Bat, Cat, EitEvent, Nit, Pat, Pmt, Sdt, Tdt, Tot};
+use ts::MediaInfoCodecSnapshot;
+use ts::MediaInfoTablesCtx;
 use ts::Pid;
 
 // ---------------------------------------------------------------------------
@@ -305,6 +307,14 @@ pub struct AppState {
     pub metrics: MetricsSnapshot,
     pub audio: AudioStatusSnapshot,
     pub tables: TablesSnapshot,
+    /// Snapshot de codec probe Media Info por PID.
+    ///
+    /// SPEC-MI-003
+    pub media_info: MediaInfoCodecSnapshot,
+    /// Campos derivados de NIT/TOT para bloco General.
+    ///
+    /// SPEC-MI-005
+    pub media_info_tables_ctx: MediaInfoTablesCtx,
     pub selected_pid: Option<Pid>,
     pub selected_service: Option<u16>,
     /// Histórico de bitrate total dos últimos 60 s.
@@ -324,6 +334,8 @@ impl AppState {
     pub(crate) fn reset_stream_data(&mut self) {
         self.metrics = MetricsSnapshot::default();
         self.tables = TablesSnapshot::default();
+        self.media_info = MediaInfoCodecSnapshot::default();
+        self.media_info_tables_ctx = MediaInfoTablesCtx::default();
         self.selected_pid = None;
         self.selected_service = None;
         self.bitrate_history.clear();
@@ -342,7 +354,21 @@ impl AppState {
             TableEvent::Pmt(pmt) => {
                 self.tables.pmts.insert(pmt.program_number, pmt);
             }
-            TableEvent::Nit(nit) => self.tables.nit = Some(nit),
+            TableEvent::Nit(nit) => {
+                crate::panels::mediainfo::update_media_info_tables_ctx(
+                    &mut self.media_info_tables_ctx,
+                    &nit.network_descriptors,
+                    &[],
+                );
+                for ts in &nit.transport_streams {
+                    crate::panels::mediainfo::update_media_info_tables_ctx(
+                        &mut self.media_info_tables_ctx,
+                        &ts.descriptors,
+                        &[],
+                    );
+                }
+                self.tables.nit = Some(nit);
+            }
             // Aceita apenas SDT actual (table_id 0x42); SDT other (0x46) descreve
             // serviços de outros transport streams e não deve sobrescrever os dados locais.
             // O SDT pode ter múltiplas seções (last_section_number > 0); seções da mesma
@@ -370,7 +396,14 @@ impl AppState {
                 self.tables.eit_pf.insert(service_id, (current, next));
             }
             TableEvent::Tdt(tdt) => self.tables.tdt = Some(tdt),
-            TableEvent::Tot(tot) => self.tables.tot = Some(tot),
+            TableEvent::Tot(tot) => {
+                crate::panels::mediainfo::update_media_info_tables_ctx(
+                    &mut self.media_info_tables_ctx,
+                    &[],
+                    &tot.descriptors,
+                );
+                self.tables.tot = Some(tot);
+            }
             TableEvent::Bat(bat) => self.tables.bat = Some(bat),
             TableEvent::Cat(cat) => self.tables.cat = Some(cat),
         }
@@ -503,7 +536,10 @@ mod tests {
     fn spec_ui_005_audio_card_channels_downmix_active() {
         let mut audio = AudioStatusSnapshot::default();
         audio.set_channel_counts(6, 2);
-        assert!(audio_downmix_active(audio.source_channels, audio.output_channels));
+        assert!(audio_downmix_active(
+            audio.source_channels,
+            audio.output_channels
+        ));
     }
 
     #[test]

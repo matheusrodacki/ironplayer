@@ -150,6 +150,10 @@ pub struct IronPlayerApp {
     ///
     /// Preenchido via `set_audio_clock_rx` após `new()`.
     audio_clock_rx: Option<Arc<std::sync::RwLock<Option<av::AudioClockHandle>>>>,
+    /// Snapshot de codec probe Media Info por PID.
+    ///
+    /// SPEC-MI-003
+    media_info_rx: Option<Arc<std::sync::RwLock<ts::MediaInfoCodecSnapshot>>>,
 }
 
 impl IronPlayerApp {
@@ -219,6 +223,7 @@ impl IronPlayerApp {
             audio_clock_rx: None,
             seen_pcr_jitter_records: 0,
             pipeline_metrics_rx: None,
+            media_info_rx: None,
         }
     }
 
@@ -245,6 +250,13 @@ impl IronPlayerApp {
     /// Deve ser chamado logo após `new()`, antes do primeiro `update()`.
     pub fn set_audio_clock_rx(&mut self, rx: Arc<std::sync::RwLock<Option<av::AudioClockHandle>>>) {
         self.audio_clock_rx = Some(rx);
+    }
+
+    /// Associa o snapshot compartilhado de Media Info probe.
+    ///
+    /// SPEC-MI-003
+    pub fn set_media_info_rx(&mut self, rx: Arc<std::sync::RwLock<ts::MediaInfoCodecSnapshot>>) {
+        self.media_info_rx = Some(rx);
     }
 
     pub fn set_hwaccel_choice(&mut self, choice: HwAccelChoice) {
@@ -564,6 +576,17 @@ impl IronPlayerApp {
         }
     }
 
+    /// Copia snapshot de codec probe da thread `media-probe`.
+    ///
+    /// SPEC-MI-003
+    fn poll_media_info(&mut self) {
+        if let Some(rx) = &self.media_info_rx {
+            if let Ok(snapshot) = rx.read() {
+                self.state.media_info = snapshot.clone();
+            }
+        }
+    }
+
     fn handle_device_removed(&mut self, _ctx: &egui::Context, error: &av::AvError) {
         if let Some(rx) = &self.video_frames_rx {
             while rx.try_recv().is_ok() {}
@@ -654,6 +677,7 @@ impl eframe::App for IronPlayerApp {
         self.poll_snapshot();
         self.poll_table_events();
         self.poll_pipeline_metrics();
+        self.poll_media_info();
         self.poll_video_frames(ctx);
 
         // eframe é reactive por padrão. Para vídeo em tempo real, pedimos

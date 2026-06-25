@@ -13,11 +13,11 @@
 #[cfg(windows)]
 mod d3d11_impl;
 #[cfg(windows)]
+pub(crate) use d3d11_impl::com_addref;
+#[cfg(windows)]
 pub use d3d11_impl::{
     AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwPixelFormat, NvPlanes, TransferFunction,
 };
-#[cfg(windows)]
-pub(crate) use d3d11_impl::com_addref;
 
 #[cfg(not(windows))]
 mod stub;

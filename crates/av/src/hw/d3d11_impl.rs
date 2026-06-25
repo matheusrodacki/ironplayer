@@ -266,8 +266,7 @@ pub(crate) unsafe fn com_addref(ptr: *mut std::ffi::c_void) {
     if ptr.is_null() {
         return;
     }
-    let borrowed =
-        std::mem::ManuallyDrop::new(windows::core::IUnknown::from_raw(ptr as *mut _));
+    let borrowed = std::mem::ManuallyDrop::new(windows::core::IUnknown::from_raw(ptr as *mut _));
     let _ = borrowed.clone();
 }
 

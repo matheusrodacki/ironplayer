@@ -433,8 +433,7 @@ type FnAvcodecSendPacket =
     unsafe extern "C" fn(avctx: *mut AvCodecContext, avpkt: *const AvPacket) -> c_int;
 type FnAvcodecReceiveFrame =
     unsafe extern "C" fn(avctx: *mut AvCodecContext, frame: *mut c_void) -> c_int;
-type FnAvcodecProfileName =
-    unsafe extern "C" fn(codec_id: u32, profile: i32) -> *const i8;
+type FnAvcodecProfileName = unsafe extern "C" fn(codec_id: u32, profile: i32) -> *const i8;
 
 type FnAvPacketAlloc = unsafe extern "C" fn() -> *mut AvPacket;
 type FnAvPacketFree = unsafe extern "C" fn(pkt: *mut *mut AvPacket);
@@ -669,8 +668,7 @@ impl FfmpegLib {
         let avcodec_send_packet = sym!(avcodec, b"avcodec_send_packet\0", FnAvcodecSendPacket);
         let avcodec_receive_frame =
             sym!(avcodec, b"avcodec_receive_frame\0", FnAvcodecReceiveFrame);
-        let avcodec_profile_name =
-            sym!(avcodec, b"avcodec_profile_name\0", FnAvcodecProfileName);
+        let avcodec_profile_name = sym!(avcodec, b"avcodec_profile_name\0", FnAvcodecProfileName);
 
         let av_parser_init = sym!(avcodec, b"av_parser_init\0", FnAvParserInit);
         let av_parser_parse2 = sym!(avcodec, b"av_parser_parse2\0", FnAvParserParse2);
@@ -705,8 +703,7 @@ impl FfmpegLib {
 
         let av_hwdevice_ctx_create =
             sym!(avutil, b"av_hwdevice_ctx_create\0", FnAvHwdeviceCtxCreate);
-        let av_hwdevice_ctx_alloc =
-            sym!(avutil, b"av_hwdevice_ctx_alloc\0", FnAvHwdeviceCtxAlloc);
+        let av_hwdevice_ctx_alloc = sym!(avutil, b"av_hwdevice_ctx_alloc\0", FnAvHwdeviceCtxAlloc);
         let av_hwdevice_ctx_init = sym!(avutil, b"av_hwdevice_ctx_init\0", FnAvHwdeviceCtxInit);
         let av_hwframe_transfer_data = sym!(
             avutil,
@@ -799,8 +796,8 @@ unsafe fn create_d3d11_hw_device_ctx(
     }
 
     let hw_dev = buffer_ref_data(hw_buf) as *mut c_void;
-    let d3d11_va_ctx = *((hw_dev as *const u8).add(AV_HWDEVICE_CTX_HWCTX_OFFSET)
-        as *const *mut c_void);
+    let d3d11_va_ctx =
+        *((hw_dev as *const u8).add(AV_HWDEVICE_CTX_HWCTX_OFFSET) as *const *mut c_void);
     if d3d11_va_ctx.is_null() {
         let mut buf = hw_buf;
         (lib.av_buffer_unref)(&mut buf);
@@ -809,10 +806,7 @@ unsafe fn create_d3d11_hw_device_ctx(
 
     com_addref(device);
     com_addref(context);
-    std::ptr::write(
-        (d3d11_va_ctx as *mut u8).add(0) as *mut *mut c_void,
-        device,
-    );
+    std::ptr::write((d3d11_va_ctx as *mut u8).add(0) as *mut *mut c_void, device);
     std::ptr::write(
         (d3d11_va_ctx as *mut u8).add(8) as *mut *mut c_void,
         context,

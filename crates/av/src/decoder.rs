@@ -19,14 +19,13 @@ use crate::ffi::{
     AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
     AV_COL_RANGE_JPEG, AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
 };
-use crate::scan_type::{
-    detect_h264_scan_type, hevc_hwaccel_unsupported, update_scan_type, DeinterlaceReason,
-    ScanType,
-};
-use crate::hw::{D3d11Device, HwAccelMode, HwAccelState};
 #[cfg(windows)]
 use crate::hw::{ColorSpace, TransferFunction};
+use crate::hw::{D3d11Device, HwAccelMode, HwAccelState};
 use crate::pes::PesPacket;
+use crate::scan_type::{
+    detect_h264_scan_type, hevc_hwaccel_unsupported, update_scan_type, DeinterlaceReason, ScanType,
+};
 use crate::video_queue::{HwVideoFrame, VideoFrame, YuvColorRange, YuvColorspace, YuvFrame};
 
 // ─── DecodedFrame ─────────────────────────────────────────────────────────────
@@ -474,8 +473,7 @@ impl FfmpegDecoder {
                     || self.codec_config.deinterlace == DeinterlaceMode::Force);
 
             // HEVC 4:2:2/4:4:4 não é decodificado pelo D3D11VA — abrir SW direto.
-            let skip_hw_for_hevc_chroma =
-                is_hevc && hevc_hwaccel_unsupported(&pes.payload);
+            let skip_hw_for_hevc_chroma = is_hevc && hevc_hwaccel_unsupported(&pes.payload);
             let skip_hw = skip_hw_for_deinterlace || skip_hw_for_hevc_chroma;
 
             // Tenta abrir com hwaccel se for vídeo e o estado estiver ativo.
@@ -486,9 +484,9 @@ impl FfmpegDecoder {
                     thread_type: ThreadType::Auto,
                     ..self.codec_config.clone()
                 };
-                let external_d3d11 = self.shared_d3d11_device().map(|dev| unsafe {
-                    (dev.as_raw(), dev.as_raw_context())
-                });
+                let external_d3d11 = self
+                    .shared_d3d11_device()
+                    .map(|dev| unsafe { (dev.as_raw(), dev.as_raw_context()) });
                 match FfmpegCodecContext::open_with_hwaccel(
                     Arc::clone(&self.lib),
                     avid,
@@ -545,10 +543,7 @@ impl FfmpegDecoder {
 
             // Deadline para o primeiro frame HW quando em modo D3D11VA.
             // 2 s (spec §4.3): tempo para o primeiro frame HW antes de fallback SW.
-            let hw_init_deadline = if is_video
-                && self.hw_state.is_active()
-                && !skip_hw
-            {
+            let hw_init_deadline = if is_video && self.hw_state.is_active() && !skip_hw {
                 Some(Instant::now() + Duration::from_secs(2))
             } else {
                 None
@@ -1176,14 +1171,8 @@ fn pts_raw_to_option(pts_raw: i64) -> Option<u64> {
 /// mesmo quando o PES/pacote carrega PTS válido — usar o PTS do container
 /// evita âncora `0` no `AudioClock` e descompasso A/V.
 #[inline]
-fn resolve_audio_pts(
-    pts_raw: i64,
-    packet_pts: Option<u64>,
-    pes_pts: Option<u64>,
-) -> Option<u64> {
-    pts_raw_to_option(pts_raw)
-        .or(packet_pts)
-        .or(pes_pts)
+fn resolve_audio_pts(pts_raw: i64, packet_pts: Option<u64>, pes_pts: Option<u64>) -> Option<u64> {
+    pts_raw_to_option(pts_raw).or(packet_pts).or(pes_pts)
 }
 
 // ─── Testes ───────────────────────────────────────────────────────────────────

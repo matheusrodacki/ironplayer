@@ -42,8 +42,12 @@ pub const CAP_AUDIO_FRAMES: usize = 32;
 pub const CAP_PCR_EVENTS: usize = 256;
 /// Capacidade do canal `net_events` (UdpReceiver → MetricsAggregator).
 pub const CAP_NET_EVENTS: usize = 64;
-/// Capacidade do canal `app_commands` (UI → CommandHandler).
-pub const CAP_APP_COMMANDS: usize = 32;
+/// Capacidade do canal `pes_probe` (TsDemuxer → StreamProbe Media Info).
+///
+/// SPEC-MI-002
+pub const CAP_PES_PROBE: usize = 256;
+/// Capacidade do canal `app_commands` (UI → cmd-handler).
+pub const CAP_APP_COMMANDS: usize = 16;
 
 // ─── Tipos placeholder ────────────────────────────────────────────────────────
 
@@ -228,6 +232,10 @@ pub struct AppChannels {
     pub net_events_tx: BoundedSender<NetEvent>,
     pub net_events_rx: Receiver<NetEvent>,
 
+    /// `pes_probe`: TsDemuxer → StreamProbe (Media Info)
+    pub pes_probe_tx: BoundedSender<ts::PesData>,
+    pub pes_probe_rx: Receiver<ts::PesData>,
+
     /// `app_commands`: UI → CommandHandler
     pub app_commands_tx: BoundedSender<AppCommand>,
     pub app_commands_rx: Receiver<AppCommand>,
@@ -257,6 +265,7 @@ impl AppChannels {
         let (audio_frames_tx, audio_frames_rx) = chan!(CAP_AUDIO_FRAMES, "audio_frames");
         let (pcr_events_tx, pcr_events_rx) = chan!(CAP_PCR_EVENTS, "pcr_events");
         let (net_events_tx, net_events_rx) = chan!(CAP_NET_EVENTS, "net_events");
+        let (pes_probe_tx, pes_probe_rx) = chan!(CAP_PES_PROBE, "pes_probe");
         let (app_commands_tx, app_commands_rx) = chan!(CAP_APP_COMMANDS, "app_commands");
 
         Self {
@@ -284,6 +293,8 @@ impl AppChannels {
             pcr_events_rx,
             net_events_tx,
             net_events_rx,
+            pes_probe_tx,
+            pes_probe_rx,
             app_commands_tx,
             app_commands_rx,
         }
@@ -371,6 +382,7 @@ mod tests {
         assert_eq!(ch.audio_frames_tx.capacity(), CAP_AUDIO_FRAMES);
         assert_eq!(ch.pcr_events_tx.capacity(), CAP_PCR_EVENTS);
         assert_eq!(ch.net_events_tx.capacity(), CAP_NET_EVENTS);
+        assert_eq!(ch.pes_probe_tx.capacity(), CAP_PES_PROBE);
         assert_eq!(ch.app_commands_tx.capacity(), CAP_APP_COMMANDS);
     }
 }

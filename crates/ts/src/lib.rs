@@ -9,6 +9,7 @@ pub mod aggregator;
 pub mod crc;
 pub mod demux;
 pub mod error;
+pub mod mediainfo;
 pub mod metrics;
 pub mod packet;
 pub mod pcr;
@@ -19,6 +20,11 @@ pub use adaptation::{pcr_to_duration, AdaptationField};
 pub use crc::{crc32_mpeg2, verify_crc32_mpeg2};
 pub use demux::{PesData, SectionData, TsDemuxer};
 pub use error::{DiscontinuityReason, PcrEvent, TsError, TsEvent};
+pub use mediainfo::{
+    build_elementary_stream_fields, build_media_info_report, enrich_tables_ctx_from_descriptors,
+    ElementaryCodecInfo, MediaInfoBuildInput, MediaInfoCodecSnapshot, MediaInfoReport,
+    MediaInfoSection, MediaInfoTablesCtx, ProbeStreamMeta, ReportField, StreamKind, StreamProbe,
+};
 pub use packet::TsPacket;
 pub use pcr::PcrTracker;
 pub use section::{CompleteSection, SectionAssembler};

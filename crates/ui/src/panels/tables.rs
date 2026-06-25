@@ -17,6 +17,7 @@ use ts::Pid;
 use crate::state::AppState;
 use crate::AppCommand;
 
+use super::mediainfo::MediaInfoPanel;
 use super::pid::PidPanel;
 
 // ---------------------------------------------------------------------------
@@ -259,6 +260,10 @@ pub enum ActiveTab {
     Tables,
     /// Lista de serviços DVB com clique duplo.
     Services,
+    /// Relatório Media Info por PID elementar.
+    ///
+    /// SPEC-MI-004
+    MediaInfo,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +276,7 @@ pub enum ActiveTab {
 pub struct TablesPanel {
     active_tab: ActiveTab,
     pid_panel: PidPanel,
+    media_info_panel: MediaInfoPanel,
 }
 
 impl Default for TablesPanel {
@@ -278,6 +284,7 @@ impl Default for TablesPanel {
         Self {
             active_tab: ActiveTab::Pids,
             pid_panel: PidPanel::new(),
+            media_info_panel: MediaInfoPanel::new(),
         }
     }
 }
@@ -299,6 +306,7 @@ impl TablesPanel {
             ui.selectable_value(&mut self.active_tab, ActiveTab::Pids, "PIDs");
             ui.selectable_value(&mut self.active_tab, ActiveTab::Tables, "Tables");
             ui.selectable_value(&mut self.active_tab, ActiveTab::Services, "Serviços");
+            ui.selectable_value(&mut self.active_tab, ActiveTab::MediaInfo, "Media Info");
         });
         ui.separator();
 
@@ -306,6 +314,7 @@ impl TablesPanel {
             ActiveTab::Pids => self.show_pids(ui, state, cmd_tx),
             ActiveTab::Tables => self.show_tables(ui, state),
             ActiveTab::Services => self.show_services(ui, state, cmd_tx),
+            ActiveTab::MediaInfo => self.media_info_panel.show(ui, state),
         }
     }
 

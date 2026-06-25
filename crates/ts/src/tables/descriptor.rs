@@ -65,9 +65,11 @@ pub enum KnownDescriptor {
 
     /// Tag 0x43 — entrega via satélite.
     ///
-    /// SPEC-TABLE-003
+    /// SPEC-TABLE-003 · SPEC-MI-005
     SatelliteDelivery {
         frequency_hz: u64,
+        orbital_position_tenths: u16,
+        west_east_flag: bool,
         polarization: Polarization,
         symbol_rate: u32,
     },
@@ -87,6 +89,17 @@ pub enum KnownDescriptor {
     TerrestrialDelivery {
         centre_frequency_hz: u64,
         bandwidth_hz: u32,
+    },
+
+    /// Tag 0x58 — offset de fuso horário local (TOT).
+    ///
+    /// SPEC-MI-005
+    LocalTimeOffset {
+        country_code: String,
+        country_region_id: u8,
+        local_time_offset_polarity: bool,
+        local_time_offset_h: u8,
+        local_time_offset_m: u8,
     },
 
     /// Descriptor desconhecido — carrega tag e dados brutos.
@@ -205,6 +218,8 @@ impl Descriptor {
                 // frequency: 8 BCD digits → 10 kHz units
                 let freq_bcd = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                 let frequency_hz = bcd32_to_u64(freq_bcd) * 10_000;
+                let orbital_position_tenths = ((data[4] as u16) << 8) | data[5] as u16;
+                let west_east_flag = (data[6] & 0x80) != 0;
                 // polarization: bits 7-6 of byte 6
                 let pol_bits = (data[6] >> 5) & 0x03;
                 let polarization = match pol_bits {
@@ -218,8 +233,30 @@ impl Descriptor {
                 let symbol_rate = (bcd32_to_u64(sr_bcd) * 100) as u32;
                 KnownDescriptor::SatelliteDelivery {
                     frequency_hz,
+                    orbital_position_tenths,
+                    west_east_flag,
                     polarization,
                     symbol_rate,
+                }
+            }
+
+            // ── 0x58: LocalTimeOffsetDescriptor (TOT) ────────────────────
+            0x58 => {
+                let data = &self.data;
+                if data.len() < 6 {
+                    return self.unknown();
+                }
+                let country_code = String::from_utf8_lossy(&data[0..3]).to_string();
+                let country_region_id = (data[3] >> 2) & 0x3F;
+                let local_time_offset_polarity = data[3] & 0x01 != 0;
+                let local_time_offset_h = data[4];
+                let local_time_offset_m = data[5];
+                KnownDescriptor::LocalTimeOffset {
+                    country_code,
+                    country_region_id,
+                    local_time_offset_polarity,
+                    local_time_offset_h,
+                    local_time_offset_m,
                 }
             }
 

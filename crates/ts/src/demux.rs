@@ -79,6 +79,14 @@ pub struct TsDemuxer {
     dynamic_nit_pid: Option<Pid>,
     /// PIDs de A/V registrados dinamicamente ao parsear a PMT.
     av_pids: HashSet<Pid>,
+    /// PIDs monitorados pelo analisador Media Info (todos os ES).
+    ///
+    /// SPEC-MI-002
+    probe_pids: HashSet<Pid>,
+    /// Canal opcional para PES de probe (Media Info).
+    ///
+    /// SPEC-MI-002
+    probe_tx: Option<Sender<PesData>>,
     /// Último WARN de canal cheio para eventos Packet, que são de alta frequência.
     last_packet_event_full_warn: Option<Instant>,
     /// Rastreador de jitter e descontinuidade PCR (opcional).
@@ -104,6 +112,8 @@ impl TsDemuxer {
             pmt_pids: HashSet::new(),
             dynamic_nit_pid: None,
             av_pids: HashSet::new(),
+            probe_pids: HashSet::new(),
+            probe_tx: None,
             last_packet_event_full_warn: None,
             pcr_tracker: None,
         }
@@ -119,6 +129,28 @@ impl TsDemuxer {
     pub fn with_pcr_tracker(mut self, pcr_tx: Sender<PcrEvent>) -> Self {
         self.pcr_tracker = Some(PcrTracker::new(pcr_tx));
         self
+    }
+
+    /// Associa canal de saída para PES de probe Media Info.
+    ///
+    /// SPEC-MI-002
+    pub fn with_probe_tx(mut self, probe_tx: Sender<PesData>) -> Self {
+        self.probe_tx = Some(probe_tx);
+        self
+    }
+
+    /// Registra PID para análise Media Info.
+    ///
+    /// SPEC-MI-002
+    pub fn register_probe_pid(&mut self, pid: Pid) {
+        self.probe_pids.insert(pid);
+    }
+
+    /// Remove PID do probe Media Info.
+    ///
+    /// SPEC-MI-002
+    pub fn deregister_probe_pid(&mut self, pid: Pid) {
+        self.probe_pids.remove(&pid);
     }
 
     /// Registra um PID como PMT (chamado ao parsear a PAT).
@@ -163,6 +195,7 @@ impl TsDemuxer {
         self.pmt_pids.clear();
         self.dynamic_nit_pid = None;
         self.av_pids.clear();
+        self.probe_pids.clear();
     }
 
     /// Processa um chunk de bytes (múltiplos de 188 bytes).
@@ -300,34 +333,50 @@ impl TsDemuxer {
                     pid
                 );
             }
-        } else if self.av_pids.contains(&pid) {
-            // PID de A/V → canal PES.
-            if self
-                .pes_tx
-                .try_send(PesData {
-                    pid,
-                    pusi: pkt.pusi,
-                    data: payload,
-                })
-                .is_err()
-            {
-                warn!("pes_tx cheio; PesData(pid=0x{:04X}) descartado", pid);
-            }
         } else {
-            // PID desconhecido → rotear como seção (tentativa).
-            if self
-                .section_tx
-                .try_send(SectionData {
-                    pid,
-                    pusi: pkt.pusi,
-                    payload,
-                })
-                .is_err()
-            {
-                warn!(
-                    "section_tx cheio; SectionData(pid=0x{:04X}, desconhecido) descartado",
-                    pid
-                );
+            if self.probe_pids.contains(&pid) {
+                if let Some(probe_tx) = &self.probe_tx {
+                    if probe_tx
+                        .try_send(PesData {
+                            pid,
+                            pusi: pkt.pusi,
+                            data: payload.clone(),
+                        })
+                        .is_err()
+                    {
+                        warn!("probe_tx cheio; PesData(pid=0x{:04X}) descartado", pid);
+                    }
+                }
+            }
+            if self.av_pids.contains(&pid) {
+                // PID de A/V → canal PES.
+                if self
+                    .pes_tx
+                    .try_send(PesData {
+                        pid,
+                        pusi: pkt.pusi,
+                        data: payload,
+                    })
+                    .is_err()
+                {
+                    warn!("pes_tx cheio; PesData(pid=0x{:04X}) descartado", pid);
+                }
+            } else if !self.probe_pids.contains(&pid) {
+                // PID desconhecido → rotear como seção (tentativa).
+                if self
+                    .section_tx
+                    .try_send(SectionData {
+                        pid,
+                        pusi: pkt.pusi,
+                        payload,
+                    })
+                    .is_err()
+                {
+                    warn!(
+                        "section_tx cheio; SectionData(pid=0x{:04X}, desconhecido) descartado",
+                        pid
+                    );
+                }
             }
         }
     }

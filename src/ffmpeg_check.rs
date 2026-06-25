@@ -40,8 +40,8 @@ pub fn check_avfilter_available() -> bool {
     set_dll_search_dir(Some(&dir));
 
     let path = dir.join(AVFILTER_DLL);
-    let ok = std::path::Path::new(&path).exists()
-        && unsafe { libloading::Library::new(&path) }.is_ok();
+    let ok =
+        std::path::Path::new(&path).exists() && unsafe { libloading::Library::new(&path) }.is_ok();
 
     #[cfg(windows)]
     set_dll_search_dir(None);

@@ -12,9 +12,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tracing::{trace, warn};
 use ts::tables::{
     descriptor_aac_profile_hint, descriptor_audio_channel_hint, Bat, Cat, Descriptor, Eit, Nit,
-    Pat, Pmt, Sdt, Tdt, Tot,
+    Pat, Pmt, PmtStream, Sdt, Tdt, Tot,
 };
-use ts::{CompleteSection, Pid};
+use ts::{CompleteSection, Pid, ProbeStreamMeta};
 use ui::{AudioOperationalState, AudioStatusSnapshot, AudioTrackInfo, TableEvent};
 
 use crate::channels::BoundedSender;
@@ -36,6 +36,14 @@ pub enum DemuxCommand {
     RegisterAvPid(Pid),
     /// Remove um PID A/V do roteamento (ao trocar de serviço).
     DeregisterAvPid(Pid),
+    /// Registra PID para probe Media Info (todos os ES).
+    ///
+    /// SPEC-MI-002
+    RegisterProbePid(Pid),
+    /// Remove PID do probe Media Info.
+    ///
+    /// SPEC-MI-002
+    DeregisterProbePid(Pid),
 }
 
 /// SPEC-TABLE
@@ -72,6 +80,17 @@ pub enum DecodeCommand {
 pub enum TableCommand {
     /// Limpa caches PSI/SI e notifica a UI para zerar dados do stream.
     Reset,
+}
+
+/// Comandos para a thread `media-probe`.
+///
+/// SPEC-MI-002
+#[derive(Debug, Clone)]
+pub enum MediaProbeCommand {
+    /// Limpa estado do probe.
+    Reset,
+    /// Registra PID com metadados da PMT.
+    Register { pid: Pid, meta: ProbeStreamMeta },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,6 +136,10 @@ pub struct TableDispatcher {
     auto_play: bool,
     /// Indica que o auto-play já disparou (ou foi inibido por seleção manual).
     auto_play_triggered: bool,
+    /// Canal opcional para registrar metadados de probe Media Info.
+    probe_cmd_tx: Option<Sender<MediaProbeCommand>>,
+    /// PIDs atualmente registrados para probe.
+    active_probe_pids: HashSet<Pid>,
 }
 
 impl TableDispatcher {
@@ -207,7 +230,17 @@ impl TableDispatcher {
             last_selected_audio_pid: None,
             auto_play,
             auto_play_triggered: false,
+            probe_cmd_tx: None,
+            active_probe_pids: HashSet::new(),
         }
+    }
+
+    /// Associa canal de comandos ao analisador Media Info.
+    ///
+    /// SPEC-MI-002
+    pub fn with_probe_cmd(mut self, tx: Sender<MediaProbeCommand>) -> Self {
+        self.probe_cmd_tx = Some(tx);
+        self
     }
 
     /// Loop principal: drena `complete_sections` e despacha `TableEvent`.
@@ -263,6 +296,7 @@ impl TableDispatcher {
         self.pmt_versions.clear();
         self.pmt_cache.clear();
         self.active_av_pids.clear();
+        self.active_probe_pids.clear();
         self.last_selected_service = None;
         self.last_selected_audio_pid = None;
         self.auto_play_triggered = false;
@@ -272,6 +306,7 @@ impl TableDispatcher {
         }
 
         self.tx.try_send(TableEvent::Reset);
+        self.send_probe_command(MediaProbeCommand::Reset);
     }
 
     /// Processa uma seção com deduplicação e despacho.
@@ -397,6 +432,8 @@ impl TableDispatcher {
 
                     // Atualiza o cache de PMT.
                     self.pmt_cache.insert(pmt.program_number, pmt.clone());
+
+                    self.register_probe_streams(&pmt);
 
                     // Registra PIDs do novo serviço apenas se ele está selecionado
                     // (ou se nenhum serviço está selecionado — modo "registra tudo").
@@ -692,6 +729,30 @@ impl TableDispatcher {
         }
     }
 
+    fn send_probe_command(&self, command: MediaProbeCommand) {
+        if let Some(tx) = &self.probe_cmd_tx {
+            if tx.try_send(command).is_err() {
+                warn!("canal probe-control cheio — comando descartado");
+            }
+        }
+    }
+
+    /// Registra todos os ES da PMT para probe Media Info.
+    ///
+    /// SPEC-MI-002
+    fn register_probe_streams(&mut self, pmt: &Pmt) {
+        for stream in &pmt.streams {
+            let pid = stream.elementary_pid;
+            if self.active_probe_pids.contains(&pid) {
+                continue;
+            }
+            self.active_probe_pids.insert(pid);
+            self.send_demux_command(DemuxCommand::RegisterProbePid(pid));
+            let meta = probe_stream_meta(stream, pmt.program_number);
+            self.send_probe_command(MediaProbeCommand::Register { pid, meta });
+        }
+    }
+
     fn is_repeated_section(&mut self, section: &CompleteSection) -> bool {
         let key = section_key(section);
         if let Some(previous) = self.last_sections.get(&key) {
@@ -702,6 +763,38 @@ impl TableDispatcher {
         self.last_sections.insert(key, section.data.clone());
         false
     }
+}
+
+fn probe_stream_meta(stream: &PmtStream, menu_id: u16) -> ProbeStreamMeta {
+    let is_latm = stream.stream_type == 0x11;
+    let is_private_ac3 = stream.stream_type == 0x06
+        && (stream_has_descriptor_tag(stream, 0x6A)
+            || stream_has_registration(stream, b"AC-3")
+            || stream_has_registration(stream, b"EAC3"));
+    let encrypted = stream_has_descriptor_tag(stream, 0x09) || pmt_stream_ca_descriptor(stream);
+    ProbeStreamMeta {
+        stream_type: stream.stream_type,
+        menu_id,
+        language: audio_language(&stream.descriptors),
+        encrypted,
+        is_latm,
+        is_private_ac3,
+    }
+}
+
+fn stream_has_descriptor_tag(stream: &PmtStream, tag: u8) -> bool {
+    stream.descriptors.iter().any(|d| d.tag == tag)
+}
+
+fn stream_has_registration(stream: &PmtStream, id: &[u8; 4]) -> bool {
+    stream
+        .descriptors
+        .iter()
+        .any(|d| d.is_registration_format(id))
+}
+
+fn pmt_stream_ca_descriptor(stream: &PmtStream) -> bool {
+    stream.descriptors.iter().any(|d| d.tag == 0x09)
 }
 
 fn first_audio_track_from_pmt(pmt: &Pmt) -> Option<AudioTrackInfo> {
@@ -1104,6 +1197,10 @@ mod tests {
         dispatcher.process_section(pmt_v0);
         assert_eq!(
             demux_rx.try_recv().unwrap(),
+            DemuxCommand::RegisterProbePid(0x200)
+        );
+        assert_eq!(
+            demux_rx.try_recv().unwrap(),
             DemuxCommand::RegisterAvPid(0x200)
         );
         let _ = pes_rx.try_recv(); // RegisterPid
@@ -1191,6 +1288,10 @@ mod tests {
             make_pmt_section_with_streams(0x100, 1, 0, 0x0110, &[(0x06, 0x0120, &[0x6A, 0x00])]);
         dispatcher.process_section(pmt);
 
+        assert_eq!(
+            demux_rx.try_recv().unwrap(),
+            DemuxCommand::RegisterProbePid(0x0120)
+        );
         assert_eq!(
             demux_rx.try_recv().unwrap(),
             DemuxCommand::RegisterAvPid(0x0120)

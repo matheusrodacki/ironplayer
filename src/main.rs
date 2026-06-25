@@ -370,6 +370,9 @@ fn main() -> eframe::Result<()> {
     let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded::<DecodeCommand>(16);
     let (audio_cmd_tx, audio_cmd_rx) = crossbeam_channel::bounded::<AudioCommand>(16);
 
+    let (probe_cmd_tx, probe_cmd_rx) =
+        crossbeam_channel::bounded::<table_dispatcher::MediaProbeCommand>(64);
+
     // 6. Token de parada do MetricsAggregator
     let (metrics_stop_token, metrics_stop_handle): (MetricsStopToken, MetricsStopHandle) =
         MetricsStopToken::new();
@@ -403,6 +406,7 @@ fn main() -> eframe::Result<()> {
         ch.pes_data_tx.sender(),
         ch.ts_events_tx.sender(),
     )
+    .with_probe_tx(ch.pes_probe_tx.sender())
     .with_pcr_tracker(ch.pcr_events_tx.sender());
 
     // 9. Instancia SectionAssembler
@@ -422,7 +426,8 @@ fn main() -> eframe::Result<()> {
         audio_status.clone(),
         true,
         Some(table_cmd_rx),
-    );
+    )
+    .with_probe_cmd(probe_cmd_tx);
     let table_events_rx = ch.table_events_rx;
 
     // 11. SenderGuard -- mantem senders vivos ate o shutdown
@@ -524,6 +529,12 @@ fn main() -> eframe::Result<()> {
                                 DemuxCommand::DeregisterAvPid(pid) => {
                                     demuxer.deregister_av_pid(pid);
                                 }
+                                DemuxCommand::RegisterProbePid(pid) => {
+                                    demuxer.register_probe_pid(pid);
+                                }
+                                DemuxCommand::DeregisterProbePid(pid) => {
+                                    demuxer.deregister_probe_pid(pid);
+                                }
                             }
                         }
                         demuxer.process_chunk(&bytes);
@@ -595,6 +606,67 @@ fn main() -> eframe::Result<()> {
             })
             .expect("falha ao criar thread table-disp"),
     );
+
+    let media_info_shared: Arc<std::sync::RwLock<ts::MediaInfoCodecSnapshot>> =
+        Arc::new(std::sync::RwLock::new(ts::MediaInfoCodecSnapshot::default()));
+    let media_info_ui = Arc::clone(&media_info_shared);
+
+    // Thread: media-probe — SPEC-MI-002
+    {
+        let pes_probe_rx = ch.pes_probe_rx;
+        let probe_cmd_rx = probe_cmd_rx;
+        let demux_cmd_for_probe = demux_cmd_tx.clone();
+        let media_info = Arc::clone(&media_info_shared);
+        handles.push(
+            std::thread::Builder::new()
+                .name("media-probe".into())
+                .spawn(move || {
+                    let mut probe = ts::StreamProbe::new();
+                    let mut pes_disconnected = false;
+                    loop {
+                        while let Ok(cmd) = probe_cmd_rx.try_recv() {
+                            match cmd {
+                                table_dispatcher::MediaProbeCommand::Reset => {
+                                    probe.reset();
+                                }
+                                table_dispatcher::MediaProbeCommand::Register { pid, meta } => {
+                                    probe.register_pid(pid, meta);
+                                }
+                            }
+                        }
+
+                        for pid in probe.take_deregister_queue() {
+                            let _ =
+                                demux_cmd_for_probe.try_send(DemuxCommand::DeregisterProbePid(pid));
+                        }
+
+                        match pes_probe_rx.recv_timeout(Duration::from_millis(20)) {
+                            Ok(data) => {
+                                probe.push(data);
+                                for pid in probe.take_deregister_queue() {
+                                    let _ = demux_cmd_for_probe
+                                        .try_send(DemuxCommand::DeregisterProbePid(pid));
+                                }
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                pes_disconnected = true;
+                            }
+                        }
+
+                        if pes_disconnected && probe_cmd_rx.is_empty() {
+                            break;
+                        }
+
+                        if let Ok(mut guard) = media_info.write() {
+                            *guard = probe.snapshot();
+                        }
+                    }
+                    tracing::info!("media-probe: encerrado");
+                })
+                .expect("falha ao criar thread media-probe"),
+        );
+    }
 
     // Thread: av-decode — SPEC-AV-002b
     // Recebe PesPackets, decodifica via FFmpeg e roteia VideoFrame/AudioFrame.
@@ -1395,6 +1467,7 @@ fn main() -> eframe::Result<()> {
             );
             inner.set_pipeline_metrics_rx(pipeline_metrics_ui);
             inner.set_audio_clock_rx(audio_clock_for_ui);
+            inner.set_media_info_rx(media_info_ui);
             inner.set_hwaccel_choice(cfg.player.hwaccel.into());
             Ok(Box::new(IronPlayerAppWithPipeline { inner, guard }))
         }),

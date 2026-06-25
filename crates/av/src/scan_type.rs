@@ -212,10 +212,7 @@ fn parse_hevc_sps_chroma(rbsp: &[u8]) -> Option<u32> {
 /// sub-camadas conforme `max_sub_layers_minus1`.
 ///
 /// SPEC-AV-005
-fn skip_hevc_profile_tier_level(
-    br: &mut BitReader<'_>,
-    max_sub_layers_minus1: u32,
-) -> Option<()> {
+fn skip_hevc_profile_tier_level(br: &mut BitReader<'_>, max_sub_layers_minus1: u32) -> Option<()> {
     // general_profile_space(2)+tier(1)+profile_idc(5) = 8 bits
     br.read_bits(8)?;
     // general_profile_compatibility_flag[32] = 32 bits
@@ -540,14 +537,8 @@ mod tests {
     /// SPEC-AV-005: `update_scan_type` fixa Interlaced quando flag de frame está setada.
     #[test]
     fn spec_av_005_frame_flag_latches_interlaced() {
-        let updated = update_scan_type(
-            ScanType::Unknown,
-            DeinterlaceMode::Auto,
-            true,
-            &[],
-            true,
-            0,
-        );
+        let updated =
+            update_scan_type(ScanType::Unknown, DeinterlaceMode::Auto, true, &[], true, 0);
         assert_eq!(updated, ScanType::Interlaced);
     }
 

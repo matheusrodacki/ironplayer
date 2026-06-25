@@ -20,7 +20,8 @@ use crate::ffi::{
     AV_COL_RANGE_JPEG, AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
 };
 use crate::scan_type::{
-    detect_h264_scan_type, update_scan_type, DeinterlaceReason, ScanType,
+    detect_h264_scan_type, hevc_hwaccel_unsupported, update_scan_type, DeinterlaceReason,
+    ScanType,
 };
 use crate::hw::{D3d11Device, HwAccelMode, HwAccelState};
 #[cfg(windows)]
@@ -355,14 +356,16 @@ impl FfmpegDecoder {
         &self.hwaccel
     }
 
-    /// `true` se o decoder está ativamente produzindo frames acelerados em GPU.
+    /// `true` se algum PID de vídeo está **de fato** decodificando em GPU agora.
     ///
-    /// Difere de `hwaccel_mode().is_gpu()`: este método fica `false` após o
-    /// fallback automático para CPU.
+    /// Reflete o estado real por PID (`hw_decode`), não apenas o estado global
+    /// armado: após uma migração HW→SW (ex.: HEVC 4:2:2 não suportado pelo
+    /// D3D11VA, ou deinterlace bwdif) este método fica `false` mesmo que o
+    /// caminho HW continue armado para outros PIDs.
     ///
     /// SPEC-AV-HW-DEC-001
     pub fn is_hwaccel_active(&self) -> bool {
-        self.hw_state.is_active()
+        self.states.values().any(|s| s.is_video && s.hw_decode)
     }
 
     /// Motivo do último fallback hwaccel→CPU (se houve).
@@ -372,17 +375,22 @@ impl FfmpegDecoder {
         self.hw_state.fallback_reason()
     }
 
-    /// Label do último codec HW ativo (ex.: `hevc_d3d11va`).
+    /// Label do codec HW (ex.: `hevc_d3d11va`) somente enquanto algum PID de
+    /// vídeo está realmente em GPU; `None` quando todos migraram para SW.
     pub fn hw_decode_codec(&self) -> Option<&str> {
-        self.last_hw_codec.as_deref()
+        if self.states.values().any(|s| s.is_video && s.hw_decode) {
+            self.last_hw_codec.as_deref()
+        } else {
+            None
+        }
     }
 
-    /// Contagem aproximada de contextos de vídeo HW ativos nesta sessão.
+    /// Contagem de contextos de vídeo realmente em GPU (`hw_decode == true`).
     pub fn hw_frame_pool_in_use(&self) -> u32 {
-        if !self.hw_state.is_active() {
-            return 0;
-        }
-        self.states.values().filter(|state| state.is_video).count() as u32
+        self.states
+            .values()
+            .filter(|s| s.is_video && s.hw_decode)
+            .count() as u32
     }
 
     /// Promove imediatamente o decoder para o caminho CPU, registrando o motivo.
@@ -450,6 +458,7 @@ impl FfmpegDecoder {
             let avid = codec_to_avid(pes.codec)?;
             let is_video = matches!(pes.codec, MediaCodec::Video(_));
             let is_h264 = matches!(pes.codec, MediaCodec::Video(VideoCodec::H264));
+            let is_hevc = matches!(pes.codec, MediaCodec::Video(VideoCodec::Hevc));
 
             let initial_scan = if self.codec_config.deinterlace == DeinterlaceMode::Force {
                 ScanType::Interlaced
@@ -464,9 +473,14 @@ impl FfmpegDecoder {
                 && (initial_scan.is_interlaced()
                     || self.codec_config.deinterlace == DeinterlaceMode::Force);
 
+            // HEVC 4:2:2/4:4:4 não é decodificado pelo D3D11VA — abrir SW direto.
+            let skip_hw_for_hevc_chroma =
+                is_hevc && hevc_hwaccel_unsupported(&pes.payload);
+            let skip_hw = skip_hw_for_deinterlace || skip_hw_for_hevc_chroma;
+
             // Tenta abrir com hwaccel se for vídeo e o estado estiver ativo.
             let mut hw_decode = false;
-            let codec_ctx = if is_video && self.hw_state.is_active() && !skip_hw_for_deinterlace {
+            let codec_ctx = if is_video && self.hw_state.is_active() && !skip_hw {
                 let hw_codec_config = CodecConfig {
                     thread_count: 1,
                     thread_type: ThreadType::Auto,
@@ -522,12 +536,18 @@ impl FfmpegDecoder {
                     "vídeo entrelaçado detectado — decoder SW para bwdif"
                 );
             }
+            if skip_hw_for_hevc_chroma && self.hw_state.is_active() {
+                tracing::info!(
+                    pid = pid_raw,
+                    "HEVC chroma ≠ 4:2:0 detectado no SPS — decoder SW (D3D11VA não suporta)"
+                );
+            }
 
             // Deadline para o primeiro frame HW quando em modo D3D11VA.
             // 2 s (spec §4.3): tempo para o primeiro frame HW antes de fallback SW.
             let hw_init_deadline = if is_video
                 && self.hw_state.is_active()
-                && !skip_hw_for_deinterlace
+                && !skip_hw
             {
                 Some(Instant::now() + Duration::from_secs(2))
             } else {
@@ -679,12 +699,27 @@ impl FfmpegDecoder {
                 );
 
                 if state.hw_decode && state.scan_type.is_interlaced() {
-                    reopen_sw_codec_for_deinterlace(
+                    reopen_sw_codec_from_hw(
                         &self.lib,
                         &self.codec_config,
                         state,
                         pes.codec,
                         pid_raw,
+                        "deinterlacing bwdif",
+                    )?;
+                }
+
+                if state.hw_decode
+                    && matches!(pes.codec, MediaCodec::Video(VideoCodec::Hevc))
+                    && hevc_hwaccel_unsupported(&pkt_bytes)
+                {
+                    reopen_sw_codec_from_hw(
+                        &self.lib,
+                        &self.codec_config,
+                        state,
+                        pes.codec,
+                        pid_raw,
+                        "HEVC chroma ≠ 4:2:0",
                     )?;
                 }
             }
@@ -724,12 +759,13 @@ impl FfmpegDecoder {
                                         "frame HW em stream entrelaçado — migrando para SW"
                                     );
                                     state.frame.unref();
-                                    reopen_sw_codec_for_deinterlace(
+                                    reopen_sw_codec_from_hw(
                                         &self.lib,
                                         &self.codec_config,
                                         state,
                                         pes.codec,
                                         pid_raw,
+                                        "deinterlacing bwdif",
                                     )?;
                                     if let Err(e) = state.codec_ctx.send_packet(&pkt) {
                                         tracing::debug!(%e, pid = pid_raw, "re-send após migração HW→SW");
@@ -958,27 +994,24 @@ impl FfmpegDecoder {
     }
 }
 
-/// Reabre o decoder de vídeo em SW quando entrelaçamento exige bwdif.
+/// Reabre o decoder de vídeo em SW, descartando o contexto D3D11VA.
 ///
-/// Preserva `scan_type` e o parser; descarta o contexto D3D11VA.
+/// Preserva `scan_type` e o parser.
 ///
 /// SPEC-AV-005
-fn reopen_sw_codec_for_deinterlace(
+fn reopen_sw_codec_from_hw(
     lib: &Arc<FfmpegLib>,
     config: &CodecConfig,
     state: &mut CodecState,
     codec: MediaCodec,
     pid: u16,
+    reason: &str,
 ) -> Result<(), AvError> {
     if !state.hw_decode {
         return Ok(());
     }
     let avid = codec_to_avid(codec)?;
-    tracing::warn!(
-        pid,
-        scan = state.scan_type.label(),
-        "migrando decoder HW → SW para deinterlacing bwdif"
-    );
+    tracing::warn!(pid, reason, "migrando decoder HW → SW");
     state.codec_ctx = FfmpegCodecContext::open(Arc::clone(lib), avid, config)?;
     state.hw_decode = false;
     state.hw_init_deadline = None;

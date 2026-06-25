@@ -76,7 +76,6 @@ impl DeinterlaceReason {
 }
 
 /// `AVFieldOrder::AV_FIELD_PROGRESSIVE` — conteúdo progressivo.
-#[allow(dead_code)]
 const AV_FIELD_PROGRESSIVE: i32 = 1;
 /// Primeiro valor de field order que indica entrelaçamento (TT, BB, TB, BT).
 const AV_FIELD_INTERLACED_MIN: i32 = 2;
@@ -122,8 +121,13 @@ pub fn update_scan_type(
         }
     }
 
-    // Não fixar Progressive só por field_order — evita falso positivo em 1080i
-    // MBAFF (Globo/SKY) onde field_order pode ser PROGRESSIVE prematuramente.
+    // Para H.264 não fixar Progressive só por field_order — evita falso positivo
+    // em 1080i MBAFF (Globo/SKY) onde field_order pode ser PROGRESSIVE
+    // prematuramente. Para HEVC/MPEG-2 (sem MBAFF) o field_order do FFmpeg é
+    // confiável após o 1º frame decodificado — resolve Progressive.
+    if !is_h264 && field_order == AV_FIELD_PROGRESSIVE {
+        return ScanType::Progressive;
+    }
 
     current
 }
@@ -147,6 +151,105 @@ pub fn detect_h264_scan_type(data: &[u8]) -> Option<ScanType> {
         return parse_sps_scan_type(&rbsp);
     }
     None
+}
+
+/// `chroma_format_idc` HEVC para 4:2:0 (Main / Main10).
+///
+/// SPEC-AV-005
+pub const HEVC_CHROMA_420: u32 = 1;
+
+/// Detecta o `chroma_format_idc` do primeiro SPS HEVC no payload.
+///
+/// Retorna `Some(idc)` onde `1` = 4:2:0, `2` = 4:2:2, `3` = 4:4:4, `0` =
+/// monocromático. `None` se nenhum SPS HEVC completo for encontrado.
+///
+/// Usado para decidir o caminho de decode: o D3D11VA (HEVC) só decodifica
+/// 4:2:0 (Main/Main10). Streams 4:2:2/4:4:4 devem ir direto para SW, evitando
+/// o timeout de init HW (2 s) e a perda do keyframe inicial consumido pelo
+/// decoder HW que não produz frames.
+///
+/// SPEC-AV-005
+pub fn detect_hevc_chroma_format(data: &[u8]) -> Option<u32> {
+    for nal in iter_h264_nal_units(data) {
+        if nal.len() < 2 {
+            continue;
+        }
+        // HEVC NAL header: 2 bytes; nal_unit_type = (byte0 >> 1) & 0x3F.
+        let nal_type = (nal[0] >> 1) & 0x3F;
+        if nal_type != 33 {
+            // 33 = SPS_NUT
+            continue;
+        }
+        let rbsp = remove_emulation_prevention_bytes(&nal[2..]);
+        return parse_hevc_sps_chroma(&rbsp);
+    }
+    None
+}
+
+/// Retorna `true` quando o SPS HEVC indica chroma diferente de 4:2:0.
+///
+/// SPEC-AV-005
+pub fn hevc_hwaccel_unsupported(data: &[u8]) -> bool {
+    detect_hevc_chroma_format(data).is_some_and(|idc| idc != HEVC_CHROMA_420)
+}
+
+/// Faz parse mínimo de um SPS HEVC (RBSP) para extrair `chroma_format_idc`.
+///
+/// SPEC-AV-005
+fn parse_hevc_sps_chroma(rbsp: &[u8]) -> Option<u32> {
+    let mut br = BitReader::new(rbsp);
+    br.read_bits(4)?; // sps_video_parameter_set_id
+    let max_sub_layers_minus1 = br.read_bits(3)?; // sps_max_sub_layers_minus1
+    br.read_bit()?; // sps_temporal_id_nesting_flag
+    skip_hevc_profile_tier_level(&mut br, max_sub_layers_minus1)?;
+    br.read_ue()?; // sps_seq_parameter_set_id
+    br.read_ue() // chroma_format_idc
+}
+
+/// Pula `profile_tier_level()` (profilePresentFlag = 1) de um SPS HEVC.
+///
+/// Parte geral fixa = 96 bits (12 bytes); seguida pelas flags/perfis de
+/// sub-camadas conforme `max_sub_layers_minus1`.
+///
+/// SPEC-AV-005
+fn skip_hevc_profile_tier_level(
+    br: &mut BitReader<'_>,
+    max_sub_layers_minus1: u32,
+) -> Option<()> {
+    // general_profile_space(2)+tier(1)+profile_idc(5) = 8 bits
+    br.read_bits(8)?;
+    // general_profile_compatibility_flag[32] = 32 bits
+    br.read_bits(32)?;
+    // 48 bits: 4 flags + 44 bits de constraint/reserved
+    br.read_bits(32)?;
+    br.read_bits(16)?;
+    // general_level_idc = 8 bits
+    br.read_bits(8)?;
+
+    let n = (max_sub_layers_minus1 as usize).min(8);
+    let mut profile_present = [false; 8];
+    let mut level_present = [false; 8];
+    for i in 0..n {
+        profile_present[i] = br.read_bit()? == 1;
+        level_present[i] = br.read_bit()? == 1;
+    }
+    if n > 0 {
+        for _ in n..8 {
+            br.read_bits(2)?; // reserved_zero_2bits
+        }
+    }
+    for i in 0..n {
+        if profile_present[i] {
+            // sub_layer profile = 88 bits (8 + 32 + 48)
+            br.read_bits(32)?;
+            br.read_bits(32)?;
+            br.read_bits(24)?;
+        }
+        if level_present[i] {
+            br.read_bits(8)?; // sub_layer_level_idc
+        }
+    }
+    Some(())
 }
 
 /// Itera NAL units H.264 delimitadas por start codes `0x000001` ou `0x00000001`.
@@ -474,5 +577,56 @@ mod tests {
             AV_FIELD_PROGRESSIVE,
         );
         assert_eq!(updated, ScanType::Interlaced);
+    }
+
+    /// SPS HEVC Main 4:2:2 10 (Globo REDE HD) — chroma_format_idc = 2.
+    fn globo_hevc_422_sps_au() -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0x6D,
+            0x08, 0x00, 0x00, 0x03, 0x00, 0x00, 0x78, 0xB0, 0x03, 0xC0, 0x80, 0x22, 0x1F, 0x2B,
+            0x68, 0x20, 0xCE, 0xAD, 0xC2, 0xF0, 0x1B, 0x50, 0x10, 0x10, 0x13, 0x40, 0x00, 0x00,
+            0xFA, 0x40, 0x00, 0x3A, 0x98, 0x3C, 0x25, 0x71, 0xC9, 0xC0, 0x00, 0x20, 0x0B, 0x20,
+            0x01, 0xEC, 0x3F, 0xD4, 0x50, 0x94,
+        ]
+    }
+
+    /// SPEC-AV-005: SPS HEVC 4:2:2 detecta chroma_format_idc = 2.
+    #[test]
+    fn spec_av_005_hevc_422_sps_chroma_format() {
+        assert_eq!(detect_hevc_chroma_format(&globo_hevc_422_sps_au()), Some(2));
+        assert!(hevc_hwaccel_unsupported(&globo_hevc_422_sps_au()));
+    }
+
+    /// SPEC-AV-005: payload sem SPS HEVC retorna None.
+    #[test]
+    fn spec_av_005_hevc_no_sps_returns_none() {
+        let data = [0x00, 0x00, 0x01, 0x65, 0x88, 0x84]; // H.264 IDR
+        assert_eq!(detect_hevc_chroma_format(&data), None);
+        assert!(!hevc_hwaccel_unsupported(&data));
+    }
+
+    /// SPEC-AV-005: HEVC progressivo resolve via field_order após 1º frame.
+    #[test]
+    fn spec_av_005_hevc_progressive_resolves_via_field_order() {
+        let hevc = update_scan_type(
+            ScanType::Unknown,
+            DeinterlaceMode::Auto,
+            false, // is_h264
+            &[],
+            false, // frame_interlaced
+            AV_FIELD_PROGRESSIVE,
+        );
+        assert_eq!(hevc, ScanType::Progressive);
+
+        // H.264 não deve fixar Progressive só por field_order (cautela MBAFF).
+        let h264 = update_scan_type(
+            ScanType::Unknown,
+            DeinterlaceMode::Auto,
+            true, // is_h264
+            &[],
+            false,
+            AV_FIELD_PROGRESSIVE,
+        );
+        assert_eq!(h264, ScanType::Unknown);
     }
 }

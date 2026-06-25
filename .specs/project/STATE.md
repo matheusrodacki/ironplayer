@@ -108,6 +108,41 @@ Sessão de debug em stream multicast H.264 1080i MBAFF (Globo/SKY, `udp://@239.0
 
 Refs: `crates/av/src/deinterlace.rs`, `crates/av/src/ffi/mod.rs` (`new_bwdif`, `rescale_bwdif_output_pts`, `FfmpegFilterGraph::process`), `crates/av/src/video_queue.rs` (`pop_ready_with_resync`).
 
+### L-004 — HEVC 4:2:2/4:4:4: D3D11VA não decodifica (2026-06-25)
+
+Sessão de debug em stream multicast HEVC Main 4:2:2 10 (Globo REDE HD, `P1171_GLOBO_REDE.ts`). Sintomas e **invariantes que não podem regredir**:
+
+| Sintoma | Causa raiz | Invariante obrigatória |
+| ------- | ---------- | ---------------------- |
+| Tela preta com áudio ok; vídeo aparece só após 2–5 s | D3D11VA aberto para HEVC; GPU não produz frames para 4:2:2/4:4:4; `hw_init_deadline` (2 s) expira → fallback SW; keyframe inicial consumido na fase HW inútil | Parse leve do SPS HEVC (`detect_hevc_chroma_format`); se `chroma_format_idc ≠ 1` (≠ 4:2:0), abrir decoder SW direto — não tentar D3D11VA |
+| Decode/render SW funciona após fallback | `to_yuv_planes` já aceita `YUV422P10LE`; problema é só o caminho HW | Main/Main10 (4:2:0) continuam em D3D11VA quando HW ativo |
+
+**Checklist rápido em regressão HEVC:**
+
+1. Stream 4:2:2 10: vídeo visível em < 1 s (sem `timeout de 2 s sem frame HW` no log).
+2. Stream HEVC 4:2:0 (Main10): ainda usa D3D11VA quando disponível.
+3. Teste `spec_av_005_hevc_422_sps_chroma_format` verde após mudanças em `scan_type.rs` ou `decoder.rs`.
+
+Refs: `crates/av/src/scan_type.rs` (`detect_hevc_chroma_format`, `hevc_hwaccel_unsupported`), `crates/av/src/decoder.rs` (`skip_hw_for_hevc_chroma`, `reopen_sw_codec_from_hw`).
+
+### L-005 — HEVC: latência de abertura ∝ intervalo de IRAP; status HW por-PID (2026-06-25)
+
+Continuação do debug do Globo REDE HD (HEVC 4:2:2). Após L-004, o vídeo abria mas com latência **muito variável** (2 s a 30 s+) e os cards de status mostravam estado errado. Diagnóstico por instrumentação de runtime (logs NDJSON) + ffprobe:
+
+| Sintoma | Causa raiz (com evidência) | Invariante obrigatória |
+| ------- | -------------------------- | ---------------------- |
+| Tempo até 1º frame varia 2–30 s conforme o ponto de entrada no multicast | **Inerente ao stream**: o decoder só produz imagem ao receber um IRAP (IDR/CRA). Logs: 1º frame sai ~146 ms **após** o 1º IRAP; tempo-até-IRAP medido em 4 s / 20 s / 3,8 s por join. ffprobe na amostra: keyframes irregulares, lacunas de até ~30 s. `send_err=0` o tempo todo (decoder aceita tudo, só não há IRAP). **Não é bug** — nenhum player abre antes do próximo IRAP | Não "consertar" com timeouts/sleeps; a migração HW→SW deve terminar **antes** do IRAP (mede-se: `hw_decode=false` quando o IRAP chega) para nunca desperdiçar o keyframe |
+| Card "Hwaccel" preso em `GPU (hevc_d3d11va)` após migração para SW; `Pool frames` ≠ 0 | `is_hwaccel_active`/`hw_decode_codec`/`hw_frame_pool_in_use` liam o estado **global** `hw_state` (que continua armado), não o `hw_decode` real por PID | Esses 3 métodos devem refletir o estado **por-PID** (`states.values().any(s.is_video && s.hw_decode)`); após migração o card mostra `CPU` + `Pool frames 0` |
+| `Scan type` eternamente `Unknown` em HEVC progressivo | `update_scan_type` só resolvia `Progressive` via SPS H.264; HEVC nunca resolvia | Para não-H.264, resolver `Progressive` via `field_order == AV_FIELD_PROGRESSIVE` após o 1º frame (H.264 mantém cautela MBAFF) |
+
+**Checklist rápido em regressão:**
+
+1. HEVC 4:2:2: após migração, card "Hwaccel" = `CPU`, `Pool frames 0`, `Scan type Progressive`.
+2. Latência de abertura ≈ tempo até o próximo IRAP do stream (não há piso menor); não introduzir HW deadline para HEVC 4:2:2.
+3. Testes `spec_av_005_hevc_progressive_resolves_via_field_order` e os de `is_hwaccel_active`/fallback verdes.
+
+Refs: `crates/av/src/decoder.rs` (`is_hwaccel_active`, `hw_decode_codec`, `hw_frame_pool_in_use`), `crates/av/src/scan_type.rs` (`update_scan_type`), `src/main.rs` (snapshot de `PipelineMetrics`).
+
 ---
 
 ## Pendências

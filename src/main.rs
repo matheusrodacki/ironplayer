@@ -601,10 +601,9 @@ fn main() -> eframe::Result<()> {
 
     // Arc compartilhado para expor métricas do pipeline de decode à UI.
     let pipeline_metrics_shared: std::sync::Arc<std::sync::RwLock<ts::metrics::PipelineMetrics>> =
-        std::sync::Arc::new(std::sync::RwLock::new({
-            let mut m = ts::metrics::PipelineMetrics::default();
-            m.avfilter_available = avfilter_ok;
-            m
+        std::sync::Arc::new(std::sync::RwLock::new(ts::metrics::PipelineMetrics {
+            avfilter_available: avfilter_ok,
+            ..Default::default()
         }));
     let pipeline_metrics_ui = std::sync::Arc::clone(&pipeline_metrics_shared);
     let d3d11_device_arc = bootstrap_d3d11_device(cfg.player.hwaccel, &pipeline_metrics_shared);

@@ -73,6 +73,22 @@
 
 ---
 
+### UI Slint (POC) — spec-11-slint
+
+**Meta:** modernizar a UI do modo Broadcast migrando de egui para Slint, mantendo o backend intacto. Ver `.specs/features/spec-11-slint/plan.md`, [D-009](../project/STATE.md) e [L-006](../project/STATE.md).
+
+| Status | Item                                                                 |
+| ------ | -------------------------------------------------------------------- |
+| ✅      | Crate `crates/ui-slint` (Slint 1.17 · femtovg); `crates/ui` removida |
+| ✅      | Layout Broadcast: top bar, abas PIDs/Tabelas/Serviços/Media Info, vídeo, gráficos bitrate/PCR jitter (Path), status bar |
+| ✅      | Pipeline ao vivo: mesmos snapshots/canais via `slint::Timer`; callbacks → `AppCommand` |
+| ✅      | Vídeo real (CPU): planos YUV/NV12 → `SharedPixelBuffer`, conversão em thread worker |
+| ⏳      | **Zero-copy GPU** (`slint::wgpu_28`) — eliminar stutter da conversão CPU (cf. L-006) |
+| ⏳      | Abas Tabelas/Serviços: conteúdo detalhado (árvore PSI/SI, EIT p/f)   |
+| ⏳      | Modo Cinema em Slint (hoje stub visual)                              |
+
+---
+
 ### v1.x — Funcionalidades Futuras
 
 | Item                                      | Descrição                                                                                                                                                                                                                                                             |

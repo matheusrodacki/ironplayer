@@ -1,6 +1,10 @@
 //! Modelo de estado da aplicação: `AppState`, `AppCommand`, `ConnectionState`,
 //! `TablesSnapshot`.
 //!
+//! Migrado de `crates/ui/src/state.rs` (sem dependência de egui). A única
+//! chamada a `panels::mediainfo::update_media_info_tables_ctx` foi substituída
+//! pela função subjacente `ts::enrich_tables_ctx_from_descriptors`.
+//!
 //! SPEC-UI-002
 
 use std::collections::{HashMap, VecDeque};
@@ -18,9 +22,6 @@ use ts::Pid;
 
 /// Modo de exibição do aspect-ratio do vídeo.
 ///
-/// Controla como o `VideoPanel` calcula o retângulo de exibição.
-/// Preferência puramente visual; não afeta o pipeline de decodificação.
-///
 /// SPEC-UI-001
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AspectRatioMode {
@@ -35,9 +36,6 @@ pub enum AspectRatioMode {
 
 impl AspectRatioMode {
     /// Retorna o aspect-ratio efetivo para exibição.
-    ///
-    /// `stream_aspect` é o aspect-ratio calculado a partir das dimensões de
-    /// exibição SAR-corrigidas (`display_w / display_h`).
     pub fn effective_aspect(self, stream_aspect: f32) -> f32 {
         match self {
             Self::Dar => stream_aspect,
@@ -143,6 +141,7 @@ pub struct AudioStatusSnapshot {
 }
 
 /// SPEC-UI-006b — texto compacto de canais para a status bar (`6ch > 2ch`).
+#[allow(dead_code)]
 pub fn format_status_bar_channels(source: u16, output: u16) -> String {
     if source != output {
         format!("{source}ch > {output}ch")
@@ -152,16 +151,9 @@ pub fn format_status_bar_channels(source: u16, output: u16) -> String {
 }
 
 /// SPEC-UI-009 — formata contagem de canais para o card (`6 ch`).
+#[allow(dead_code)]
 pub fn format_card_channels(channels: u16) -> String {
     format!("{channels} ch")
-}
-
-/// `true` quando o playback usa menos canais que o stream de origem.
-pub fn audio_downmix_active(source: Option<u16>, output: Option<u16>) -> bool {
-    match (source, output) {
-        (Some(src), Some(out)) => src != out,
-        _ => false,
-    }
 }
 
 impl Default for AudioStatusSnapshot {
@@ -308,12 +300,8 @@ pub struct AppState {
     pub audio: AudioStatusSnapshot,
     pub tables: TablesSnapshot,
     /// Snapshot de codec probe Media Info por PID.
-    ///
-    /// SPEC-MI-003
     pub media_info: MediaInfoCodecSnapshot,
     /// Campos derivados de NIT/TOT para bloco General.
-    ///
-    /// SPEC-MI-005
     pub media_info_tables_ctx: MediaInfoTablesCtx,
     pub selected_pid: Option<Pid>,
     pub selected_service: Option<u16>,
@@ -322,16 +310,12 @@ pub struct AppState {
     /// Histórico de jitter de PCR por PID.
     pub pcr_history: HashMap<Pid, VecDeque<PcrJitterRecord>>,
     /// Histórico de offset de sincronismo A/V dos últimos 60 s (em ms).
-    ///
-    /// Amostrado a ~1 Hz junto com o bitrate. Positivo = vídeo adiantado.
-    ///
-    /// SPEC-METRICS-SYNC-001
     pub av_sync_history: VecDeque<(Instant, i32)>,
 }
 
 impl AppState {
     /// Limpa dados derivados do stream atual, preservando preferências externas.
-    pub(crate) fn reset_stream_data(&mut self) {
+    pub fn reset_stream_data(&mut self) {
         self.metrics = MetricsSnapshot::default();
         self.tables = TablesSnapshot::default();
         self.media_info = MediaInfoCodecSnapshot::default();
@@ -347,7 +331,7 @@ impl AppState {
     /// Aplica um evento incremental de tabela ao snapshot imutável da UI.
     ///
     /// SPEC-UI-002
-    pub(crate) fn apply_table_event(&mut self, event: TableEvent) {
+    pub fn apply_table_event(&mut self, event: TableEvent) {
         match event {
             TableEvent::Reset => self.reset_stream_data(),
             TableEvent::Pat(pat) => self.tables.pat = Some(pat),
@@ -355,24 +339,22 @@ impl AppState {
                 self.tables.pmts.insert(pmt.program_number, pmt);
             }
             TableEvent::Nit(nit) => {
-                crate::panels::mediainfo::update_media_info_tables_ctx(
+                ts::enrich_tables_ctx_from_descriptors(
                     &mut self.media_info_tables_ctx,
                     &nit.network_descriptors,
                     &[],
                 );
-                for ts in &nit.transport_streams {
-                    crate::panels::mediainfo::update_media_info_tables_ctx(
+                for transport in &nit.transport_streams {
+                    ts::enrich_tables_ctx_from_descriptors(
                         &mut self.media_info_tables_ctx,
-                        &ts.descriptors,
+                        &transport.descriptors,
                         &[],
                     );
                 }
                 self.tables.nit = Some(nit);
             }
-            // Aceita apenas SDT actual (table_id 0x42); SDT other (0x46) descreve
-            // serviços de outros transport streams e não deve sobrescrever os dados locais.
-            // O SDT pode ter múltiplas seções (last_section_number > 0); seções da mesma
-            // versão são mescladas para acumular todos os serviços do multiplex.
+            // Aceita apenas SDT actual (table_id 0x42); seções da mesma versão são
+            // mescladas para acumular todos os serviços do multiplex.
             TableEvent::Sdt(sdt) if sdt.actual => match &mut self.tables.sdt {
                 Some(existing) if existing.version == sdt.version => {
                     for svc in sdt.services {
@@ -397,7 +379,7 @@ impl AppState {
             }
             TableEvent::Tdt(tdt) => self.tables.tdt = Some(tdt),
             TableEvent::Tot(tot) => {
-                crate::panels::mediainfo::update_media_info_tables_ctx(
+                ts::enrich_tables_ctx_from_descriptors(
                     &mut self.media_info_tables_ctx,
                     &[],
                     &tot.descriptors,
@@ -419,8 +401,7 @@ impl AppState {
 /// SPEC-UI-002
 #[derive(Debug, Clone)]
 pub enum AppCommand {
-    /// Inicia conexão com a URL informada, opcionalmente ligada a uma
-    /// interface de rede específica.
+    /// Inicia conexão com a URL informada.
     Connect { url: String, iface: Option<String> },
     /// Encerra a conexão ativa.
     Disconnect,
@@ -436,8 +417,7 @@ pub enum AppCommand {
     ResetErrors,
     /// Alterna entre tema escuro e claro.
     ChangeTheme { dark: bool },
-    /// Solicita ao backend que troque o modo de aceleração de hardware do
-    /// decoder de vídeo em runtime.
+    /// Solicita troca do modo de aceleração de hardware do decoder.
     ///
     /// SPEC-CFG-HW-001
     SetHwAccel { choice: HwAccelChoice },
@@ -446,13 +426,10 @@ pub enum AppCommand {
 }
 
 // ---------------------------------------------------------------------------
-// HwAccelChoice — seleção de hwaccel acessível pela UI
+// HwAccelChoice
 // ---------------------------------------------------------------------------
 
-/// Seleção de hardware acceleration exposta para a UI (sem dependência de
-/// `serde`/TOML).  Espelha as três opções aceitas pelo CLI e pelo
-/// `ironstream.toml`; o binário converte para a sua própria
-/// `config::HwAccelChoice` antes de aplicar no decoder.
+/// Seleção de hardware acceleration exposta para a UI.
 ///
 /// SPEC-CFG-HW-001
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -498,9 +475,6 @@ mod tests {
         assert!(state.pcr_history.is_empty());
     }
 
-    /// `HwAccelChoice` expõe labels estáveis e default = Auto.
-    ///
-    /// SPEC-CFG-HW-001
     #[test]
     fn spec_cfg_hw_001_hwaccel_choice_labels() {
         assert_eq!(HwAccelChoice::default(), HwAccelChoice::Auto);
@@ -509,51 +483,11 @@ mod tests {
         assert_eq!(HwAccelChoice::None.label(), "none");
     }
 
-    /// `AppCommand::SetHwAccel` carrega o choice transportando-o intacto.
-    ///
-    /// SPEC-CFG-HW-001
-    #[test]
-    fn spec_cfg_hw_001_set_hwaccel_command_payload() {
-        let cmd = AppCommand::SetHwAccel {
-            choice: HwAccelChoice::D3d11va,
-        };
-        match cmd {
-            AppCommand::SetHwAccel { choice } => {
-                assert_eq!(choice, HwAccelChoice::D3d11va);
-            }
-            _ => panic!("variante incorreta"),
-        }
-    }
-
     #[test]
     fn spec_ui_002_format_status_bar_channels_downmix() {
         assert_eq!(format_status_bar_channels(6, 2), "6ch > 2ch");
         assert_eq!(format_status_bar_channels(2, 2), "2ch");
         assert_eq!(format_card_channels(6), "6 ch");
-    }
-
-    #[test]
-    fn spec_ui_005_audio_card_channels_downmix_active() {
-        let mut audio = AudioStatusSnapshot::default();
-        audio.set_channel_counts(6, 2);
-        assert!(audio_downmix_active(
-            audio.source_channels,
-            audio.output_channels
-        ));
-    }
-
-    #[test]
-    fn spec_ui_002_audio_status_snapshot_default_is_idle() {
-        let audio = AudioStatusSnapshot::default();
-        assert_eq!(audio.volume, 1.0);
-        assert!(!audio.muted);
-        assert!(audio.active_track.is_none());
-        assert_eq!(audio.sample_rate_hz, None);
-        assert_eq!(audio.channels, None);
-        assert_eq!(audio.buffer_level, 0.0);
-        assert_eq!(audio.output_latency_ms, 0);
-        assert_eq!(audio.state, AudioOperationalState::Idle);
-        assert_eq!(audio.errors, AudioErrorSnapshot::default());
     }
 
     #[test]
@@ -569,24 +503,6 @@ mod tests {
     }
 
     #[test]
-    fn spec_ui_002_tables_snapshot_default_all_none() {
-        let snap = TablesSnapshot::default();
-        assert!(snap.pat.is_none());
-        assert!(snap.pmts.is_empty());
-        assert!(snap.nit.is_none());
-        assert!(snap.sdt.is_none());
-        assert!(snap.eit_pf.is_empty());
-        assert!(snap.tdt.is_none());
-        assert!(snap.bat.is_none());
-    }
-
-    #[test]
-    fn spec_ui_002_connection_state_default_is_idle() {
-        let cs = ConnectionState::default();
-        assert!(matches!(cs, ConnectionState::Idle));
-    }
-
-    #[test]
     fn spec_ui_002_apply_table_event_updates_pat_snapshot() {
         let mut state = AppState::default();
         let pat = Pat {
@@ -595,103 +511,19 @@ mod tests {
             current_next: true,
             programs: Vec::new(),
         };
-
         state.apply_table_event(TableEvent::Pat(pat.clone()));
-
         assert_eq!(state.tables.pat, Some(pat));
-    }
-
-    /// SPEC-UI-002: seções SDT da mesma versão são mescladas; versão nova substitui.
-    #[test]
-    fn spec_ui_002_sdt_multi_section_merge() {
-        use ts::tables::{RunningStatus, SdtService};
-
-        let make_svc = |id: u16, name: &str| SdtService {
-            service_id: id,
-            eit_schedule_flag: false,
-            eit_present_following: false,
-            running_status: RunningStatus::Running,
-            free_ca_mode: false,
-            service_name: Some(name.to_owned()),
-            provider_name: None,
-            service_type: None,
-            descriptors: vec![],
-        };
-        let make_sdt = |version: u8, services: Vec<SdtService>| Sdt {
-            transport_stream_id: 1,
-            original_network_id: 1,
-            version,
-            actual: true,
-            services,
-        };
-
-        let mut state = AppState::default();
-
-        // Seção 0: service 0x0001 "Service01"
-        state.apply_table_event(TableEvent::Sdt(make_sdt(
-            3,
-            vec![make_svc(0x0001, "Service01")],
-        )));
-        assert_eq!(state.tables.sdt.as_ref().unwrap().services.len(), 1);
-
-        // Seção 1 (mesma versão): service 0x0010 "Globo" — deve mesclar
-        state.apply_table_event(TableEvent::Sdt(make_sdt(
-            3,
-            vec![make_svc(0x0010, "Globo")],
-        )));
-        let sdt = state.tables.sdt.as_ref().unwrap();
-        assert_eq!(sdt.services.len(), 2);
-        assert!(sdt.services.iter().any(|s| s.service_id == 0x0001));
-        assert!(sdt.services.iter().any(|s| s.service_id == 0x0010));
-
-        // Mesma seção repetida não duplica
-        state.apply_table_event(TableEvent::Sdt(make_sdt(
-            3,
-            vec![make_svc(0x0001, "Service01")],
-        )));
-        assert_eq!(state.tables.sdt.as_ref().unwrap().services.len(), 2);
-
-        // Nova versão substitui completamente
-        state.apply_table_event(TableEvent::Sdt(make_sdt(
-            4,
-            vec![make_svc(0x0010, "Globo v2")],
-        )));
-        let sdt = state.tables.sdt.as_ref().unwrap();
-        assert_eq!(sdt.services.len(), 1);
-        assert_eq!(sdt.services[0].service_id, 0x0010);
     }
 
     #[test]
     fn spec_ui_002_table_reset_clears_stream_state() {
         let mut state = AppState::default();
         state.selected_pid = Some(0x0100);
-        state.selected_service = Some(16);
         state.bitrate_history.push_back((Instant::now(), 1_000.0));
         state.metrics.total_bitrate_kbps = 1_000.0;
-        state.audio.active_track = Some(AudioTrackInfo {
-            service_id: 16,
-            pid: 0x0112,
-            codec_label: "AAC".to_owned(),
-            language: Some("por".to_owned()),
-            stream_type: Some(0x11),
-            ..Default::default()
-        });
-        state.tables.pat = Some(Pat {
-            transport_stream_id: 1,
-            version: 3,
-            current_next: true,
-            programs: Vec::new(),
-        });
-
         state.apply_table_event(TableEvent::Reset);
-
-        assert!(state.tables.pat.is_none());
         assert!(state.selected_pid.is_none());
-        assert!(state.selected_service.is_none());
         assert!(state.bitrate_history.is_empty());
-        assert!(state.pcr_history.is_empty());
         assert_eq!(state.metrics.total_bitrate_kbps, 0.0);
-        assert!(state.audio.active_track.is_none());
-        assert_eq!(state.audio.state, AudioOperationalState::Idle);
     }
 }

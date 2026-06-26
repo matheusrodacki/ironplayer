@@ -1,0 +1,941 @@
+// IronPlayer — UI Broadcast em Slint.
+// Coluna esquerda com 4 abas (PIDs / Tabelas / Serviços / Media Info),
+// vídeo + gráficos ocupando o restante, status bar no rodapé.
+// Dados preenchidos pela camada Rust (src/lib.rs).
+
+import { ListView, ScrollView } from "std-widgets.slint";
+
+// ─── Tema ───────────────────────────────────────────────────────────────────
+export global Theme {
+    out property <color> bg: #0a0c0e;
+    out property <color> panel: #111418;
+    out property <color> panel-alt: #161b21;
+    out property <color> card: #15191f;
+    out property <color> border: #20262e;
+    out property <color> border-soft: #1a1f25;
+    out property <color> accent: #e8943a;
+    out property <color> text: #dde4ec;
+    out property <color> text-dim: #8a95a3;
+    out property <color> text-faint: #5f6b78;
+    out property <color> green: #57c08a;
+    out property <color> red: #d6605f;
+    out property <color> blue: #5aa0d0;
+    out property <length> radius: 6px;
+    out property <string> mono: "Consolas";
+}
+
+// ─── Structs de dados (espelhados em Rust) ──────────────────────────────────
+export struct PidRow {
+    pid-dec: string,
+    pid-hex: string,
+    kind: string,
+    kind-color: color,
+    label: string,
+    kbps: string,
+    cc: string,
+    pkts: string,
+    has-errors: bool,
+    selected: bool,
+    pid: int,
+}
+
+export struct InfoRow {
+    key: string,
+    value: string,
+    accent: bool,
+}
+
+export struct PsiCard {
+    name: string,
+    detail: string,
+    present: bool,
+}
+
+export struct PsiRow {
+    a: PsiCard,
+    b: PsiCard,
+    has-b: bool,
+}
+
+export struct ServiceRow {
+    id: string,
+    name: string,
+    provider: string,
+    running: string,
+    scrambled: bool,
+    selected: bool,
+    service-id: int,
+}
+
+// ─── Badge de tipo de PID ────────────────────────────────────────────────────
+component TypeBadge inherits Rectangle {
+    in property <string> text;
+    in property <color> tint;
+    in property <bool> filled: true;
+    width: txt.preferred-width + 14px;
+    height: 18px;
+    border-radius: 3px;
+    background: filled ? tint.with-alpha(0.16) : transparent;
+    border-width: 1px;
+    border-color: tint.with-alpha(0.45);
+    txt := Text {
+        text: root.text;
+        color: tint;
+        font-size: 10px;
+        font-weight: 700;
+        font-family: Theme.mono;
+        letter-spacing: 0.4px;
+    }
+}
+
+// ─── Card individual PSI/SI ──────────────────────────────────────────────────
+component PsiCardView inherits Rectangle {
+    in property <PsiCard> card;
+    height: 50px;
+    background: Theme.card;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: card.present ? Theme.border : Theme.border-soft;
+    opacity: card.present ? 1.0 : 0.45;
+    VerticalLayout {
+        padding: 9px;
+        spacing: 2px;
+        HorizontalLayout {
+            Text {
+                text: card.name;
+                color: Theme.text;
+                font-size: 13px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Rectangle {
+                width: 7px; height: 7px; border-radius: 3.5px;
+                background: card.present ? Theme.green : Theme.text-faint;
+            }
+        }
+        Text {
+            text: card.detail;
+            color: Theme.text-faint;
+            font-size: 10px;
+            overflow: elide;
+        }
+    }
+}
+
+// ─── Bloco de informação chave/valor ─────────────────────────────────────────
+component InfoLine inherits HorizontalLayout {
+    in property <string> key;
+    in property <string> value;
+    in property <bool> accent: false;
+    height: 26px;
+    Text {
+        text: root.key;
+        color: Theme.text-dim;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    Rectangle { horizontal-stretch: 1; }
+    Text {
+        text: root.value;
+        color: root.accent ? Theme.accent : Theme.text;
+        font-size: 13px;
+        font-family: Theme.mono;
+        font-weight: root.accent ? 700 : 500;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+    }
+}
+
+// ─── Cabeçalho de seção ───────────────────────────────────────────────────────
+component SectionHeader inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> trailing;
+    height: 28px;
+    Text {
+        text: root.title;
+        color: Theme.text-dim;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 1.2px;
+        vertical-alignment: center;
+    }
+    Rectangle { horizontal-stretch: 1; }
+    Text {
+        text: root.trailing;
+        color: Theme.text-faint;
+        font-size: 10px;
+        letter-spacing: 0.8px;
+        vertical-alignment: center;
+    }
+}
+
+// ─── Aba clicável ─────────────────────────────────────────────────────────────
+component TabButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    height: 28px;
+    width: lbl.preferred-width;
+    VerticalLayout {
+        lbl := Text {
+            text: root.text;
+            color: root.active ? Theme.text : Theme.text-faint;
+            font-size: 14px;
+            font-weight: root.active ? 700 : 500;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            height: 2px;
+            background: root.active ? Theme.accent : transparent;
+        }
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+// ─── Card de gráfico ─────────────────────────────────────────────────────────
+component ChartCard inherits Rectangle {
+    in property <string> title;
+    in property <string> unit;
+    in property <string> big-value;
+    in property <string> sub-value;
+    in property <string> area-commands;
+    in property <string> line-commands;
+    in property <color> line-color;
+    in property <bool> dashed-guides: false;
+    background: Theme.card;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border-soft;
+    VerticalLayout {
+        padding: 14px;
+        spacing: 3px;
+        HorizontalLayout {
+            Text {
+                text: root.title;
+                color: Theme.text-dim;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 1px;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                text: root.unit;
+                color: Theme.text-faint;
+                font-size: 10px;
+            }
+        }
+        HorizontalLayout {
+            spacing: 7px;
+            alignment: start;
+            Text {
+                text: root.big-value;
+                color: root.line-color;
+                font-size: 24px;
+                font-weight: 800;
+                font-family: Theme.mono;
+            }
+            Text {
+                text: root.sub-value;
+                color: Theme.text-dim;
+                font-size: 11px;
+                vertical-alignment: bottom;
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            if root.dashed-guides : Rectangle {
+                y: parent.height / 2;
+                height: 1px;
+                background: Theme.border;
+            }
+            Path {
+                width: 100%;
+                height: 100%;
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                commands: root.area-commands;
+                fill: root.line-color.with-alpha(0.14);
+            }
+            Path {
+                width: 100%;
+                height: 100%;
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                commands: root.line-commands;
+                stroke: root.line-color;
+                stroke-width: 1.5px;
+            }
+        }
+    }
+}
+
+// ─── Janela principal ─────────────────────────────────────────────────────────
+export component AppWindow inherits Window {
+    title: "IronPlayer";
+    preferred-width: 1360px;
+    preferred-height: 760px;
+    min-width: 1100px;
+    min-height: 660px;
+    background: Theme.bg;
+    default-font-family: "Segoe UI";
+    default-font-size: 14px;
+
+    // ── Estado (preenchido pela camada Rust) ───────────────────────────────
+    in-out property <string> url: "udp://@239.0.0.1:1234";
+    in property <bool> connected: false;
+    in property <bool> connecting: false;
+    in property <string> conn-label: "Desconectado";
+    in property <string> total-mbps: "—";
+    in property <string> cc-total: "0";
+    in property <string> buffer-pct: "0%";
+    in property <string> audio-summary: "—";
+    in property <string> hw-summary: "—";
+    in property <bool> live: false;
+    in property <string> timecode: "--:--:--:--";
+
+    in property <image> video-frame;
+    in property <bool> video-has-signal: false;
+    in property <string> video-caption: "sem sinal";
+    in property <string> video-res: "—";
+
+    in property <[PidRow]> pid-rows: [];
+    in property <string> pid-total: "—";
+    in property <int> pid-count: 0;
+
+    in property <[InfoRow]> video-info: [];
+    in property <[InfoRow]> audio-info: [];
+    in property <[PsiRow]> psi-rows: [];
+    in property <[ServiceRow]> services: [];
+
+    in property <string> bitrate-value: "—";
+    in property <string> bitrate-sub: "";
+    in property <string> bitrate-area: "";
+    in property <string> bitrate-line: "";
+    in property <string> jitter-value: "—";
+    in property <string> jitter-sub: "";
+    in property <string> jitter-line: "";
+
+    // Aba ativa da coluna esquerda: 0 PIDs · 1 Tabelas · 2 Serviços · 3 Media Info
+    in-out property <int> active-tab: 0;
+
+    // ── Callbacks (tratados em Rust) ───────────────────────────────────────
+    callback connect(string);
+    callback disconnect();
+    callback select-pid(int);
+    callback select-service(int);
+
+    VerticalLayout {
+        // ══ TOP BAR ══════════════════════════════════════════════════════
+        Rectangle {
+            height: 64px;
+            background: Theme.panel;
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+            HorizontalLayout {
+                padding-left: 18px;
+                padding-right: 16px;
+                padding-top: 13px;
+                padding-bottom: 13px;
+                spacing: 14px;
+                // Logo
+                HorizontalLayout {
+                    spacing: 11px;
+                    alignment: start;
+                    Path {
+                        width: 18px; height: 18px;
+                        viewbox-width: 10;
+                        viewbox-height: 10;
+                        commands: "M 5 0 L 10 5 L 5 10 L 0 5 Z";
+                        fill: Theme.accent;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 1px;
+                        Text {
+                            text: "IRONPLAYER";
+                            color: Theme.text;
+                            font-size: 17px;
+                            font-weight: 800;
+                            letter-spacing: 1.5px;
+                        }
+                        Text {
+                            text: "TS · STREAM ANALYZER";
+                            color: Theme.text-faint;
+                            font-size: 9px;
+                            letter-spacing: 1.5px;
+                        }
+                    }
+                }
+
+                Rectangle { width: 6px; }
+
+                // Protocolo
+                Rectangle {
+                    width: 104px;
+                    background: Theme.panel-alt;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 10px;
+                        Text {
+                            text: "UDP/TS";
+                            color: Theme.text-dim;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        // chevron ▾
+                        Path {
+                            width: 9px; height: 6px;
+                            y: (parent.height - 6px) / 2;
+                            viewbox-width: 10; viewbox-height: 6;
+                            commands: "M 0 0 L 5 6 L 10 0 Z";
+                            fill: Theme.text-faint;
+                        }
+                    }
+                }
+
+                // URL
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: Theme.panel-alt;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: root.connected ? Theme.green.with-alpha(0.4) : Theme.border;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 9px;
+                        Rectangle {
+                            width: 8px; height: 8px; y: (parent.height - 8px)/2;
+                            border-radius: 4px;
+                            background: root.connected ? Theme.green : (root.connecting ? Theme.accent : Theme.text-faint);
+                        }
+                        TextInput {
+                            text <=> root.url;
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-family: Theme.mono;
+                            vertical-alignment: center;
+                            single-line: true;
+                            horizontal-stretch: 1;
+                            accepted => { root.connect(root.url); }
+                        }
+                    }
+                }
+
+                // Conectar
+                Rectangle {
+                    width: 116px;
+                    background: root.connected ? Theme.panel-alt : (ta-conn.has-hover ? Theme.accent.brighter(0.15) : Theme.accent);
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: root.connected ? Theme.border : Theme.accent;
+                    Text {
+                        text: "Conectar";
+                        color: root.connected ? Theme.text-faint : #1a1206;
+                        font-size: 14px;
+                        font-weight: 700;
+                    }
+                    ta-conn := TouchArea {
+                        enabled: !root.connected;
+                        clicked => { root.connect(root.url); }
+                    }
+                }
+                // Desconectar
+                Rectangle {
+                    width: 124px;
+                    background: ta-disc.has-hover && root.connected ? Theme.panel-alt.brighter(0.3) : Theme.panel-alt;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: root.connected ? Theme.red.with-alpha(0.5) : Theme.border;
+                    Text {
+                        text: "Desconectar";
+                        color: root.connected ? Theme.text : Theme.text-faint;
+                        font-size: 14px;
+                        font-weight: 600;
+                    }
+                    ta-disc := TouchArea {
+                        enabled: root.connected || root.connecting;
+                        clicked => { root.disconnect(); }
+                    }
+                }
+
+                Rectangle { width: 4px; }
+
+                // Toggle Cinema/Broadcast
+                Rectangle {
+                    width: 184px;
+                    background: Theme.panel-alt;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    HorizontalLayout {
+                        padding: 4px;
+                        spacing: 4px;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            border-radius: 4px;
+                            Text { text: "Cinema"; color: Theme.text-dim; font-size: 13px; }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            border-radius: 4px;
+                            background: Theme.accent;
+                            Text { text: "Broadcast"; color: #1a1206; font-size: 13px; font-weight: 700; }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ══ CORPO ════════════════════════════════════════════════════════
+        HorizontalLayout {
+            padding: 12px;
+            spacing: 12px;
+
+            // ── PAINEL ESQUERDO: abas ──────────────────────────────────
+            Rectangle {
+                width: 528px;
+                background: Theme.panel;
+                border-radius: Theme.radius;
+                border-width: 1px;
+                border-color: Theme.border;
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 10px;
+                    // Abas
+                    HorizontalLayout {
+                        spacing: 20px;
+                        alignment: start;
+                        TabButton {
+                            text: "PIDs " + root.pid-count;
+                            active: root.active-tab == 0;
+                            clicked => { root.active-tab = 0; }
+                        }
+                        TabButton {
+                            text: "Tabelas";
+                            active: root.active-tab == 1;
+                            clicked => { root.active-tab = 1; }
+                        }
+                        TabButton {
+                            text: "Serviços";
+                            active: root.active-tab == 2;
+                            clicked => { root.active-tab = 2; }
+                        }
+                        TabButton {
+                            text: "Media Info";
+                            active: root.active-tab == 3;
+                            clicked => { root.active-tab = 3; }
+                        }
+                    }
+                    Rectangle { height: 1px; background: Theme.border-soft; }
+
+                    // ── Conteúdo: PIDs ──────────────────────────────────
+                    if root.active-tab == 0 : VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 30px;
+                                background: Theme.panel-alt;
+                                border-radius: 4px;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                Text {
+                                    x: 10px;
+                                    text: "filtrar PID, tipo ou serviço...";
+                                    color: Theme.text-faint;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Text {
+                                text: root.pid-total;
+                                color: Theme.accent;
+                                font-size: 13px;
+                                font-weight: 700;
+                                font-family: Theme.mono;
+                                vertical-alignment: center;
+                            }
+                        }
+                        HorizontalLayout {
+                            height: 20px;
+                            Text { text: "PID"; width: 60px; color: Theme.text-faint; font-size: 10px; letter-spacing: 0.5px; }
+                            Text { text: "TIPO"; width: 62px; color: Theme.text-faint; font-size: 10px; }
+                            Text { text: "LABEL"; horizontal-stretch: 1; color: Theme.text-faint; font-size: 10px; }
+                            Text { text: "KBPS"; width: 56px; color: Theme.text-faint; font-size: 10px; horizontal-alignment: right; }
+                            Text { text: "CC"; width: 28px; color: Theme.text-faint; font-size: 10px; horizontal-alignment: right; }
+                            Text { text: "PKTS"; width: 48px; color: Theme.text-faint; font-size: 10px; horizontal-alignment: right; }
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for row in root.pid-rows : Rectangle {
+                                height: 38px;
+                                background: row.selected ? Theme.accent.with-alpha(0.12) : (touch.has-hover ? Theme.panel-alt : transparent);
+                                border-radius: 4px;
+                                Rectangle {
+                                    x: 0; width: 2px;
+                                    background: row.selected ? Theme.accent : transparent;
+                                }
+                                HorizontalLayout {
+                                    padding-left: 7px;
+                                    padding-right: 2px;
+                                    VerticalLayout {
+                                        width: 54px;
+                                        alignment: center;
+                                        Text {
+                                            text: row.pid-dec;
+                                            color: row.has-errors ? Theme.red : Theme.text;
+                                            font-size: 13px;
+                                            font-weight: 600;
+                                            font-family: Theme.mono;
+                                        }
+                                        Text {
+                                            text: row.pid-hex;
+                                            color: Theme.text-faint;
+                                            font-size: 9px;
+                                            font-family: Theme.mono;
+                                        }
+                                    }
+                                    Rectangle {
+                                        width: 62px;
+                                        TypeBadge {
+                                            x: 0;
+                                            text: row.kind;
+                                            tint: row.kind-color;
+                                            filled: row.kind != "—";
+                                        }
+                                    }
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: row.label;
+                                        color: Theme.text-dim;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        width: 56px;
+                                        text: row.kbps;
+                                        color: Theme.text;
+                                        font-size: 12px;
+                                        font-family: Theme.mono;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        width: 28px;
+                                        text: row.cc;
+                                        color: row.has-errors ? Theme.red : Theme.text-faint;
+                                        font-size: 12px;
+                                        font-family: Theme.mono;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        width: 48px;
+                                        text: row.pkts;
+                                        color: Theme.text-dim;
+                                        font-size: 12px;
+                                        font-family: Theme.mono;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                touch := TouchArea {
+                                    clicked => { root.select-pid(row.pid); }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Conteúdo: Tabelas (grade PSI/SI) ───────────────
+                    if root.active-tab == 1 : ScrollView {
+                        VerticalLayout {
+                            spacing: 8px;
+                            SectionHeader { title: "TABELAS PSI / SI"; trailing: "DVB · ATSC · ISDB"; }
+                            for prow in root.psi-rows : HorizontalLayout {
+                                spacing: 8px;
+                                PsiCardView { horizontal-stretch: 1; card: prow.a; }
+                                if prow.has-b : PsiCardView { horizontal-stretch: 1; card: prow.b; }
+                                if !prow.has-b : Rectangle { horizontal-stretch: 1; }
+                            }
+                            Rectangle { vertical-stretch: 1; }
+                        }
+                    }
+
+                    // ── Conteúdo: Serviços ─────────────────────────────
+                    if root.active-tab == 2 : VerticalLayout {
+                        spacing: 8px;
+                        SectionHeader { title: "SERVIÇOS DVB"; trailing: "SDT"; }
+                        if root.services.length == 0 : Text {
+                            text: "Nenhum serviço descrito (SDT) recebido.";
+                            color: Theme.text-faint;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for svc in root.services : Rectangle {
+                                height: 50px;
+                                background: svc.selected ? Theme.accent.with-alpha(0.12) : (sta.has-hover ? Theme.panel-alt : transparent);
+                                border-radius: 5px;
+                                Rectangle { x: 0; width: 2px; background: svc.selected ? Theme.accent : transparent; }
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 8px;
+                                    spacing: 10px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        Text {
+                                            text: svc.name;
+                                            color: Theme.text;
+                                            font-size: 13px;
+                                            font-weight: 600;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: svc.provider;
+                                            color: Theme.text-faint;
+                                            font-size: 10px;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        Text {
+                                            text: svc.id;
+                                            color: Theme.text-dim;
+                                            font-size: 11px;
+                                            font-family: Theme.mono;
+                                            horizontal-alignment: right;
+                                        }
+                                        Text {
+                                            text: svc.scrambled ? "CA · " + svc.running : svc.running;
+                                            color: svc.scrambled ? Theme.accent : Theme.green;
+                                            font-size: 10px;
+                                            horizontal-alignment: right;
+                                        }
+                                    }
+                                }
+                                sta := TouchArea {
+                                    clicked => { root.select-service(svc.service-id); }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Conteúdo: Media Info ───────────────────────────
+                    if root.active-tab == 3 : ScrollView {
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text { text: "VÍDEO"; color: Theme.accent; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; }
+                            if root.video-info.length == 0 : Text {
+                                text: "Aguardando análise do stream...";
+                                color: Theme.text-faint; font-size: 12px;
+                            }
+                            for i in root.video-info : InfoLine { key: i.key; value: i.value; accent: i.accent; }
+                            Rectangle { height: 10px; }
+                            Text { text: "ÁUDIO"; color: Theme.accent; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; }
+                            for i in root.audio-info : InfoLine { key: i.key; value: i.value; accent: i.accent; }
+                            Rectangle { vertical-stretch: 1; min-height: 8px; }
+                        }
+                    }
+                }
+            }
+
+            // ── CENTRO: vídeo + gráficos ────────────────────────────────
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 12px;
+                Rectangle {
+                    vertical-stretch: 3;
+                    background: #050607;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    clip: true;
+
+                    if root.video-has-signal : Image {
+                        width: 100%;
+                        height: 100%;
+                        source: root.video-frame;
+                        image-fit: contain;
+                    }
+                    if !root.video-has-signal : VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: "SINAL DE VÍDEO · " + root.video-res;
+                            color: Theme.text-faint;
+                            font-size: 14px;
+                            letter-spacing: 2px;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: root.video-caption;
+                            color: #3a434d;
+                            font-size: 11px;
+                            letter-spacing: 1px;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    // chip de codec (sup. esquerdo)
+                    Rectangle {
+                        x: 14px; y: 14px;
+                        width: cap.preferred-width + 22px;
+                        height: 26px;
+                        background: #0b0d10dd;
+                        border-radius: 5px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        cap := Text {
+                            text: root.video-caption;
+                            color: Theme.text;
+                            font-size: 12px;
+                            font-family: Theme.mono;
+                        }
+                    }
+
+                    // AO VIVO (sup. direito)
+                    if root.live : Rectangle {
+                        x: parent.width - self.width - 14px;
+                        y: 14px;
+                        width: 98px;
+                        height: 26px;
+                        background: Theme.red.with-alpha(0.16);
+                        border-radius: 5px;
+                        border-width: 1px;
+                        border-color: Theme.red.with-alpha(0.55);
+                        HorizontalLayout {
+                            padding-left: 11px;
+                            padding-right: 11px;
+                            spacing: 7px;
+                            alignment: center;
+                            Rectangle {
+                                width: 7px; height: 7px; border-radius: 3.5px;
+                                y: (parent.height - 7px) / 2;
+                                background: Theme.red;
+                            }
+                            Text {
+                                text: "AO VIVO";
+                                color: Theme.red;
+                                font-size: 11px;
+                                font-weight: 700;
+                                letter-spacing: 0.5px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+
+                    // barra inferior: reproduzindo + timecode
+                    Rectangle {
+                        x: 14px;
+                        y: parent.height - 40px;
+                        width: parent.width - 28px;
+                        height: 28px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                // play ▶
+                                Path {
+                                    width: 11px; height: 12px;
+                                    y: (parent.height - 12px) / 2;
+                                    viewbox-width: 10; viewbox-height: 12;
+                                    commands: "M 0 0 L 10 6 L 0 12 Z";
+                                    fill: root.connected ? Theme.green : Theme.text-faint;
+                                }
+                                Text {
+                                    text: root.connected ? "Reproduzindo" : "Parado";
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text {
+                                text: root.timecode;
+                                color: Theme.accent;
+                                font-size: 14px;
+                                font-weight: 700;
+                                font-family: Theme.mono;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    vertical-stretch: 2;
+                    spacing: 12px;
+                    ChartCard {
+                        horizontal-stretch: 1;
+                        title: "BITRATE · 60 S";
+                        unit: "Total";
+                        big-value: root.bitrate-value;
+                        sub-value: root.bitrate-sub;
+                        area-commands: root.bitrate-area;
+                        line-commands: root.bitrate-line;
+                        line-color: Theme.green;
+                    }
+                    ChartCard {
+                        horizontal-stretch: 1;
+                        title: "PCR JITTER";
+                        unit: "µs";
+                        big-value: root.jitter-value;
+                        sub-value: root.jitter-sub;
+                        line-commands: root.jitter-line;
+                        line-color: Theme.blue;
+                        dashed-guides: true;
+                    }
+                }
+            }
+        }
+
+        // ══ STATUS BAR ═══════════════════════════════════════════════════
+        Rectangle {
+            height: 28px;
+            background: Theme.panel;
+            Rectangle { y: 0; height: 1px; background: Theme.border; }
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 18px;
+                HorizontalLayout {
+                    spacing: 7px;
+                    alignment: start;
+                    Rectangle {
+                        width: 8px; height: 8px; y: (parent.height - 8px)/2; border-radius: 4px;
+                        background: root.connected ? Theme.green : Theme.text-faint;
+                    }
+                    Text {
+                        text: root.conn-label;
+                        color: Theme.text-dim;
+                        font-size: 11px;
+                        font-family: Theme.mono;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: root.total-mbps + " Mbps"; color: Theme.text-dim; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
+                Text { text: "CC " + root.cc-total; color: Theme.text-dim; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
+                Text { text: "buf " + root.buffer-pct; color: Theme.text-dim; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
+                Text { text: root.audio-summary; color: Theme.text-dim; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
+                Text { text: root.hw-summary; color: Theme.text-faint; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
+            }
+        }
+    }
+}

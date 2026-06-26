@@ -15,7 +15,7 @@ use ts::tables::{
     Pat, Pmt, PmtStream, Sdt, Tdt, Tot,
 };
 use ts::{CompleteSection, Pid, ProbeStreamMeta};
-use ui::{AudioOperationalState, AudioStatusSnapshot, AudioTrackInfo, TableEvent};
+use ui_slint::{AudioOperationalState, AudioStatusSnapshot, AudioTrackInfo, TableEvent};
 
 use crate::channels::BoundedSender;
 

@@ -11,7 +11,7 @@ use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use net::NetEvent;
 use ts::{CompleteSection, PcrEvent, PesData, SectionData, TsEvent};
-use ui::TableEvent;
+use ui_slint::TableEvent;
 
 // ─── Capacidades (SPEC-CHAN-001) ──────────────────────────────────────────────
 

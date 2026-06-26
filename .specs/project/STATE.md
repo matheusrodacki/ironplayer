@@ -16,6 +16,7 @@
 | 2026-05-19 | D-006 | egui/eframe com backend wgpu (D3D11 no Windows)           | Immediate-mode simplifica estado de UI; D3D11 nativo no target              |
 | 2026-05-19 | D-007 | MSRV Rust 1.78 (stable)                                   | Suporte a `impl Trait` em posições variadas; disponível no CI               |
 | 2026-06-24 | D-008 | `AudioClockHandle::anchor_pts` imutável na UI; skew de mux absorvido pela `VideoQueue` (cap=64) | `shift_anchor` na UI adiantava vídeo ~1–2 s vs áudio audível; cf. L-002 |
+| 2026-06-26 | D-009 | UI Broadcast migrada de egui para **Slint 1.17** (femtovg); `crates/ui` removida, nova `crates/ui-slint`; vídeo via conversão CPU YUV→RGBA em thread worker (sem device wgpu compartilhado) | POC de reestilização (spec-11-slint). femtovg escolhido por compatibilidade com `+crt-static` (Skia/`skia-bindings` conflita). `av` mantém egui interno. Decoder já entrega planos na CPU → não precisa de zero-copy para um 1º corte. cf. L-006 |
 
 ---
 
@@ -143,6 +144,22 @@ Continuação do debug do Globo REDE HD (HEVC 4:2:2). Após L-004, o vídeo abri
 
 Refs: `crates/av/src/decoder.rs` (`is_hwaccel_active`, `hw_decode_codec`, `hw_frame_pool_in_use`), `crates/av/src/scan_type.rs` (`update_scan_type`), `src/main.rs` (snapshot de `PipelineMetrics`).
 
+### L-006 — UI Slint: conversão CPU de vídeo trava vs egui (zero-copy GPU pendente) (2026-06-26)
+
+POC da UI Slint (spec-11-slint, [D-009](#decisões-arquiteturais)). Em uso ao vivo a 1080p, o vídeo **engasga visivelmente** comparado à UI egui anterior — mesmo em build `--release` e com a conversão fora da thread da UI.
+
+| Sintoma | Causa raiz | Encaminhamento |
+| ------- | ---------- | -------------- |
+| Travamento/stutter do vídeo na UI Slint, pior que egui | A UI egui fazia **YUV→RGB num shader wgpu (GPU)** — a CPU nunca tocava nos pixels no caminho quente (cf. `crates/av/src/renderer.rs` pipelines NV12/YUV). O POC Slint faz **conversão YUV→RGBA na CPU** por frame + upload de textura RGBA ao femtovg por frame; em 1080p são ~2 Mpx/frame na CPU + ~8 MB de upload/frame | **Próximo passo:** zero-copy GPU via `slint::wgpu_28` — usar o mesmo `wgpu::Device`/`Queue` do Slint (`WGPUConfiguration::Manual` ou `set_rendering_notifier`), fazer YUV→RGB num shader e importar a textura como `slint::Image`. Reaproveitar os shaders de `crates/av/src/renderer.rs` (`nv12_to_rgb.wgsl`, `yuv_to_rgb.wgsl`) |
+
+**Mitigações já aplicadas (não regredir):**
+
+1. Conversão roda em thread worker dedicada (`slint-video-convert`), **nunca** no event loop do Slint — o `Poller` só resolve timing (`VideoQueue`/`MasterClock`) e despacha o frame pronto. Não reintroduzir conversão por pixel na thread da UI.
+2. Conversão escreve **direto** nos bytes do `SharedPixelBuffer` (`make_mut_bytes`), sem `Vec` intermediário nem zero-fill redundante.
+3. `+crt-static` impede Skia (`skia-bindings`); o renderer é **femtovg**. Ao adotar `slint::wgpu_28`, validar build com CRT estático.
+
+Refs: `crates/ui-slint/src/video.rs` (conversão CPU), `crates/ui-slint/src/lib.rs` (`VideoState`, worker `slint-video-convert`), `crates/av/src/renderer.rs` (pipelines GPU de referência), `.specs/features/spec-11-slint/plan.md`.
+
 ---
 
 ## Pendências
@@ -151,3 +168,6 @@ Refs: `crates/av/src/decoder.rs` (`is_hwaccel_active`, `hw_decode_codec`, `hw_fr
 - [ ] Criar script de geração de fixtures sintéticas para tabelas DVB
 - [ ] Escolher entre `tokio::sync::watch` vs `arc-swap` para snapshot da UI
 - [ ] Definir política de versionamento semântico (SemVer vs CalVer)
+- [ ] **Zero-copy GPU para a UI Slint** (`slint::wgpu_28`) — resolver o stutter de vídeo (cf. L-006)
+- [ ] Abas Tabelas/Serviços do Slint: detalhar conteúdo (árvore PSI/SI, EIT p/f) além da grade/lista atual
+- [ ] Avaliar migrar o modo **Cinema** para Slint (hoje só stub visual no toggle)

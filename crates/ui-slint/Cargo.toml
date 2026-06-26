@@ -1,0 +1,21 @@
+[package]
+name    = "ui-slint"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ui_slint"
+path = "src/lib.rs"
+
+[dependencies]
+ts  = { path = "../ts" }
+av  = { path = "../av" }
+net = { path = "../net" }
+
+slint             = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
+crossbeam-channel = { workspace = true }
+chrono            = { version = "0.4", default-features = false, features = ["std", "clock"] }
+tracing           = { workspace = true }
+
+[build-dependencies]
+slint-build = "1.17"

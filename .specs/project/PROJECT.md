@@ -1,9 +1,11 @@
 # IronPlayer — Visão do Projeto
 
-- **Data:** 2026-05-19
+- **Data:** 2026-05-19 (atualizado 2026-06-26)
 - **Status:** Ativo — fase de documentação / pré-implementação
 - **Owner:** Open Source Community
-- **Stack:** Rust · egui/eframe · FFmpeg (decode only) · Windows 10/11 x86-64
+- **Stack:** Rust · Slint (UI Broadcast, POC — substitui egui) · FFmpeg (decode only) · Windows 10/11 x86-64
+
+> **Atualização 2026-06-26 (spec-11-slint):** a UI do modo **Broadcast** foi reescrita de egui para **Slint 1.17** (renderer femtovg), na nova crate `crates/ui-slint`; `crates/ui` (egui) foi removida. É um POC de reestilização — o backend (`ts`/`av`/`net`) permanece. O `crates/av` ainda usa egui internamente. Pendência conhecida: o vídeo usa conversão YUV→RGBA na CPU; o caminho zero-copy GPU (`slint::wgpu_28`) é o próximo passo de performance. Ver [D-009](STATE.md) e [L-006](STATE.md).
 
 ---
 
@@ -54,8 +56,8 @@ O **IronPlayer** é um player e analisador de MPEG-TS para profissionais de víd
 | Camada              | Tecnologia                              | Justificativa                                                       |
 | ------------------- | --------------------------------------- | ------------------------------------------------------------------- |
 | Linguagem           | Rust stable (MSRV: 1.78)                | Memory safety, performance, ecossistema de broadcast em crescimento |
-| UI                  | egui 0.29 / eframe 0.29                 | Immediate-mode, integra com wgpu, Windows-first                     |
-| Renderização GPU    | wgpu (backend D3D11)                    | Nativo Windows, sem OpenGL                                          |
+| UI (Broadcast)      | Slint 1.17 (renderer femtovg)           | Markup declarativo, visual moderno; POC substitui egui (spec-11)    |
+| Renderização GPU    | wgpu (backend D3D11) no decode `av`     | Nativo Windows. UI Slint usa caminho CPU p/ vídeo no POC; zero-copy GPU (`slint::wgpu_28`) é follow-up |
 | Decodificação A/V   | FFmpeg 7.x (libavcodec) via ffmpeg-next | Suporte a todos os codecs relevantes                                |
 | Áudio               | cpal 0.15 (WASAPI)                      | Nativo Windows, latência baixa                                      |
 | Async runtime       | tokio 1.x                               | I/O de rede; thread pool                                            |
@@ -75,15 +77,15 @@ ironstream/
 │   ├── net/                # SPEC-NET-*  recepção UDP/RTP multicast
 │   ├── ts/                 # SPEC-TS-*, SPEC-TABLE-*, SPEC-METRICS-*
 │   ├── av/                 # SPEC-AV-*  FFmpeg bridge + render + áudio
-│   └── ui/                 # SPEC-UI-*  egui app
+│   └── ui-slint/           # SPEC-UI-*  app Slint (POC; substitui egui `ui/`)
 └── src/
     └── main.rs             # wiring de canais + bootstrap
 ```
 
 **Invariante de dependência:**
 ```
-ui  →  ts, av, net
-av  →  ts
+ui-slint  →  ts, av, net
+av        →  ts
 ts  →  (sem deps internas)
 net →  (sem deps internas)
 ```
@@ -99,6 +101,6 @@ net →  (sem deps internas)
 | `SPEC-TABLE-*`   | `crates/ts::tables` — tabelas PSI/SI/DVB |
 | `SPEC-METRICS-*` | `crates/ts::metrics` — bitrate e erros   |
 | `SPEC-AV-*`      | `crates/av`                              |
-| `SPEC-UI-*`      | `crates/ui`                              |
+| `SPEC-UI-*`      | `crates/ui-slint` (antes `crates/ui`)    |
 | `SPEC-CFG-*`     | `AppConfig` (shared)                     |
 | `SPEC-CHAN-*`    | Contratos de canal entre crates          |

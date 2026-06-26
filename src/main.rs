@@ -20,7 +20,7 @@ use ts::{
     },
     CompleteSection, SectionAssembler, SectionData, TsDemuxer,
 };
-use ui::IronPlayerApp;
+use ui_slint::PipelineHandles;
 
 // ── CLI parsing ───────────────────────────────────────────────────────────────
 
@@ -70,7 +70,7 @@ impl CliArgs {
 /// Mantém os senders do pipeline vivos até o shutdown limpo.
 ///
 /// Enquanto este guard existir, os canais permanecem abertos.  Ao ser dropado
-/// em `IronPlayerApp::on_exit`, desencadeia o encerramento em cascata:
+/// após o fechamento da janela Slint, desencadeia o encerramento em cascata:
 ///
 /// `net_raw` fecha → rtp-strip sai → `ts_raw` fecha → ts-demux sai →
 /// `section_data` fecha → sec-asm sai → `complete_sections` fecha →
@@ -93,8 +93,8 @@ enum AudioCommand {
 
 /// Encapsula handles e recursos do pipeline para shutdown limpo.
 ///
-/// Injetado em `IronPlayerApp` via `eframe::CreationContext` e recuperado
-/// em `on_exit` para encerramento em cascata.
+/// Mantido em escopo durante o event loop do Slint e dropado ao seu término
+/// para encerramento em cascata.
 struct PipelineGuard {
     pipeline_handles: Vec<Option<std::thread::JoinHandle<()>>>,
     metrics_handle: Option<std::thread::JoinHandle<()>>,
@@ -106,7 +106,7 @@ struct PipelineGuard {
 
 impl PipelineGuard {
     fn shutdown(&mut self) {
-        tracing::info!("shutdown iniciado pelo eframe::App::on_exit");
+        tracing::info!("shutdown iniciado ao fechar a janela Slint");
 
         // 1. Para a conexão de rede ativa (se houver)
         if let Some(h) = self.current_net_stop.lock().unwrap().take() {
@@ -132,25 +132,6 @@ impl PipelineGuard {
         }
 
         tracing::info!("shutdown limpo concluido");
-    }
-}
-
-// ── IronPlayerAppExt ──────────────────────────────────────────────────────────
-
-/// Wrapper que adiciona shutdown do pipeline ao `IronPlayerApp` do crate `ui`.
-struct IronPlayerAppWithPipeline {
-    inner: IronPlayerApp,
-    guard: PipelineGuard,
-}
-
-impl eframe::App for IronPlayerAppWithPipeline {
-    fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
-        self.inner.update(ctx, frame);
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.inner.close_command_channel();
-        self.guard.shutdown();
     }
 }
 
@@ -183,7 +164,7 @@ fn join_with_deadline(handle: std::thread::JoinHandle<()>, deadline: Instant) {
 }
 
 fn refresh_audio_status_from_output(
-    audio_status: &Arc<std::sync::RwLock<ui::AudioStatusSnapshot>>,
+    audio_status: &Arc<std::sync::RwLock<ui_slint::AudioStatusSnapshot>>,
     audio_out: &av::AudioOutput,
 ) {
     if let Ok(mut status) = audio_status.write() {
@@ -195,14 +176,14 @@ fn refresh_audio_status_from_output(
         status.errors.underruns = audio_out.underrun_count();
         status.errors.overruns = audio_out.overrun_count();
         status.state = if status.buffer_level >= 0.5 {
-            ui::AudioOperationalState::Playing
+            ui_slint::AudioOperationalState::Playing
         } else {
-            ui::AudioOperationalState::Buffering
+            ui_slint::AudioOperationalState::Buffering
         };
     }
 }
 
-fn apply_audio_frame_metadata(status: &mut ui::AudioStatusSnapshot, frame: &av::AudioFrame) {
+fn apply_audio_frame_metadata(status: &mut ui_slint::AudioStatusSnapshot, frame: &av::AudioFrame) {
     status.sample_rate_hz = Some(frame.sample_rate);
     status.set_channel_counts(frame.source_channels, frame.channels);
     status.codec_profile = frame.stream_info.profile_label.clone();
@@ -307,7 +288,7 @@ fn bootstrap_d3d11_device(
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
-fn main() -> eframe::Result<()> {
+fn main() -> anyhow::Result<()> {
     // 1. Init tracing
     //
     // O filtro default silencia bibliotecas de UI/GPU notoriamente barulhentas
@@ -319,7 +300,8 @@ fn main() -> eframe::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new(
                     "info,wgpu=warn,wgpu_core=warn,wgpu_hal=error,naga=warn,\
-                     winit=warn,glutin=warn,eframe=warn,egui_wgpu=warn",
+                     winit=warn,glutin=warn,femtovg=warn,i_slint_core=warn,\
+                     i_slint_backend_winit=warn",
                 )
             }),
         )
@@ -378,10 +360,10 @@ fn main() -> eframe::Result<()> {
         MetricsStopToken::new();
 
     // Estado de conexão compartilhado entre cmd-handler e IronPlayerApp
-    let conn_state: Arc<std::sync::RwLock<ui::ConnectionState>> =
-        Arc::new(std::sync::RwLock::new(ui::ConnectionState::Idle));
-    let audio_status: Arc<std::sync::RwLock<ui::AudioStatusSnapshot>> =
-        Arc::new(std::sync::RwLock::new(ui::AudioStatusSnapshot::default()));
+    let conn_state: Arc<std::sync::RwLock<ui_slint::ConnectionState>> =
+        Arc::new(std::sync::RwLock::new(ui_slint::ConnectionState::Idle));
+    let audio_status: Arc<std::sync::RwLock<ui_slint::AudioStatusSnapshot>> =
+        Arc::new(std::sync::RwLock::new(ui_slint::AudioStatusSnapshot::default()));
     if let Ok(mut status) = audio_status.write() {
         status.set_volume(cfg.player.volume);
     }
@@ -906,7 +888,7 @@ fn main() -> eframe::Result<()> {
                                             if let Ok(mut status) = audio_status.write() {
                                                 status.errors.decode_errors += 1;
                                                 status.errors.last_error = Some(e.to_string());
-                                                status.state = ui::AudioOperationalState::Error;
+                                                status.state = ui_slint::AudioOperationalState::Error;
                                             }
                                         }
                                         let n = decode_err_count.entry(packet.pid).or_insert(0);
@@ -991,7 +973,7 @@ fn main() -> eframe::Result<()> {
                         if let Some(out) = audio_out.as_mut() {
                             if out.needs_rebuild() {
                                 if let Ok(mut status) = audio_status.write() {
-                                    status.state = ui::AudioOperationalState::Recovering;
+                                    status.state = ui_slint::AudioOperationalState::Recovering;
                                 }
                                 match out.rebuild_stream() {
                                     Ok(()) => {
@@ -1003,7 +985,7 @@ fn main() -> eframe::Result<()> {
                                         if let Ok(mut status) = audio_status.write() {
                                             status.errors.output_errors += 1;
                                             status.errors.last_error = Some(e.to_string());
-                                            status.state = ui::AudioOperationalState::Error;
+                                            status.state = ui_slint::AudioOperationalState::Error;
                                         }
                                         if rebuild_failures == 1 || rebuild_failures.is_multiple_of(20) {
                                             tracing::warn!(
@@ -1075,7 +1057,7 @@ fn main() -> eframe::Result<()> {
                                         status.set_volume(initial_volume);
                                         apply_audio_frame_metadata(&mut status, &frame);
                                         status.buffer_level = 0.0;
-                                        status.state = ui::AudioOperationalState::Buffering;
+                                        status.state = ui_slint::AudioOperationalState::Buffering;
                                     }
                                     tracing::info!(
                                         sample_rate = frame.sample_rate,
@@ -1089,7 +1071,7 @@ fn main() -> eframe::Result<()> {
                                     if let Ok(mut status) = audio_status.write() {
                                         status.errors.output_errors += 1;
                                         status.errors.last_error = Some(e.to_string());
-                                        status.state = ui::AudioOperationalState::Error;
+                                        status.state = ui_slint::AudioOperationalState::Error;
                                     }
                                     tracing::error!(
                                         %e,
@@ -1129,7 +1111,7 @@ fn main() -> eframe::Result<()> {
                     }
 
                     if let Ok(mut status) = audio_status.write() {
-                        status.reset_stream_runtime(ui::AudioOperationalState::Idle);
+                        status.reset_stream_runtime(ui_slint::AudioOperationalState::Idle);
                     }
 
                     tracing::info!("audio-out: encerrado normalmente");
@@ -1149,7 +1131,7 @@ fn main() -> eframe::Result<()> {
     tracing::info!(threads = handles.len() + 1, "pipeline de backend iniciado");
 
     // 13. Canal de comandos UI → pipeline
-    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<ui::AppCommand>(channels::CAP_APP_COMMANDS);
+    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<ui_slint::AppCommand>(channels::CAP_APP_COMMANDS);
 
     // 14. Thread: cmd-handler — processa Connect/Disconnect da UI dinamicamente
     {
@@ -1175,7 +1157,7 @@ fn main() -> eframe::Result<()> {
             .spawn(move || {
                 for cmd in cmd_rx.iter() {
                     match cmd {
-                        ui::AppCommand::Connect { url, iface: _ } => {
+                        ui_slint::AppCommand::Connect { url, iface: _ } => {
                             // Para conexão anterior, se existir
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
                                 h.stop();
@@ -1195,21 +1177,21 @@ fn main() -> eframe::Result<()> {
                                 Err(e) => {
                                     tracing::error!(error = %e, url, "URL de stream inválida");
                                     if let Ok(mut status) = audio_status.write() {
-                                        status.reset_stream_runtime(ui::AudioOperationalState::Error);
+                                        status.reset_stream_runtime(ui_slint::AudioOperationalState::Error);
                                         status.errors.last_error = Some(e.to_string());
                                     }
-                                    *conn_state.write().unwrap() = ui::ConnectionState::Error {
+                                    *conn_state.write().unwrap() = ui_slint::ConnectionState::Error {
                                         url,
                                         reason: e.to_string(),
                                     };
                                 }
                                 Ok(parsed_url) => {
                                     if let Ok(mut status) = audio_status.write() {
-                                        status.reset_stream_runtime(ui::AudioOperationalState::Buffering);
+                                        status.reset_stream_runtime(ui_slint::AudioOperationalState::Buffering);
                                         status.set_volume(cfg.player.volume);
                                     }
                                     *conn_state.write().unwrap() =
-                                        ui::ConnectionState::Connecting { url: url.clone() };
+                                        ui_slint::ConnectionState::Connecting { url: url.clone() };
                                     tracing::info!(url, "conectando...");
 
                                     let (stop_token, stop_handle) = NetStopToken::new();
@@ -1229,27 +1211,27 @@ fn main() -> eframe::Result<()> {
                                         .name("net-recv".into())
                                         .spawn(move || {
                                             *conn_state_t.write().unwrap() =
-                                                ui::ConnectionState::Connected {
+                                                ui_slint::ConnectionState::Connected {
                                                     url: url_t.clone(),
                                                     since: Instant::now(),
                                                 };
                                             match receiver.run(stop_token) {
                                                 Ok(()) => {
                                                     if let Ok(mut status) = audio_status_t.write() {
-                                                        status.reset_stream_runtime(ui::AudioOperationalState::Idle);
+                                                        status.reset_stream_runtime(ui_slint::AudioOperationalState::Idle);
                                                     }
                                                     *conn_state_t.write().unwrap() =
-                                                        ui::ConnectionState::Idle;
+                                                        ui_slint::ConnectionState::Idle;
                                                     tracing::info!("net-recv encerrado normalmente");
                                                 }
                                                 Err(e) => {
                                                     tracing::error!(error = %e, "net-recv encerrou com erro");
                                                     if let Ok(mut status) = audio_status_t.write() {
-                                                        status.reset_stream_runtime(ui::AudioOperationalState::Error);
+                                                        status.reset_stream_runtime(ui_slint::AudioOperationalState::Error);
                                                         status.errors.last_error = Some(e.to_string());
                                                     }
                                                     *conn_state_t.write().unwrap() =
-                                                        ui::ConnectionState::Error {
+                                                        ui_slint::ConnectionState::Error {
                                                             url: url_t,
                                                             reason: e.to_string(),
                                                         };
@@ -1260,7 +1242,7 @@ fn main() -> eframe::Result<()> {
                                 }
                             }
                         }
-                        ui::AppCommand::Disconnect => {
+                        ui_slint::AppCommand::Disconnect => {
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
                                 h.stop();
                             }
@@ -1275,12 +1257,12 @@ fn main() -> eframe::Result<()> {
                                 audio_cmd_tx: &audio_cmd_tx,
                             });
                             if let Ok(mut status) = audio_status.write() {
-                                status.reset_stream_runtime(ui::AudioOperationalState::Idle);
+                                status.reset_stream_runtime(ui_slint::AudioOperationalState::Idle);
                             }
-                            *conn_state.write().unwrap() = ui::ConnectionState::Idle;
+                            *conn_state.write().unwrap() = ui_slint::ConnectionState::Idle;
                             tracing::info!("desconectado pelo usuário");
                         }
-                        ui::AppCommand::SelectService { service_id } => {
+                        ui_slint::AppCommand::SelectService { service_id } => {
                             if let Ok(mut status) = audio_status.write() {
                                 status.sample_rate_hz = None;
                                 status.source_channels = None;
@@ -1290,7 +1272,7 @@ fn main() -> eframe::Result<()> {
                                 status.encoded_bitrate_kbps = None;
                                 status.stream_bitrate_kbps = None;
                                 status.buffer_level = 0.0;
-                                status.state = ui::AudioOperationalState::Buffering;
+                                status.state = ui_slint::AudioOperationalState::Buffering;
                                 status.errors.last_error = None;
                             }
                             if let Ok(mut audio_pid) = selected_audio_pid.write() {
@@ -1302,7 +1284,7 @@ fn main() -> eframe::Result<()> {
                             *selected_service.write().unwrap() = Some(service_id);
                             tracing::info!(service_id, "serviço selecionado pelo usuário");
                         }
-                        ui::AppCommand::SelectAudio { service_id, pid } => {
+                        ui_slint::AppCommand::SelectAudio { service_id, pid } => {
                             if let Ok(mut status) = audio_status.write() {
                                 status.sample_rate_hz = None;
                                 status.source_channels = None;
@@ -1312,7 +1294,7 @@ fn main() -> eframe::Result<()> {
                                 status.encoded_bitrate_kbps = None;
                                 status.stream_bitrate_kbps = None;
                                 status.buffer_level = 0.0;
-                                status.state = ui::AudioOperationalState::Buffering;
+                                status.state = ui_slint::AudioOperationalState::Buffering;
                                 status.errors.last_error = None;
                             }
                             *selected_service.write().unwrap() = Some(service_id);
@@ -1322,7 +1304,7 @@ fn main() -> eframe::Result<()> {
                             }
                             tracing::info!(service_id, pid, "trilha de áudio selecionada pelo usuário");
                         }
-                        ui::AppCommand::SetHwAccel { choice } => {
+                        ui_slint::AppCommand::SetHwAccel { choice } => {
                             let cfg_choice: config::HwAccelChoice = choice.into();
                             if decode_cmd_tx
                                 .try_send(DecodeCommand::SetHwAccel { choice: cfg_choice })
@@ -1339,7 +1321,7 @@ fn main() -> eframe::Result<()> {
                                 );
                             }
                         }
-                        ui::AppCommand::GpuDeviceRemoved => {
+                        ui_slint::AppCommand::GpuDeviceRemoved => {
                             if decode_cmd_tx
                                 .try_send(DecodeCommand::HandleDeviceRemoved)
                                 .is_err()
@@ -1361,17 +1343,13 @@ fn main() -> eframe::Result<()> {
         handles.push(handle);
     }
 
-    // Usa PowerPreference::HighPerformance para que wgpu e D3D11 selecionem
-    // o mesmo adapter físico em sistemas com múltiplas GPUs (iGPU + dGPU).
-    // A validação definitiva do LUID acontece no CreationContext abaixo.
-    let wgpu_power_pref = if d3d11_device_arc.is_some() {
-        eframe::wgpu::PowerPreference::HighPerformance
-    } else {
-        eframe::wgpu::PowerPreference::default()
-    };
+    // O Arc `d3d11_device_arc` já foi clonado para a thread de decode (Fase B).
+    // A UI Slint usa o caminho de vídeo CPU (planos YUV → RGBA), portanto não
+    // precisa do D3d11Device nem da validação de adapter wgpu (Fase A).
+    drop(d3d11_device_arc);
 
-    // 16. Loop de UI via eframe
-    let guard = PipelineGuard {
+    // 16. Loop de UI via Slint
+    let mut guard = PipelineGuard {
         pipeline_handles: handles.into_iter().map(Some).collect(),
         metrics_handle: Some(metrics_handle),
         current_net_stop,
@@ -1379,97 +1357,22 @@ fn main() -> eframe::Result<()> {
         _sender_guard: Some(sender_guard),
     };
 
-    let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("IronPlayer")
-            .with_inner_size([1280.0, 720.0]),
-        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            present_mode: eframe::wgpu::PresentMode::Fifo,
-            power_preference: wgpu_power_pref,
-            // Pede TEXTURE_FORMAT_16BIT_NORM para suportar upload R16Unorm dos
-            // planos YUV 10-bit (HEVC Main10/Rext, comum em broadcast). Quando
-            // o adapter não expõe a feature, cai silenciosamente para o default
-            // — o renderer ainda funciona em streams 8-bit.
-            device_descriptor: std::sync::Arc::new(|adapter| {
-                let base_limits = if adapter.get_info().backend == eframe::wgpu::Backend::Gl {
-                    eframe::wgpu::Limits::downlevel_webgl2_defaults()
-                } else {
-                    eframe::wgpu::Limits::default()
-                };
+    let result = ui_slint::run(PipelineHandles {
+        cmd_tx,
+        snapshot_rx,
+        conn_rx: conn_state,
+        audio_rx: audio_status,
+        selected_service_rx: selected_service,
+        table_events_rx,
+        video_frames_rx,
+        pipeline_metrics_rx: pipeline_metrics_ui,
+        audio_clock_rx: audio_clock_for_ui,
+        media_info_rx: media_info_ui,
+        initial_url: "udp://@239.0.0.1:1234".to_string(),
+    });
 
-                let wanted = eframe::wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
-                let required_features = wanted & adapter.features();
+    // Janela fechada: encerra o pipeline em cascata antes de sair.
+    guard.shutdown();
 
-                eframe::wgpu::DeviceDescriptor {
-                    label: Some("ironplayer wgpu device"),
-                    required_features,
-                    required_limits: eframe::wgpu::Limits {
-                        max_texture_dimension_2d: 8192,
-                        ..base_limits
-                    },
-                    memory_hints: eframe::wgpu::MemoryHints::default(),
-                }
-            }),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    // Clona `d3d11_device_arc` para uso dentro do closure (o Arc original pode
-    // ser movido para o FfmpegDecoder na Fase B).
-    let d3d11_for_cc = d3d11_device_arc.clone();
-    let d3d11_for_ui = d3d11_device_arc;
-
-    eframe::run_native(
-        "IronPlayer",
-        native_options,
-        Box::new(move |cc| {
-            // ── Fase A: validar LUID do adapter wgpu vs D3d11Device ───────────
-            //
-            // Compara o VendorId do adapter wgpu com o VendorId do ID3D11Device
-            // para detectar mismatches em sistemas multi-GPU (Risco R4).
-            // A comparação definitiva por LUID requer wgpu::hal que ainda não é
-            // necessária na Fase A; VendorId é suficiente para validação inicial.
-            if let Some(ref d3d_dev) = d3d11_for_cc {
-                if let Some(rs) = cc.wgpu_render_state.as_ref() {
-                    let wgpu_info = rs.adapter.get_info();
-                    let d3d_vendor = d3d_dev.vendor_id();
-                    let wgpu_vendor = wgpu_info.vendor;
-
-                    if wgpu_vendor == d3d_vendor {
-                        tracing::info!(
-                            wgpu_adapter = %wgpu_info.name,
-                            wgpu_vendor = format!("{:#06x}", wgpu_vendor),
-                            d3d_vendor = format!("{:#06x}", d3d_vendor),
-                            "hw: adapter wgpu e D3d11Device usam o mesmo vendor — LUID compatível (Fase A OK)"
-                        );
-                    } else {
-                        tracing::warn!(
-                            wgpu_adapter = %wgpu_info.name,
-                            wgpu_vendor = format!("{:#06x}", wgpu_vendor),
-                            d3d_vendor = format!("{:#06x}", d3d_vendor),
-                            "hw: vendor mismatch entre wgpu e D3d11Device (possível multi-GPU Optimus) — Risco R4"
-                        );
-                    }
-                }
-            }
-
-            let mut inner = IronPlayerApp::new(
-                cc,
-                cmd_tx,
-                Some(snapshot_rx),
-                Some(conn_state),
-                Some(audio_status),
-                Some(selected_service),
-                Some(table_events_rx.clone()),
-                Some(video_frames_rx),
-                d3d11_for_ui.clone(),
-            );
-            inner.set_pipeline_metrics_rx(pipeline_metrics_ui);
-            inner.set_audio_clock_rx(audio_clock_for_ui);
-            inner.set_media_info_rx(media_info_ui);
-            inner.set_hwaccel_choice(cfg.player.hwaccel.into());
-            Ok(Box::new(IronPlayerAppWithPipeline { inner, guard }))
-        }),
-    )
+    result.map_err(|e| anyhow::anyhow!("falha no event loop Slint: {e}"))
 }

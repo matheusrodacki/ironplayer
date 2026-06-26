@@ -75,17 +75,17 @@ impl HwAccelChoice {
 // Conversões com a variante UI (sem dependência de serde/TOML).
 //
 // SPEC-CFG-HW-001
-impl From<ui::HwAccelChoice> for HwAccelChoice {
-    fn from(value: ui::HwAccelChoice) -> Self {
+impl From<ui_slint::HwAccelChoice> for HwAccelChoice {
+    fn from(value: ui_slint::HwAccelChoice) -> Self {
         match value {
-            ui::HwAccelChoice::Auto => Self::Auto,
-            ui::HwAccelChoice::D3d11va => Self::D3d11va,
-            ui::HwAccelChoice::None => Self::None,
+            ui_slint::HwAccelChoice::Auto => Self::Auto,
+            ui_slint::HwAccelChoice::D3d11va => Self::D3d11va,
+            ui_slint::HwAccelChoice::None => Self::None,
         }
     }
 }
 
-impl From<HwAccelChoice> for ui::HwAccelChoice {
+impl From<HwAccelChoice> for ui_slint::HwAccelChoice {
     fn from(value: HwAccelChoice) -> Self {
         match value {
             HwAccelChoice::Auto => Self::Auto,

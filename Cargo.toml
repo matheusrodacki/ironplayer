@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ts", "crates/net", "crates/ui", "crates/av"]
+members = ["crates/ts", "crates/net", "crates/ui-slint", "crates/av"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -34,10 +34,9 @@ anyhow            = { workspace = true }
 crossbeam-channel = { workspace = true }
 bytes             = { workspace = true }
 libloading        = { workspace = true }
-eframe            = "0.29"
 ts                = { path = "crates/ts" }
 net               = { path = "crates/net" }
-ui                = { path = "crates/ui" }
+ui-slint          = { path = "crates/ui-slint" }
 av                = { path = "crates/av" }
 
 [dev-dependencies]

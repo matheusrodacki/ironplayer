@@ -121,6 +121,8 @@ pub struct YuvFrame {
     pub colorspace: YuvColorspace,
     /// Faixa de cor.
     pub color_range: YuvColorRange,
+    /// Função de transferência (BT.1886, PQ, HLG ou sRGB).
+    pub transfer: crate::hw::TransferFunction,
     /// `true` se o frame é 10-bit (YUV420P10LE); `false` para 8-bit (YUV420P).
     pub ten_bit: bool,
 }
@@ -381,6 +383,37 @@ impl VideoQueue {
         self.frames.is_empty()
     }
 
+    /// Capacidade máxima atual (número de frames).
+    ///
+    /// SPEC-AV-VQ-001
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Ajusta a capacidade máxima da fila em tempo de execução.
+    ///
+    /// Necessário porque a capacidade fixa (`DEFAULT_CAPACITY = 64`) foi
+    /// dimensionada para ~30 fps (~2,1 s). Em conteúdo de alta taxa de quadros
+    /// (50/60 fps) 64 frames cobrem apenas ~1 s, insuficiente para segurar o
+    /// *lead* de mux (vídeo decodifica após o 1º IDR, ~1,5-2 s à frente do
+    /// áudio audível). Sem capacidade suficiente, os frames mais antigos —
+    /// justamente os que o clock vai alcançar primeiro — são despejados antes
+    /// de virarem `Ready`, congelando o vídeo. A UI calcula a capacidade alvo
+    /// a partir do intervalo de PTS observado para manter um horizonte de
+    /// retenção temporal constante, independentemente do frame rate.
+    ///
+    /// Se a nova capacidade for menor que a quantidade atual de frames, os
+    /// frames mais antigos são descartados.
+    ///
+    /// SPEC-AV-VQ-001
+    pub fn set_capacity(&mut self, capacity: usize) {
+        let cap = capacity.max(1);
+        self.capacity = cap;
+        while self.frames.len() > cap {
+            self.frames.pop_front();
+        }
+    }
+
     /// Retorna o PTS ajustado do frame na frente da fila sem removê-lo.
     ///
     /// Usado pela UI para calcular o offset de sincronização A/V:
@@ -594,6 +627,7 @@ mod tests {
             sar_den: 1,
             colorspace: YuvColorspace::Bt709,
             color_range: YuvColorRange::Limited,
+            transfer: crate::hw::TransferFunction::Bt1886,
             ten_bit: false,
         })
     }
@@ -611,6 +645,7 @@ mod tests {
             sar_den: 1,
             colorspace: YuvColorspace::Bt709,
             color_range: YuvColorRange::Limited,
+            transfer: crate::hw::TransferFunction::Bt1886,
             ten_bit: false,
         }
     }
@@ -873,6 +908,48 @@ mod tests {
         let q = VideoQueue::default();
         assert_eq!(q.len(), 0);
         assert!(q.is_empty());
+        assert_eq!(q.capacity(), DEFAULT_CAPACITY);
+    }
+
+    /// `set_capacity` aumenta a capacidade sem descartar frames.
+    ///
+    /// SPEC-AV-VQ-001
+    #[test]
+    fn spec_av_vq_001_set_capacity_grow_keeps_frames() {
+        let mut q = VideoQueue::new(2);
+        q.push(make_frame(Some(100)));
+        q.push(make_frame(Some(200)));
+        q.set_capacity(128);
+        assert_eq!(q.capacity(), 128);
+        // Frames preservados; novos cabem sem despejar.
+        q.push(make_frame(Some(300)));
+        assert_eq!(q.len(), 3);
+    }
+
+    /// `set_capacity` menor descarta os frames mais antigos.
+    ///
+    /// SPEC-AV-VQ-001
+    #[test]
+    fn spec_av_vq_001_set_capacity_shrink_drops_oldest() {
+        let mut q = VideoQueue::new(8);
+        for pts in [100u64, 200, 300, 400] {
+            q.push(make_frame(Some(pts)));
+        }
+        q.set_capacity(2);
+        assert_eq!(q.capacity(), 2);
+        assert_eq!(q.len(), 2);
+        // Os dois mais recentes (300, 400) permanecem; front = 300.
+        assert_eq!(q.front_pts(), Some(300));
+    }
+
+    /// `set_capacity(0)` é normalizado para 1 (capacidade mínima).
+    ///
+    /// SPEC-AV-VQ-001
+    #[test]
+    fn spec_av_vq_001_set_capacity_zero_clamped_to_one() {
+        let mut q = VideoQueue::new(4);
+        q.set_capacity(0);
+        assert_eq!(q.capacity(), 1);
     }
 
     // ── limiar exato ──────────────────────────────────────────────────────────

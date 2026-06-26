@@ -1433,7 +1433,7 @@ impl FfmpegFrame {
     #[allow(clippy::type_complexity)]
     pub(crate) fn to_yuv_planes(
         &self,
-    ) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {
+    ) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, i32, bool), AvError> {
         // SAFETY: offsets validados contra FFmpeg 8.x headers (ver comentário de layout).
         let (width, height, pts, fmt, raw_sar) = unsafe {
             (
@@ -1518,6 +1518,7 @@ impl FfmpegFrame {
         // layout x86-64 de FFmpeg 8.0 (avutil-60). Ver comentário nos helpers.
         let raw_colorspace = unsafe { frame_colorspace(self.frame) };
         let raw_color_range = unsafe { frame_color_range(self.frame) };
+        let raw_color_trc = unsafe { frame_color_trc(self.frame) };
 
         Ok((
             width as u32,
@@ -1527,6 +1528,7 @@ impl FfmpegFrame {
             sar,
             raw_colorspace,
             raw_color_range,
+            raw_color_trc,
             ten_bit,
         ))
     }
@@ -1819,7 +1821,7 @@ impl FfmpegFrame {
     #[allow(clippy::type_complexity)]
     pub(crate) fn download_to_yuv_planes(
         &self,
-    ) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {
+    ) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, i32, bool), AvError> {
         // Aloca frame SW destino — av_hwframe_transfer_data aloca os buffers de
         // dados automaticamente (não precisamos chamar av_frame_get_buffer).
         // SAFETY: av_frame_alloc aloca com av_malloc e zera o struct.
@@ -1871,7 +1873,7 @@ impl Drop for FfmpegFrame {
 unsafe fn extract_sw_yuv_planes(
     frame: *mut c_void,
     props_frame: *mut c_void,
-) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, bool), AvError> {
+) -> Result<(u32, u32, i64, [Vec<u8>; 3], (u32, u32), i32, i32, i32, bool), AvError> {
     let fmt = frame_format(frame);
     let width = {
         let transferred = frame_width(frame);
@@ -1893,6 +1895,7 @@ unsafe fn extract_sw_yuv_planes(
     let raw_sar = frame_sar(props_frame);
     let raw_colorspace = frame_colorspace(props_frame);
     let raw_color_range = frame_color_range(props_frame);
+    let raw_color_trc = frame_color_trc(props_frame);
 
     if width <= 0 || height <= 0 {
         return Err(AvError::FfmpegError { code: -22 }); // EINVAL
@@ -1925,6 +1928,7 @@ unsafe fn extract_sw_yuv_planes(
         sar,
         raw_colorspace,
         raw_color_range,
+        raw_color_trc,
         ten_bit,
     ))
 }

@@ -111,6 +111,16 @@ pub struct IronPlayerApp {
     video_clock: MasterClock,
     /// Indica se o clock de vídeo já foi ancorado (wall no primeiro PTS ou áudio).
     video_clock_initialized: bool,
+    /// Intervalo de PTS (90 kHz) entre frames consecutivos, suavizado por EMA.
+    ///
+    /// Estima a taxa de quadros a partir dos PTS recebidos para dimensionar a
+    /// capacidade da `VideoQueue` por tempo (não por contagem fixa de frames).
+    /// `None` até observar dois frames com PTS válido.
+    ///
+    /// SPEC-AV-VQ-001
+    video_pts_interval: Option<i64>,
+    /// PTS ajustado do último frame drenado do canal, para estimar o intervalo.
+    last_drained_video_pts: Option<i64>,
     /// `true` quando `video_clock` usa `AudioClock` como master A/V.
     clock_uses_audio: bool,
     /// Id estável do `AudioClockHandle` atualmente adotado pela UI.
@@ -214,6 +224,8 @@ impl IronPlayerApp {
             video_queue: VideoQueue::default(),
             video_clock: MasterClock::wall(0),
             video_clock_initialized: false,
+            video_pts_interval: None,
+            last_drained_video_pts: None,
             clock_uses_audio: false,
             adopted_audio_clock_id: None,
             video_renderer,
@@ -355,6 +367,8 @@ impl IronPlayerApp {
         // um novo AudioClockHandle e video_clock será trocado novamente.
         self.video_clock = MasterClock::wall(0);
         self.video_clock_initialized = false;
+        self.video_pts_interval = None;
+        self.last_drained_video_pts = None;
         self.clock_uses_audio = false;
         self.adopted_audio_clock_id = None;
         // Limpa o handle de áudio obsoleto para que poll_video_frames troque
@@ -441,7 +455,38 @@ impl IronPlayerApp {
                     self.video_clock_initialized = true;
                 }
             }
+            // Estima o intervalo de PTS (frame rate) para dimensionar a fila.
+            if let Some(pts) = frame.pts() {
+                let pts = pts as i64;
+                if let Some(last) = self.last_drained_video_pts {
+                    let delta = pts - last;
+                    // Filtra reordenação de B-frames e descontinuidades: aceita
+                    // apenas deltas plausíveis de um quadro (1..=120 ms).
+                    if (90..=10_800).contains(&delta) {
+                        self.video_pts_interval = Some(match self.video_pts_interval {
+                            Some(prev) => (prev * 7 + delta) / 8,
+                            None => delta,
+                        });
+                    }
+                }
+                self.last_drained_video_pts = Some(pts);
+            }
             self.video_queue.push(frame);
+        }
+
+        // 2b. Dimensiona a capacidade da fila por tempo (não por contagem fixa).
+        //     A 59,94 fps, 64 frames cobrem só ~1 s — insuficiente para o lead
+        //     de mux (~1,5-2 s) com áudio como master. Alvo: ~2,5 s de retenção,
+        //     limitado para evitar consumo excessivo de memória em 4K.
+        if let Some(interval) = self.video_pts_interval {
+            const TARGET_HOLD_TICKS: i64 = 225_000; // 2,5 s × 90 kHz
+            let target = (TARGET_HOLD_TICKS / interval.max(1)).clamp(
+                av::video_queue::DEFAULT_CAPACITY as i64,
+                160,
+            ) as usize;
+            if target != self.video_queue.capacity() {
+                self.video_queue.set_capacity(target);
+            }
         }
 
         // 3. Extrai o próximo frame pronto (um por tick — pop_ready já descarta

@@ -1,7 +1,8 @@
 // YUV → RGB fragment shader. SPEC-AV-003
 //
-// Fase D: o UBO carrega matriz YUV→RGB, offsets de range, TRC (BT.1886, PQ,
-// HLG ou sRGB) e a flag de fallback HDR→sRGB com clipping explícito.
+// Fase D: matriz YUV→RGB parametrizada por colorspace e TRC. Conteúdo HDR10
+// (PQ/HLG + BT.2020) passa por tone mapping HDR→SDR e gamut BT.2020→BT.709
+// antes da codificação para o framebuffer (BT.1886 em UNORM, sRGB em sRGB).
 
 override DECODE_SRGB: f32 = 0.0;
 
@@ -103,6 +104,38 @@ fn decode_transfer(rgb: vec3<f32>, mode: f32) -> vec3<f32> {
     );
 }
 
+fn linear_to_bt1886(c: f32) -> f32 {
+    return pow(clamp(c, 0.0, 1.0), 1.0 / 2.4);
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        return c * 12.92;
+    }
+    return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+fn bt2020_to_bt709(rgb: vec3<f32>) -> vec3<f32> {
+    // Colunas da matriz BT.2020→BT.709 (ITU-R BT.2407); WGSL usa colunas.
+    return mat3x3<f32>(
+        vec3(1.6605, -0.1246, -0.0182),
+        vec3(-0.5876, 1.1329, -0.1006),
+        vec3(-0.0728, -0.0083, 1.1187),
+    ) * rgb;
+}
+
+/// Tone mapping HDR→SDR. Entrada em luz linear (PQ: 1.0 = 10000 nits).
+fn tone_map_hdr_to_sdr(rgb: vec3<f32>, transfer: f32) -> vec3<f32> {
+    var c = rgb;
+    if transfer < 1.5 {
+        c = rgb * 25.0;
+    } else if transfer < 2.5 {
+        c = rgb * 2.5;
+    }
+    c = c / (1.0 + c);
+    return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let y = textureSample(tex_y, samp, in.uv).r;
@@ -114,6 +147,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let range_scale = params.offset_and_range.w;
     let transfer_mode = params.col0.w;
     let hdr_clip = params.col1.w;
+    let gamut_map = params.offset_and_range.z;
 
     let yuv = vec3<f32>(max((y - y_offset) * range_scale, 0.0), u, v);
     let col0 = params.col0.xyz;
@@ -122,14 +156,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var rgb = mat3x3<f32>(col0, col1, col2) * yuv;
     rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
 
-    // Só converte SDR para linear quando o framebuffer é sRGB. Em targets
-    // UNORM, escrever linear escurece a imagem; o swapchain espera RGB já
-    // codificado para display.
-    if DECODE_SRGB > 0.5 || hdr_clip > 0.5 {
+    if hdr_clip > 0.5 {
         rgb = decode_transfer(rgb, transfer_mode);
-    }
-
-    if hdr_clip > 0.5 || DECODE_SRGB > 0.5 {
+        if gamut_map > 0.5 {
+            rgb = bt2020_to_bt709(rgb);
+        }
+        rgb = tone_map_hdr_to_sdr(rgb, transfer_mode);
+        if DECODE_SRGB > 0.5 {
+            rgb = vec3<f32>(
+                linear_to_srgb(rgb.r),
+                linear_to_srgb(rgb.g),
+                linear_to_srgb(rgb.b),
+            );
+        } else {
+            rgb = vec3<f32>(
+                linear_to_bt1886(rgb.r),
+                linear_to_bt1886(rgb.g),
+                linear_to_bt1886(rgb.b),
+            );
+        }
+    } else if DECODE_SRGB > 0.5 {
+        rgb = decode_transfer(rgb, transfer_mode);
         rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     }
 

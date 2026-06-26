@@ -887,7 +887,7 @@ impl FfmpegDecoder {
                                     state.frame.to_yuv_planes()
                                 };
 
-                                let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, ten_bit) =
+                                let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, raw_trc, ten_bit) =
                                     yuv_result.map_err(|e| {
                                         tracing::warn!(
                                             %e,
@@ -906,6 +906,7 @@ impl FfmpegDecoder {
                                     sar_den: sar.1,
                                     colorspace: YuvColorspace::from_avutil(raw_cs),
                                     color_range: YuvColorRange::from_avutil(raw_cr),
+                                    transfer: TransferFunction::from_avutil(raw_trc),
                                     ten_bit,
                                 })))
                             } // fim caminho SW
@@ -1082,7 +1083,7 @@ fn try_hw_zero_copy(frame: &FfmpegFrame, d3d_dev: &D3d11Device) -> Result<VideoF
 
 /// Fallback: baixa frame HW para YUV na CPU (`VideoFrame::Sw`).
 fn hw_video_frame_from_download(frame: &FfmpegFrame, pid_raw: u16) -> Result<VideoFrame, AvError> {
-    let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, ten_bit) =
+    let (w, h, pts_raw, planes, sar, raw_cs, raw_cr, raw_trc, ten_bit) =
         frame.download_to_yuv_planes().map_err(|e| {
             tracing::debug!(%e, pid = pid_raw, "download_to_yuv_planes falhou");
             e
@@ -1096,6 +1097,7 @@ fn hw_video_frame_from_download(frame: &FfmpegFrame, pid_raw: u16) -> Result<Vid
         sar_den: sar.1,
         colorspace: YuvColorspace::from_avutil(raw_cs),
         color_range: YuvColorRange::from_avutil(raw_cr),
+        transfer: TransferFunction::from_avutil(raw_trc),
         ten_bit,
     }))
 }

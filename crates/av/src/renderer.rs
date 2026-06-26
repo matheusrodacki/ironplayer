@@ -43,7 +43,7 @@ struct YuvParamsGpu {
     col1: [f32; 4],
     /// Coluna 2 da mat3x3f (coeficientes V/Cr → R,G,B) + padding.
     col2: [f32; 4],
-    /// x=luma_offset, y=centro UV, z reservado, w=range_scale.
+    /// x=luma_offset, y=centro UV, z=gamut_map (BT.2020→709), w=range_scale.
     offset_and_range: [f32; 4],
 }
 
@@ -111,6 +111,7 @@ impl YuvParamsGpu {
         };
         let hdr_clip =
             matches!(transfer, TransferFunction::Pq | TransferFunction::Hlg) as u8 as f32;
+        let gamut_map = matches!(colorspace, YuvColorspace::Bt2020) as u8 as f32;
 
         match color_range {
             // ─ TV-range (limited): Y ∈ [16,235], U/V ∈ [16,240] (8-bit).
@@ -143,7 +144,7 @@ impl YuvParamsGpu {
                     col0,
                     col1,
                     col2,
-                    offset_and_range: [luma_min, 0.5, 0.0, range_scale],
+                    offset_and_range: [luma_min, 0.5, gamut_map, range_scale],
                 }
             }
 
@@ -152,13 +153,9 @@ impl YuvParamsGpu {
                 col0: [cy[0], cy[1], cy[2], transfer_mode],
                 col1: [cu[0], cu[1], cu[2], hdr_clip],
                 col2: [cv[0], cv[1], cv[2], 0.0],
-                offset_and_range: [0.0, 0.5, 0.0, 1.0],
+                offset_and_range: [0.0, 0.5, gamut_map, 1.0],
             },
         }
-    }
-
-    fn for_sw_frame(colorspace: YuvColorspace, color_range: YuvColorRange, ten_bit: bool) -> Self {
-        Self::for_frame(colorspace, color_range, TransferFunction::Bt1886, ten_bit)
     }
 }
 
@@ -458,7 +455,12 @@ impl YuvPipelineInner {
             );
         }
 
-        let params = YuvParamsGpu::for_sw_frame(frame.colorspace, frame.color_range, frame.ten_bit);
+        let params = YuvParamsGpu::for_frame(
+            frame.colorspace,
+            frame.color_range,
+            frame.transfer,
+            frame.ten_bit,
+        );
         queue.write_buffer(&self.uniform_buf, 0, &params.to_bytes());
     }
 
@@ -1475,6 +1477,7 @@ mod tests {
             sar_den: 1,
             colorspace: YuvColorspace::Bt709,
             color_range: YuvColorRange::Limited,
+            transfer: TransferFunction::Bt1886,
             ten_bit: false,
         }
     }
@@ -1608,14 +1611,24 @@ mod tests {
     /// Serialização de `YuvParamsGpu` deve produzir exatamente 64 bytes.
     #[test]
     fn spec_av_003_yuv_params_size() {
-        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt709, YuvColorRange::Limited, false);
+        let p = YuvParamsGpu::for_frame(
+            YuvColorspace::Bt709,
+            YuvColorRange::Limited,
+            TransferFunction::Bt1886,
+            false,
+        );
         assert_eq!(p.to_bytes().len(), 64);
     }
 
     /// `range_scale` para limited range (BT.709) deve ser ≈ 255/219 ≈ 1.1644.
     #[test]
     fn spec_av_003_yuv_params_range_scale_limited() {
-        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt709, YuvColorRange::Limited, false);
+        let p = YuvParamsGpu::for_frame(
+            YuvColorspace::Bt709,
+            YuvColorRange::Limited,
+            TransferFunction::Bt1886,
+            false,
+        );
         let range_scale = p.offset_and_range[3];
         let expected = 255.0_f32 / 219.0;
         assert!(
@@ -1626,7 +1639,12 @@ mod tests {
 
     #[test]
     fn spec_av_003_yuv_params_luma_offset_limited_8bit() {
-        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt709, YuvColorRange::Limited, false);
+        let p = YuvParamsGpu::for_frame(
+            YuvColorspace::Bt709,
+            YuvColorRange::Limited,
+            TransferFunction::Bt1886,
+            false,
+        );
         let expected = 16.0_f32 / 255.0_f32;
         assert!((p.offset_and_range[0] - expected).abs() < 1e-6);
         assert!((p.offset_and_range[1] - 0.5_f32).abs() < 1e-6);
@@ -1634,7 +1652,12 @@ mod tests {
 
     #[test]
     fn spec_av_003_yuv_params_luma_offset_limited_10bit() {
-        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt2020, YuvColorRange::Limited, true);
+        let p = YuvParamsGpu::for_frame(
+            YuvColorspace::Bt2020,
+            YuvColorRange::Limited,
+            TransferFunction::Bt1886,
+            true,
+        );
         let expected = 64.0_f32 / 1023.0_f32;
         assert!((p.offset_and_range[0] - expected).abs() < 1e-6);
     }
@@ -1642,7 +1665,12 @@ mod tests {
     /// `range_scale` para full range deve ser 1.0.
     #[test]
     fn spec_av_003_yuv_params_range_scale_full() {
-        let p = YuvParamsGpu::for_sw_frame(YuvColorspace::Bt709, YuvColorRange::Full, false);
+        let p = YuvParamsGpu::for_frame(
+            YuvColorspace::Bt709,
+            YuvColorRange::Full,
+            TransferFunction::Bt1886,
+            false,
+        );
         let range_scale = p.offset_and_range[3];
         assert!(
             (range_scale - 1.0_f32).abs() < 1e-6,

@@ -2,7 +2,7 @@
 //!
 //! Substitui a UI egui (`crates/ui`). Consome os mesmos snapshots ao vivo
 //! produzidos pelo pipeline em `src/main.rs` (canais + `Arc<RwLock>`), mapeia-os
-//! para os modelos Slint e renderiza o vídeo via `SharedPixelBuffer` (CPU).
+//! para os modelos Slint e renderiza o vídeo via pipeline GPU (wgpu) ou CPU.
 
 slint::include_modules!();
 
@@ -17,11 +17,11 @@ pub use state::{
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use slint::{Color, ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
+use slint::{Color, ComponentHandle, Image, ModelRc, RenderingState, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use slint::wgpu_29::{wgpu, WGPUConfiguration};
 
 use av::video_queue::PopResult;
@@ -105,26 +105,39 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
     }
 
     // ── Modo de render: GPU (zero-copy) ou CPU (fallback) ─────────────────
-    // GPU: converte YUV/NV12 → textura RGBA na GPU (shader) e importa como
-    // `slint::Image` sem cópia CPU. CPU: thread worker converte para
-    // SharedPixelBuffer (a conversão é cara e bloquearia o event loop da UI).
-    let render = match gpu {
+    let (render, gpu_bridge) = match gpu {
         Some((device, queue)) => match av::VideoRenderer::new(device, queue) {
             Ok(renderer) => {
-                // Habilita o zero-copy de hardware (Fase 2) só quando o device
-                // suporta textura NV12; senão o decoder usa planos CPU.
                 let hw_zc = renderer.supports_hw_zero_copy();
                 av::set_gpu_zero_copy_enabled(hw_zc);
                 tracing::info!(hw_zero_copy = hw_zc, "vídeo: pipeline GPU ativo");
-                RenderMode::Gpu(renderer)
+                let bridge = Arc::new(GpuVideoBridge::new(renderer));
+                (RenderMode::Gpu(bridge.clone()), Some(bridge))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "vídeo: VideoRenderer GPU falhou; fallback CPU");
-                spawn_cpu_worker()
+                (spawn_cpu_worker(), None)
             }
         },
-        None => spawn_cpu_worker(),
+        None => (spawn_cpu_worker(), None),
     };
+
+    // GPU: converte YUV→RGBA no `BeforeRendering` do Slint (mesmo ciclo de
+    // apresentação), em vez de bloquear o timer da UI com `queue.submit`.
+    if let Some(bridge) = gpu_bridge {
+        let weak = window.as_weak();
+        if let Err(e) = window.window().set_rendering_notifier(move |state, _api| {
+            if !matches!(state, RenderingState::BeforeRendering) {
+                return;
+            }
+            let Some(win) = weak.upgrade() else {
+                return;
+            };
+            bridge.render_pending(&win);
+        }) {
+            tracing::warn!(error = ?e, "slint: set_rendering_notifier falhou");
+        }
+    }
 
     // ── Estado de polling (single-thread, na UI) ──────────────────────────
     let mut poller = Poller {
@@ -160,17 +173,58 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
 }
 
 // ---------------------------------------------------------------------------
+// Ponte GPU: timing no timer, render no BeforeRendering do Slint
+// ---------------------------------------------------------------------------
+
+/// Estado compartilhado entre o timer (timing A/V) e o `RenderingNotifier`
+/// (conversão YUV→RGBA na GPU, sincronizada com o ciclo de apresentação).
+struct GpuVideoBridge {
+    pending: Mutex<Option<VideoFrame>>,
+    renderer: Mutex<av::VideoRenderer>,
+}
+
+impl GpuVideoBridge {
+    fn new(renderer: av::VideoRenderer) -> Self {
+        Self {
+            pending: Mutex::new(None),
+            renderer: Mutex::new(renderer),
+        }
+    }
+
+    /// Enfileira o frame mais recente (descarta o anterior se ainda não exibido).
+    fn set_pending(&self, frame: VideoFrame) {
+        *self.pending.lock().expect("gpu bridge pending") = Some(frame);
+    }
+
+    /// Chamado em `RenderingState::BeforeRendering` — roda o shader e atualiza a `Image`.
+    fn render_pending(&self, win: &AppWindow) {
+        let frame = self.pending.lock().expect("gpu bridge pending").take();
+        let Some(frame) = frame else {
+            return;
+        };
+        let mut renderer = self.renderer.lock().expect("gpu bridge renderer");
+        if let Some(tex) = renderer.render_to_texture(&frame) {
+            match Image::try_from(tex) {
+                Ok(img) => {
+                    win.set_video_frame(img);
+                    win.set_video_has_signal(true);
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "slint: Image::try_from(texture) falhou")
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Modo de render (GPU zero-copy / CPU fallback)
 // ---------------------------------------------------------------------------
 
 /// Estratégia de exibição de vídeo escolhida no boot.
-///
-/// Só existe uma instância viva, então a diferença de tamanho entre variantes
-/// (o `VideoRenderer` é grande) não justifica um `Box`.
-#[allow(clippy::large_enum_variant)]
 enum RenderMode {
     /// GPU: shader YUV/NV12 → textura RGBA importada como `slint::Image`.
-    Gpu(av::VideoRenderer),
+    Gpu(Arc<GpuVideoBridge>),
     /// CPU: thread worker converte para `SharedPixelBuffer` RGBA.
     Cpu {
         frame_tx: Sender<VideoFrame>,
@@ -294,22 +348,12 @@ impl Poller {
     fn tick(&mut self, win: &AppWindow) {
         self.tick = self.tick.wrapping_add(1);
 
-        // Vídeo a cada tick (~60 Hz): resolve o timing e exibe o frame.
-        match &mut self.render {
-            // GPU: converte na GPU (shader) e importa a textura RGBA sem cópia.
-            RenderMode::Gpu(renderer) => {
+        // Vídeo a cada tick (~60 Hz): resolve o timing; render GPU no notifier.
+        match &self.render {
+            RenderMode::Gpu(bridge) => {
                 if let Some(frame) = self.video.poll() {
-                    if let Some(tex) = renderer.render_to_texture(&frame) {
-                        match Image::try_from(tex) {
-                            Ok(img) => {
-                                win.set_video_frame(img);
-                                win.set_video_has_signal(true);
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = ?e, "slint: Image::try_from(texture) falhou")
-                            }
-                        }
-                    }
+                    bridge.set_pending(frame);
+                    win.window().request_redraw();
                 }
             }
             // CPU: despacha p/ o worker e exibe o buffer convertido mais recente.

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{debug, info};
 use windows::{
     core::{Error as WinError, Interface},
+    Win32::Foundation::HMODULE,
     Win32::Graphics::{
         Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
         Direct3D11::{
@@ -87,11 +88,13 @@ impl std::fmt::Display for AdapterLuid {
 /// SPEC-AV-HW-001
 pub struct D3d11Device {
     device: ID3D11Device,
-    #[allow(dead_code)]
     context: ID3D11DeviceContext,
     adapter_luid: AdapterLuid,
     adapter_desc: String,
     vendor_id: u32,
+    /// Pool de texturas NV12 compartilhadas (Fase 2), criado sob demanda.
+    /// `None` se a inicialização falhar (→ usa caminho de planos).
+    shared_nv_pool: std::sync::OnceLock<Option<Arc<super::SharedNvPool>>>,
 }
 
 impl std::fmt::Debug for D3d11Device {
@@ -130,8 +133,8 @@ impl D3d11Device {
             .map_err(|_| AvError::HwInitFailed("Nenhum adapter DXGI encontrado".into()))?;
 
         // Obtém descrição e LUID do adapter
-        let mut desc = windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_DESC1::default();
-        unsafe { adapter1.GetDesc1(&mut desc) }
+        // windows 0.62: `GetDesc1()` devolve a descrição por valor.
+        let desc = unsafe { adapter1.GetDesc1() }
             .map_err(|e| AvError::HwInitFailed(format!("GetDesc1 falhou: {e}")))?;
 
         let adapter_luid = AdapterLuid {
@@ -169,7 +172,7 @@ impl D3d11Device {
                 // Microsoft requer DRIVER_TYPE_UNKNOWN quando o adapter é
                 // passado explicitamente; HARDWARE+adapter causa E_INVALIDARG.
                 D3D_DRIVER_TYPE_UNKNOWN,
-                None, // software rasterizer module (não usado com adapter explícito)
+                HMODULE::default(), // software rasterizer (não usado com adapter explícito)
                 flags,
                 None, // feature levels (usa default D3D11_0+)
                 D3D11_SDK_VERSION,
@@ -194,7 +197,8 @@ impl D3d11Device {
         // Ref: https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nn-d3d11-id3d11multithread
         use windows::Win32::Graphics::Direct3D11::ID3D11Multithread;
         if let Ok(mt) = device.cast::<ID3D11Multithread>() {
-            unsafe { mt.SetMultithreadProtected(true) };
+            // windows 0.62: devolve o estado anterior (BOOL); descartado de propósito.
+            let _ = unsafe { mt.SetMultithreadProtected(true) };
             debug!("hw: ID3D11Multithread::SetMultithreadProtected(true) OK");
         }
 
@@ -206,7 +210,56 @@ impl D3d11Device {
             adapter_luid,
             adapter_desc,
             vendor_id,
+            shared_nv_pool: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Pool de texturas NV12 compartilhadas (Fase 2), criado uma vez sob demanda.
+    ///
+    /// Retorna `None` se a inicialização falhar (ex.: sem D3D11.4); nesse caso o
+    /// chamador usa `extract_nv12_planes` (CPU).
+    ///
+    /// SPEC-AV-HW-ZEROCOPY-001
+    pub fn shared_nv_pool(&self) -> Option<Arc<super::SharedNvPool>> {
+        self.shared_nv_pool
+            .get_or_init(|| match super::SharedNvPool::new(&self.device, &self.context) {
+                Ok(pool) => {
+                    info!("hw: pool de texturas NV12 compartilhadas pronto (zero-copy)");
+                    Some(pool)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "hw: pool compartilhado indisponível; usando planos CPU");
+                    None
+                }
+            })
+            .clone()
+    }
+
+    /// Copia o slice NV12 do frame HW para uma textura compartilhada do `pool`
+    /// (zero-copy GPU→GPU) e devolve um `SharedNvFrame`.
+    ///
+    /// Somente NV12 8-bit. Erro → o chamador cai em `extract_nv12_planes`.
+    ///
+    /// SPEC-AV-HW-ZEROCOPY-001
+    pub fn extract_nv12_shared(
+        &self,
+        pool: &Arc<super::SharedNvPool>,
+        tex: &D3d11Texture,
+    ) -> Result<super::SharedNvFrame, AvError> {
+        if matches!(tex.format, HwPixelFormat::P010) {
+            return Err(AvError::HwInitFailed(
+                "P010 não suportado no caminho compartilhado".into(),
+            ));
+        }
+        let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { tex.texture.GetDesc(&mut src_desc) };
+        pool.acquire_copy(
+            &tex.texture,
+            tex.array_slice,
+            src_desc.ArraySize,
+            tex.width,
+            tex.height,
+        )
     }
 
     /// Retorna o LUID do adapter, usado para sincronizar seleção com wgpu.

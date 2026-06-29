@@ -139,8 +139,9 @@ pub struct YuvFrame {
 ///
 /// SPEC-AV-HW-TEX-001
 pub struct HwVideoFrame {
-    /// Planos NV12/P010 compactados (CPU), prontos para upload à GPU.
-    pub planes: crate::hw::NvPlanes,
+    /// Origem dos dados NV12: planos na CPU (Fase 1) ou textura compartilhada
+    /// na GPU (Fase 2, zero-copy).
+    pub surface: HwSurface,
     /// Espaço de cor para a matriz YUV→RGB.
     pub colorspace: YuvColorspace,
     /// Faixa de cor (limited/full).
@@ -159,13 +160,39 @@ pub struct HwVideoFrame {
     pub sar_den: u32,
 }
 
+/// Origem dos dados de um frame de vídeo HW.
+///
+/// SPEC-AV-HW-TEX-001 · SPEC-AV-HW-ZEROCOPY-001
+pub enum HwSurface {
+    /// Planos NV12/P010 baixados para a CPU via staging (Fase 1).
+    Cpu(crate::hw::NvPlanes),
+    /// Textura NV12 compartilhada na GPU (Fase 2, zero-copy D3D11→wgpu). 8-bit.
+    Shared(crate::hw::SharedNvFrame),
+}
+
+impl HwVideoFrame {
+    /// `true` se o frame é 10-bit (P010). Frames `Shared` são sempre 8-bit.
+    #[inline]
+    pub fn ten_bit(&self) -> bool {
+        match &self.surface {
+            HwSurface::Cpu(p) => p.ten_bit,
+            HwSurface::Shared(_) => false,
+        }
+    }
+}
+
 impl std::fmt::Debug for HwVideoFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.surface {
+            HwSurface::Cpu(_) => "Cpu",
+            HwSurface::Shared(_) => "Shared",
+        };
         f.debug_struct("HwVideoFrame")
+            .field("surface", &kind)
             .field("width", &self.width)
             .field("height", &self.height)
             .field("pts", &self.pts)
-            .field("ten_bit", &self.planes.ten_bit)
+            .field("ten_bit", &self.ten_bit())
             .finish()
     }
 }

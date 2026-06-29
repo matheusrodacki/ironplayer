@@ -12,8 +12,9 @@ ts  = { path = "../ts" }
 av  = { path = "../av" }
 net = { path = "../net" }
 
-slint             = { version = "1.17", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
+slint             = { version = "=1.17.0", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg-wgpu", "renderer-femtovg", "unstable-wgpu-29"] }
 crossbeam-channel = { workspace = true }
+pollster          = "0.4"
 chrono            = { version = "0.4", default-features = false, features = ["std", "clock"] }
 tracing           = { workspace = true }
 

@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "cursor-debug-bundle",
+  "owner": "micsapp",
+  "repo": "micstec-skills",
+  "path": "claude-code/plugins-plus-skills/plugins/saas-packs/cursor-pack/skills/cursor-debug-bundle",
+  "branch": "master",
+  "sha": "144556c2a177d9ded8221113329606e95028620d",
+  "source": "manual"
+}

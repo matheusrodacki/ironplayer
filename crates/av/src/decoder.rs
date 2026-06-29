@@ -1057,7 +1057,6 @@ fn try_hw_zero_copy(frame: &FfmpegFrame, d3d_dev: &D3d11Device) -> Result<VideoF
             cr == AV_COL_RANGE_JPEG,
         )?
     };
-    let planes = d3d_dev.extract_nv12_planes(&tex)?;
     let colorspace = match ColorSpace::from_avutil(cs) {
         ColorSpace::Bt601 => YuvColorspace::Bt601,
         ColorSpace::Bt709 => YuvColorspace::Bt709,
@@ -1068,8 +1067,9 @@ fn try_hw_zero_copy(frame: &FfmpegFrame, d3d_dev: &D3d11Device) -> Result<VideoF
     } else {
         YuvColorRange::Limited
     };
+    let surface = build_hw_surface(d3d_dev, &tex)?;
     Ok(VideoFrame::Hw(HwVideoFrame {
-        planes,
+        surface,
         colorspace,
         color_range,
         transfer: TransferFunction::from_avutil(trc),
@@ -1079,6 +1079,30 @@ fn try_hw_zero_copy(frame: &FfmpegFrame, d3d_dev: &D3d11Device) -> Result<VideoF
         sar_num: sar.0,
         sar_den: sar.1,
     }))
+}
+
+/// Constrói a `HwSurface` do frame: tenta o caminho zero-copy (textura NV12
+/// compartilhada) quando o render GPU está ativo e o frame é NV12 8-bit; em
+/// qualquer falha cai no caminho de planos (CPU) da Fase 1.
+///
+/// SPEC-AV-HW-ZEROCOPY-001
+#[cfg(windows)]
+fn build_hw_surface(
+    d3d_dev: &D3d11Device,
+    tex: &crate::hw::D3d11Texture,
+) -> Result<crate::video_queue::HwSurface, AvError> {
+    use crate::video_queue::HwSurface;
+    if crate::hw::gpu_zero_copy_enabled() {
+        if let Some(pool) = d3d_dev.shared_nv_pool() {
+            match d3d_dev.extract_nv12_shared(&pool, tex) {
+                Ok(shared) => return Ok(HwSurface::Shared(shared)),
+                Err(e) => {
+                    tracing::trace!(error = %e, "hw: shared NV12 falhou; fallback planos CPU")
+                }
+            }
+        }
+    }
+    Ok(HwSurface::Cpu(d3d_dev.extract_nv12_planes(tex)?))
 }
 
 /// Fallback: baixa frame HW para YUV na CPU (`VideoFrame::Sw`).

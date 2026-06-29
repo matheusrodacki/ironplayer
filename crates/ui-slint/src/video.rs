@@ -6,7 +6,7 @@
 //! extra). A conversão roda numa thread worker (ver `lib.rs`), fora do event loop
 //! do Slint. 10-bit é reduzido a 8-bit (refino HDR é follow-up).
 
-use av::{VideoFrame, YuvColorRange};
+use av::{HwSurface, VideoFrame, YuvColorRange};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 
 /// Converte o frame para um `SharedPixelBuffer` RGBA, ou `None` se inválido.
@@ -30,8 +30,15 @@ pub fn convert(frame: &VideoFrame) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
             }
         }
         VideoFrame::Hw(hw) => {
-            let w = hw.planes.width as usize;
-            let h = hw.planes.height as usize;
+            // Frames `Shared` (zero-copy GPU) só ocorrem em modo GPU; sem device
+            // D3D11 aqui não há como convertê-los na CPU — ignorados (o flag de
+            // zero-copy fica desligado no modo CPU, então não devem chegar).
+            let planes = match &hw.surface {
+                HwSurface::Cpu(p) => p,
+                HwSurface::Shared(_) => return None,
+            };
+            let w = planes.width as usize;
+            let h = planes.height as usize;
             if w == 0 || h == 0 {
                 return None;
             }
@@ -39,11 +46,11 @@ pub fn convert(frame: &VideoFrame) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
             let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
             if nv12_into(
                 buf.make_mut_bytes(),
-                &hw.planes.y_data,
-                &hw.planes.uv_data,
+                &planes.y_data,
+                &planes.uv_data,
                 w,
                 h,
-                hw.planes.ten_bit,
+                planes.ten_bit,
                 full,
             ) {
                 Some(buf)

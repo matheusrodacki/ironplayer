@@ -14,7 +14,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow            = "1"
 thiserror         = "2"
 libloading        = "0.8"
-cpal              = "0.15"
+cpal              = "0.18"
 
 [package]
 name    = "ironplayer"

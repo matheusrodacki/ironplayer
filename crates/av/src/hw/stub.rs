@@ -105,6 +105,12 @@ pub struct NvPlanes {
     pub ten_bit: bool,
 }
 
+/// Stub não-habitado de `SharedNvFrame` (zero-copy HW é exclusivo de Windows).
+///
+/// `HwSurface::Shared` nunca é construído em não-Windows.
+#[derive(Debug)]
+pub enum SharedNvFrame {}
+
 /// Stub de `D3d11Texture` para plataformas não-Windows.
 #[derive(Debug)]
 pub struct D3d11Texture;

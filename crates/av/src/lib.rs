@@ -37,14 +37,15 @@ pub use codec::{AudioCodec, CodecConfig, DeinterlaceMode, MediaCodec, ThreadType
 pub use decoder::{DecodedFrame, FfmpegDecoder};
 pub use error::AvError;
 pub use hw::{
-    AdapterInfo, AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwAccelMode, HwAccelState,
-    HwPixelFormat, NvPlanes, TdrState, TransferFunction, HW_FALLBACK_THRESHOLD, TDR_MAX_ATTEMPTS,
-    TDR_RETRY_COOLDOWN,
+    gpu_zero_copy_enabled, set_gpu_zero_copy_enabled, AdapterInfo, AdapterLuid, ColorSpace,
+    D3d11Device, D3d11Texture, HwAccelMode, HwAccelState, HwPixelFormat, NvPlanes, SharedNvFrame,
+    TdrState, TransferFunction, HW_FALLBACK_THRESHOLD, TDR_MAX_ATTEMPTS, TDR_RETRY_COOLDOWN,
 };
 pub use pes::{PesAssembler, PesPacket};
 pub use renderer::VideoRenderer;
 pub use scan_type::{DeinterlaceReason, ScanType};
 pub use video_queue::{
-    HwVideoFrame, PopResult, PushResult, VideoFrame, VideoQueue, YuvColorRange, YuvColorspace,
-    YuvFrame, DEFAULT_CAPACITY as VIDEO_QUEUE_CAPACITY, DROP_PTS, HOLD_PTS, RESYNC_PTS,
+    HwSurface, HwVideoFrame, PopResult, PushResult, VideoFrame, VideoQueue, YuvColorRange,
+    YuvColorspace, YuvFrame, DEFAULT_CAPACITY as VIDEO_QUEUE_CAPACITY, DROP_PTS, HOLD_PTS,
+    RESYNC_PTS,
 };

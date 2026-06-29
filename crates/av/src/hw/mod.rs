@@ -19,12 +19,37 @@ pub use d3d11_impl::{
     AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwPixelFormat, NvPlanes, TransferFunction,
 };
 
+#[cfg(windows)]
+mod shared_nv12;
+#[cfg(windows)]
+pub use shared_nv12::{SharedNvFrame, SharedNvPool};
+
 #[cfg(not(windows))]
 mod stub;
 #[cfg(not(windows))]
 pub use stub::{
-    AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwPixelFormat, NvPlanes, TransferFunction,
+    AdapterLuid, ColorSpace, D3d11Device, D3d11Texture, HwPixelFormat, NvPlanes, SharedNvFrame,
+    TransferFunction,
 };
+
+// ── Flag global: zero-copy de hardware habilitado ─────────────────────────────
+//
+// Existe exatamente um decoder + uma UI por processo (ver `D3d11Device`), então
+// um flag global é coerente. A UI o habilita quando o render GPU está ativo; o
+// decoder só produz frames `HwSurface::Shared` (zero-copy) quando habilitado —
+// caso contrário usa o caminho de planos (CPU), seguro para o fallback da UI.
+use std::sync::atomic::{AtomicBool, Ordering};
+static GPU_ZERO_COPY_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Habilita/desabilita o caminho zero-copy de hardware (chamado pela UI).
+pub fn set_gpu_zero_copy_enabled(enabled: bool) {
+    GPU_ZERO_COPY_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// `true` se o render GPU zero-copy está ativo.
+pub fn gpu_zero_copy_enabled() -> bool {
+    GPU_ZERO_COPY_ENABLED.load(Ordering::Relaxed)
+}
 
 mod hwaccel_mode;
 pub use hwaccel_mode::{HwAccelMode, HwAccelState, HW_FALLBACK_THRESHOLD};

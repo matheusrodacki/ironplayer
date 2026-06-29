@@ -369,9 +369,10 @@ impl AudioSharedState {
 
     fn update_playback_latency_from_info(&self, info: &cpal::OutputCallbackInfo) {
         let timestamp = info.timestamp();
-        if let Some(latency) = timestamp.playback.duration_since(&timestamp.callback) {
-            self.set_playback_latency_duration(latency);
-        }
+        // cpal 0.18: `duration_since` recebe o instante por valor e devolve
+        // `Duration` (não mais `Option`).
+        let latency = timestamp.playback.duration_since(timestamp.callback);
+        self.set_playback_latency_duration(latency);
     }
 
     fn set_playback_latency_duration(&self, latency: Duration) {
@@ -424,9 +425,10 @@ impl AudioOutput {
                 message: "nenhum dispositivo de saída de áudio encontrado".into(),
             })?;
 
+        // cpal 0.18: `SampleRate` é alias de `u32`.
         let config = cpal::StreamConfig {
             channels,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -434,7 +436,7 @@ impl AudioOutput {
         let error_state = Arc::clone(&shared);
         let stream = device
             .build_output_stream::<f32, _, _>(
-                &config,
+                config,
                 move |output: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     let volume = f32::from_bits(callback_state.volume.load(Ordering::Relaxed));
 

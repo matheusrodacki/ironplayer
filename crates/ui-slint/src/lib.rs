@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use slint::{Color, ComponentHandle, Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
+use slint::wgpu_29::{wgpu, WGPUConfiguration};
 
 use av::video_queue::PopResult;
 use av::{Clock, MasterClock, VideoFrame, VideoQueue};
@@ -60,6 +61,10 @@ pub struct PipelineHandles {
 
 /// Inicia a janela Slint do IronPlayer e roda o event loop até o usuário fechar.
 pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
+    // Configura o backend wgpu (render zero-copy) antes de criar a janela.
+    // Em falha, `gpu` é None e caímos no fallback CPU (femtovg/GL).
+    let gpu = setup_wgpu_backend();
+
     let window = AppWindow::new()?;
     window.set_url(SharedString::from(handles.initial_url.as_str()));
 
@@ -99,25 +104,27 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         });
     }
 
-    // ── Worker de conversão de vídeo (fora do event loop da UI) ───────────
-    // A conversão YUV→RGBA é cara; rodá-la na thread da UI bloqueia render/input.
-    // O Poller envia o frame pronto (já com timing resolvido) para o worker, que
-    // converte e devolve um SharedPixelBuffer. Canais pequenos com descarte para
-    // manter latência baixa sob carga.
-    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<VideoFrame>(2);
-    let (img_tx, img_rx) = crossbeam_channel::bounded::<SharedPixelBuffer<Rgba8Pixel>>(2);
-    std::thread::Builder::new()
-        .name("slint-video-convert".into())
-        .spawn(move || {
-            for frame in frame_rx.iter() {
-                if let Some(buf) = video::convert(&frame) {
-                    // Descarta se a UI ainda não consumiu (mantém latência baixa);
-                    // a UI drena e usa sempre o buffer mais recente.
-                    let _ = img_tx.try_send(buf);
-                }
+    // ── Modo de render: GPU (zero-copy) ou CPU (fallback) ─────────────────
+    // GPU: converte YUV/NV12 → textura RGBA na GPU (shader) e importa como
+    // `slint::Image` sem cópia CPU. CPU: thread worker converte para
+    // SharedPixelBuffer (a conversão é cara e bloquearia o event loop da UI).
+    let render = match gpu {
+        Some((device, queue)) => match av::VideoRenderer::new(device, queue) {
+            Ok(renderer) => {
+                // Habilita o zero-copy de hardware (Fase 2) só quando o device
+                // suporta textura NV12; senão o decoder usa planos CPU.
+                let hw_zc = renderer.supports_hw_zero_copy();
+                av::set_gpu_zero_copy_enabled(hw_zc);
+                tracing::info!(hw_zero_copy = hw_zc, "vídeo: pipeline GPU ativo");
+                RenderMode::Gpu(renderer)
             }
-        })
-        .expect("falha ao criar thread slint-video-convert");
+            Err(e) => {
+                tracing::warn!(error = %e, "vídeo: VideoRenderer GPU falhou; fallback CPU");
+                spawn_cpu_worker()
+            }
+        },
+        None => spawn_cpu_worker(),
+    };
 
     // ── Estado de polling (single-thread, na UI) ──────────────────────────
     let mut poller = Poller {
@@ -134,8 +141,7 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         selected_pid,
         tick: 0,
         video: VideoState::new(handles.video_frames_rx, handles.audio_clock_rx),
-        frame_tx,
-        img_rx,
+        render,
     };
 
     // Preenche já no primeiro tick.
@@ -151,6 +157,115 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
     );
 
     window.run()
+}
+
+// ---------------------------------------------------------------------------
+// Modo de render (GPU zero-copy / CPU fallback)
+// ---------------------------------------------------------------------------
+
+/// Estratégia de exibição de vídeo escolhida no boot.
+///
+/// Só existe uma instância viva, então a diferença de tamanho entre variantes
+/// (o `VideoRenderer` é grande) não justifica um `Box`.
+#[allow(clippy::large_enum_variant)]
+enum RenderMode {
+    /// GPU: shader YUV/NV12 → textura RGBA importada como `slint::Image`.
+    Gpu(av::VideoRenderer),
+    /// CPU: thread worker converte para `SharedPixelBuffer` RGBA.
+    Cpu {
+        frame_tx: Sender<VideoFrame>,
+        img_rx: Receiver<SharedPixelBuffer<Rgba8Pixel>>,
+    },
+}
+
+/// Cria a stack wgpu (DX12) e instala o backend wgpu da Slint via
+/// `require_wgpu_29(Manual)`. Devolve `device`/`queue` compartilhados para o
+/// `VideoRenderer`, ou `None` se a GPU/wgpu não estiver disponível (→ fallback).
+///
+/// Usa o adapter de alta performance (mesmo GPU primário que o decoder D3D11VA),
+/// pré-requisito para o compartilhamento de surface da Fase 2.
+fn setup_wgpu_backend() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        flags: wgpu::InstanceFlags::default(),
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        backend_options: wgpu::BackendOptions::default(),
+        display: None,
+    });
+    let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    })) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "wgpu: nenhum adapter DX12; fallback CPU");
+            return None;
+        }
+    };
+    let info = adapter.get_info();
+    tracing::info!(adapter = %info.name, backend = ?info.backend, "wgpu: adapter selecionado");
+
+    // Solicita `TEXTURE_FORMAT_NV12` quando o adapter suporta — habilita o
+    // caminho zero-copy de hardware (Fase 2). Sem suporte, o flag fica desligado
+    // e o decoder usa planos CPU.
+    let nv12 = adapter.features() & wgpu::Features::TEXTURE_FORMAT_NV12;
+    let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("ironplayer-video"),
+        required_features: nv12,
+        required_limits: adapter.limits(),
+        ..Default::default()
+    })) {
+        Ok(dq) => dq,
+        Err(e) => {
+            tracing::warn!(error = %e, "wgpu: request_device falhou; fallback CPU");
+            return None;
+        }
+    };
+
+    let device_for_renderer = device.clone();
+    let queue_for_renderer = queue.clone();
+    match slint::BackendSelector::new()
+        .require_wgpu_29(WGPUConfiguration::Manual {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
+        .select()
+    {
+        Ok(()) => {
+            tracing::info!("slint: backend wgpu ativo (render zero-copy)");
+            Some((
+                Arc::new(device_for_renderer),
+                Arc::new(queue_for_renderer),
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "slint: require_wgpu_29 falhou; fallback CPU/GL");
+            None
+        }
+    }
+}
+
+/// Sobe a thread worker de conversão CPU (YUV→RGBA) e devolve o modo CPU.
+///
+/// A conversão é cara; rodá-la na thread da UI bloquearia render/input. Canais
+/// pequenos com descarte mantêm a latência baixa sob carga; a UI drena e usa
+/// sempre o buffer mais recente.
+fn spawn_cpu_worker() -> RenderMode {
+    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<VideoFrame>(2);
+    let (img_tx, img_rx) = crossbeam_channel::bounded::<SharedPixelBuffer<Rgba8Pixel>>(2);
+    std::thread::Builder::new()
+        .name("slint-video-convert".into())
+        .spawn(move || {
+            for frame in frame_rx.iter() {
+                if let Some(buf) = video::convert(&frame) {
+                    let _ = img_tx.try_send(buf);
+                }
+            }
+        })
+        .expect("falha ao criar thread slint-video-convert");
+    RenderMode::Cpu { frame_tx, img_rx }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,28 +286,46 @@ struct Poller {
     selected_pid: Rc<RefCell<Option<Pid>>>,
     tick: u64,
     video: VideoState,
-    /// Envia o frame pronto (timing resolvido) para o worker de conversão.
-    frame_tx: Sender<VideoFrame>,
-    /// Recebe buffers RGBA já convertidos pelo worker.
-    img_rx: Receiver<SharedPixelBuffer<Rgba8Pixel>>,
+    /// Estratégia de exibição (GPU zero-copy ou CPU via worker).
+    render: RenderMode,
 }
 
 impl Poller {
     fn tick(&mut self, win: &AppWindow) {
         self.tick = self.tick.wrapping_add(1);
 
-        // Vídeo a cada tick (~60 Hz): extrai o frame pronto e despacha p/ o worker.
-        if let Some(frame) = self.video.poll() {
-            let _ = self.frame_tx.try_send(frame);
-        }
-        // Drena o canal de imagens e exibe o buffer mais recente.
-        let mut latest = None;
-        while let Ok(buf) = self.img_rx.try_recv() {
-            latest = Some(buf);
-        }
-        if let Some(buf) = latest {
-            win.set_video_frame(Image::from_rgba8(buf));
-            win.set_video_has_signal(true);
+        // Vídeo a cada tick (~60 Hz): resolve o timing e exibe o frame.
+        match &mut self.render {
+            // GPU: converte na GPU (shader) e importa a textura RGBA sem cópia.
+            RenderMode::Gpu(renderer) => {
+                if let Some(frame) = self.video.poll() {
+                    if let Some(tex) = renderer.render_to_texture(&frame) {
+                        match Image::try_from(tex) {
+                            Ok(img) => {
+                                win.set_video_frame(img);
+                                win.set_video_has_signal(true);
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, "slint: Image::try_from(texture) falhou")
+                            }
+                        }
+                    }
+                }
+            }
+            // CPU: despacha p/ o worker e exibe o buffer convertido mais recente.
+            RenderMode::Cpu { frame_tx, img_rx } => {
+                if let Some(frame) = self.video.poll() {
+                    let _ = frame_tx.try_send(frame);
+                }
+                let mut latest = None;
+                while let Ok(buf) = img_rx.try_recv() {
+                    latest = Some(buf);
+                }
+                if let Some(buf) = latest {
+                    win.set_video_frame(Image::from_rgba8(buf));
+                    win.set_video_has_signal(true);
+                }
+            }
         }
 
         // Métricas/tabelas a ~4 Hz (snapshots chegam a 1 Hz).

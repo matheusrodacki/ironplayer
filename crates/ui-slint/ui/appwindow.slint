@@ -122,6 +122,7 @@ component CtxRow inherits Rectangle {
                 vertical-alignment: center;
                 horizontal-alignment: center;
             }
+
             Text {
                 text: root.label;
                 color: root.enabled ? Theme.text : Theme.text-faint;
@@ -130,7 +131,8 @@ component CtxRow inherits Rectangle {
                 horizontal-stretch: 1;
                 overflow: elide;
             }
-            if root.arrow : Path {
+
+            if root.arrow: Path {
                 width: 5px;
                 height: 9px;
                 y: (parent.height - 9px) / 2;
@@ -144,10 +146,10 @@ component CtxRow inherits Rectangle {
     // Feedback de hover via `states` (padrão do MenuItemBase do Slint), com cor
     // de acento bem visível.
     states [
-        active when root.current && root.enabled : {
+        active when root.current && root.enabled: {
             root.background: Theme.accent.with-alpha(0.22);
         }
-        hovered when ta.has-hover && root.enabled : {
+        hovered when ta.has-hover && root.enabled: {
             root.background: Theme.accent.with-alpha(0.14);
         }
     ]
@@ -194,12 +196,19 @@ component PsiCardView inherits Rectangle {
                 font-weight: 700;
                 vertical-alignment: center;
             }
-            Rectangle { horizontal-stretch: 1; }
+
             Rectangle {
-                width: 7px; height: 7px; border-radius: 3.5px;
+                horizontal-stretch: 1;
+            }
+
+            Rectangle {
+                width: 7px;
+                height: 7px;
+                border-radius: 3.5px;
                 background: card.present ? Theme.green : Theme.text-faint;
             }
         }
+
         Text {
             text: card.detail;
             color: Theme.text-faint;
@@ -221,7 +230,11 @@ component InfoLine inherits HorizontalLayout {
         font-size: 13px;
         vertical-alignment: center;
     }
-    Rectangle { horizontal-stretch: 1; }
+
+    Rectangle {
+        horizontal-stretch: 1;
+    }
+
     Text {
         text: root.value;
         color: root.accent ? Theme.accent : Theme.text;
@@ -246,7 +259,11 @@ component SectionHeader inherits HorizontalLayout {
         letter-spacing: 1.2px;
         vertical-alignment: center;
     }
-    Rectangle { horizontal-stretch: 1; }
+
+    Rectangle {
+        horizontal-stretch: 1;
+    }
+
     Text {
         text: root.trailing;
         color: Theme.text-faint;
@@ -271,12 +288,16 @@ component TabButton inherits Rectangle {
             font-weight: root.active ? 700 : 500;
             vertical-alignment: center;
         }
+
         Rectangle {
             height: 2px;
             background: root.active ? Theme.accent : transparent;
         }
     }
-    TouchArea { clicked => { root.clicked(); } }
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
 }
 
 // ─── Card de gráfico ─────────────────────────────────────────────────────────
@@ -294,8 +315,8 @@ component ChartCard inherits Rectangle {
     border-width: 1px;
     border-color: Theme.border-soft;
     VerticalLayout {
-        padding: 14px;
-        spacing: 3px;
+        padding: 6px;
+        spacing: 1px;
         HorizontalLayout {
             Text {
                 text: root.title;
@@ -304,23 +325,29 @@ component ChartCard inherits Rectangle {
                 font-weight: 700;
                 letter-spacing: 1px;
             }
-            Rectangle { horizontal-stretch: 1; }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
             Text {
                 text: root.unit;
                 color: Theme.text-faint;
                 font-size: 10px;
             }
         }
+
         HorizontalLayout {
             spacing: 7px;
             alignment: start;
             Text {
                 text: root.big-value;
                 color: root.line-color;
-                font-size: 24px;
+                font-size: 18px;
                 font-weight: 800;
                 font-family: Theme.mono;
             }
+
             Text {
                 text: root.sub-value;
                 color: Theme.text-dim;
@@ -328,10 +355,11 @@ component ChartCard inherits Rectangle {
                 vertical-alignment: bottom;
             }
         }
+
         Rectangle {
             vertical-stretch: 1;
             clip: true;
-            if root.dashed-guides : Rectangle {
+            if root.dashed-guides: Rectangle {
                 y: parent.height / 2;
                 height: 1px;
                 background: Theme.border;
@@ -346,6 +374,7 @@ component ChartCard inherits Rectangle {
                 commands: root.area-commands;
                 fill: root.line-color.with-alpha(0.14);
             }
+
             Path {
                 width: 100%;
                 height: 100%;
@@ -356,6 +385,95 @@ component ChartCard inherits Rectangle {
                 commands: root.line-commands;
                 stroke: root.line-color;
                 stroke-width: 1.5px;
+            }
+        }
+    }
+}
+
+// ─── Linha compacta key/value (usada no card de pipeline) ───────────────────────
+component InfoLineSmall inherits HorizontalLayout {
+    in property <string> key;
+    in property <string> value;
+    in property <bool> accent: false;
+    height: 17px;
+    spacing: 8px;
+    Text {
+        text: root.key;
+        color: Theme.text-dim;
+        font-size: 11px;
+        horizontal-stretch: 0;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    Text {
+        text: root.value;
+        color: root.accent ? Theme.accent : Theme.text;
+        font-size: 11px;
+        font-family: Theme.mono;
+        font-weight: root.accent ? 700 : 500;
+        horizontal-stretch: 1;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+// ─── Card de informações completas do pipeline (decode/hwaccel/sync) ────────────
+component InfoCard inherits Rectangle {
+    in property <string> title;
+    in property <[InfoRow]> rows-left;
+    in property <[InfoRow]> rows-mid;
+    in property <[InfoRow]> rows-right;
+    background: Theme.card;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border-soft;
+    VerticalLayout {
+        padding: 8px;
+        spacing: 2px;
+        Text {
+            text: root.title;
+            color: Theme.text-dim;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 1px;
+        }
+
+        HorizontalLayout {
+            spacing: 14px;
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 1px;
+                alignment: start;
+                horizontal-stretch: 1;
+                for i in root.rows-left: InfoLineSmall {
+                    key: i.key;
+                    value: i.value;
+                    accent: i.accent;
+                }
+            }
+
+            VerticalLayout {
+                spacing: 1px;
+                alignment: start;
+                horizontal-stretch: 1;
+                for i in root.rows-mid: InfoLineSmall {
+                    key: i.key;
+                    value: i.value;
+                    accent: i.accent;
+                }
+            }
+
+            VerticalLayout {
+                spacing: 1px;
+                alignment: start;
+                horizontal-stretch: 1;
+                for i in root.rows-right: InfoLineSmall {
+                    key: i.key;
+                    value: i.value;
+                    accent: i.accent;
+                }
             }
         }
     }
@@ -397,6 +515,7 @@ export component AppWindow inherits Window {
     in property <[MenuEntry]> ctx-audio: [];
     in property <[MenuEntry]> ctx-subtitles: [];
     in property <[MenuEntry]> ctx-aspect: [];
+    in property <[MenuEntry]> ctx-decode: [];
 
     in property <[PidRow]> pid-rows: [];
     in property <string> pid-total: "—";
@@ -414,6 +533,9 @@ export component AppWindow inherits Window {
     in property <string> jitter-value: "—";
     in property <string> jitter-sub: "";
     in property <string> jitter-line: "";
+    in property <[InfoRow]> pipeline-info-left: [];
+    in property <[InfoRow]> pipeline-info-mid: [];
+    in property <[InfoRow]> pipeline-info-right: [];
 
     // Aba ativa da coluna esquerda: 0 PIDs · 1 Tabelas · 2 Serviços · 3 Media Info
     in-out property <int> active-tab: 0;
@@ -426,13 +548,14 @@ export component AppWindow inherits Window {
     callback select-video(int);
     callback select-audio(int);
     callback set-aspect-ratio(int);
+    callback set-hwaccel(int);
 
     // ── Estado do menu de contexto (interno) ───────────────────────────────
     // Posição do clique direito (relativa à janela).
     property <length> ctx-x: 0px;
     property <length> ctx-y: 0px;
     // Seção do submenu aberto: -1 nenhum · 0 Serviço · 1 Vídeo · 2 Áudio ·
-    // 3 Legenda · 4 Proporção. Move-se conforme o hover nas categorias.
+    // 3 Legenda · 4 Proporção · 5 Decodificação. Move-se conforme o hover nas categorias.
     property <int> ctx-section: -1;
     // Topo do submenu, alinhado à categoria sob o cursor (coord. do popup raiz).
     property <length> ctx-sub-y: 0px;
@@ -442,6 +565,7 @@ export component AppWindow inherits Window {
         root.ctx-section == 2 ? root.ctx-audio :
         root.ctx-section == 3 ? root.ctx-subtitles :
         root.ctx-section == 4 ? root.ctx-aspect :
+        root.ctx-section == 5 ? root.ctx-decode :
         root.ctx-services;
 
     // Fecha o menu de forma diferida após escolher um item — evita re-entrar no
@@ -487,7 +611,7 @@ export component AppWindow inherits Window {
         property <length> pad: 5px;
         property <length> step: self.row-h + 1px;         // linha + spacing
         property <length> sep-h: 9px;
-        property <length> cat-h: self.pad * 2 + 5 * self.row-h + self.sep-h + 5 * 1px;
+        property <length> cat-h: self.pad * 2 + 6 * self.row-h + 2 * self.sep-h + 7 * 1px;
         property <int> sub-n: max(root.ctx-sub-entries.length, 1);
         property <length> sub-h: self.pad * 2 + self.sub-n * self.row-h + (self.sub-n - 1) * 1px;
         property <bool> sub-open: root.ctx-section >= 0;
@@ -498,6 +622,7 @@ export component AppWindow inherits Window {
         property <int> n-audio: max(root.ctx-audio.length, 1);
         property <int> n-subtitle: max(root.ctx-subtitles.length, 1);
         property <int> n-aspect: max(root.ctx-aspect.length, 1);
+        property <int> n-decode: max(root.ctx-decode.length, 1);
 
         pure function sub-h-of(n: int) -> length {
             return self.pad * 2 + n * self.row-h + (n - 1) * 1px;
@@ -513,7 +638,8 @@ export component AppWindow inherits Window {
             max(self.step * 1 + self.sub-h-of(self.n-video),
             max(self.step * 2 + self.sub-h-of(self.n-audio),
             max(self.step * 3 + self.sub-h-of(self.n-subtitle),
-                self.step * 4 + self.sep-h + 1px + self.sub-h-of(self.n-aspect)))));
+            max(self.step * 4 + self.sep-h + 1px + self.sub-h-of(self.n-aspect),
+                self.step * 5 + self.sep-h * 2 + 2px + self.sub-h-of(self.n-decode))))));
 
         // Contêiner: largura/altura fixas desde o primeiro frame (reservam espaço
         // para o submenu mais largo/alto possível) — o popup nunca precisa
@@ -533,36 +659,75 @@ export component AppWindow inherits Window {
                     padding: ctx-menu.pad;
                     spacing: 1px;
                     CtxRow {
-                        label: "Serviço"; arrow: true; current: root.ctx-section == 0;
+                        label: "Serviço";
+                        arrow: true;
+                        current: root.ctx-section == 0;
                         entered => { root.ctx-section = 0; root.ctx-sub-y = 0px; }
                         chosen => { root.ctx-section = 0; root.ctx-sub-y = 0px; }
                     }
+
                     CtxRow {
-                        label: "Vídeo"; arrow: true; current: root.ctx-section == 1;
+                        label: "Vídeo";
+                        arrow: true;
+                        current: root.ctx-section == 1;
                         entered => { root.ctx-section = 1; root.ctx-sub-y = ctx-menu.step * 1; }
                         chosen => { root.ctx-section = 1; root.ctx-sub-y = ctx-menu.step * 1; }
                     }
+
                     CtxRow {
-                        label: "Áudio"; arrow: true; current: root.ctx-section == 2;
+                        label: "Áudio";
+                        arrow: true;
+                        current: root.ctx-section == 2;
                         entered => { root.ctx-section = 2; root.ctx-sub-y = ctx-menu.step * 2; }
                         chosen => { root.ctx-section = 2; root.ctx-sub-y = ctx-menu.step * 2; }
                     }
+
                     CtxRow {
-                        label: "Legenda"; arrow: true; current: root.ctx-section == 3;
+                        label: "Legenda";
+                        arrow: true;
+                        current: root.ctx-section == 3;
                         entered => { root.ctx-section = 3; root.ctx-sub-y = ctx-menu.step * 3; }
                         chosen => { root.ctx-section = 3; root.ctx-sub-y = ctx-menu.step * 3; }
                     }
-                    Rectangle { height: ctx-menu.sep-h; Rectangle { y: 4px; height: 1px; background: Theme.border-soft; } }
+
+                    Rectangle {
+                        height: ctx-menu.sep-h;
+                        Rectangle {
+                            y: 4px;
+                            height: 1px;
+                            background: Theme.border-soft;
+                        }
+                    }
+
                     CtxRow {
-                        label: "Proporção"; arrow: true; current: root.ctx-section == 4;
+                        label: "Proporção";
+                        arrow: true;
+                        current: root.ctx-section == 4;
                         entered => { root.ctx-section = 4; root.ctx-sub-y = ctx-menu.step * 4 + ctx-menu.sep-h + 1px; }
                         chosen => { root.ctx-section = 4; root.ctx-sub-y = ctx-menu.step * 4 + ctx-menu.sep-h + 1px; }
+                    }
+
+                    Rectangle {
+                        height: ctx-menu.sep-h;
+                        Rectangle {
+                            y: 4px;
+                            height: 1px;
+                            background: Theme.border-soft;
+                        }
+                    }
+
+                    CtxRow {
+                        label: "Decodificação";
+                        arrow: true;
+                        current: root.ctx-section == 5;
+                        entered => { root.ctx-section = 5; root.ctx-sub-y = ctx-menu.step * 5 + ctx-menu.sep-h * 2 + 2px; }
+                        chosen => { root.ctx-section = 5; root.ctx-sub-y = ctx-menu.step * 5 + ctx-menu.sep-h * 2 + 2px; }
                     }
                 }
             }
 
             // ── Submenu flutuante (à direita da categoria sob o cursor) ────
-            if ctx-menu.sub-open : CtxFrame {
+            if ctx-menu.sub-open: CtxFrame {
                 x: ctx-menu.cat-w - 4px;
                 y: root.ctx-sub-y;
                 width: ctx-menu.sub-w;
@@ -570,7 +735,7 @@ export component AppWindow inherits Window {
                 VerticalLayout {
                     padding: ctx-menu.pad;
                     spacing: 1px;
-                    for e in root.ctx-sub-entries : CtxRow {
+                    for e in root.ctx-sub-entries: CtxRow {
                         label: e.label;
                         checked: e.active;
                         enabled: e.enabled;
@@ -580,6 +745,7 @@ export component AppWindow inherits Window {
                                 if (root.ctx-section == 1) { root.select-video(e.id); }
                                 if (root.ctx-section == 2) { root.select-audio(e.id); }
                                 if (root.ctx-section == 4) { root.set-aspect-ratio(e.id); }
+                                if (root.ctx-section == 5) { root.set-hwaccel(e.id); }
                                 ctx-close-timer.running = true;
                             }
                         }
@@ -594,7 +760,12 @@ export component AppWindow inherits Window {
         Rectangle {
             height: 64px;
             background: Theme.panel;
-            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+
             HorizontalLayout {
                 padding-left: 18px;
                 padding-right: 16px;
@@ -606,12 +777,14 @@ export component AppWindow inherits Window {
                     spacing: 11px;
                     alignment: start;
                     Path {
-                        width: 18px; height: 18px;
+                        width: 18px;
+                        height: 18px;
                         viewbox-width: 10;
                         viewbox-height: 10;
                         commands: "M 5 0 L 10 5 L 5 10 L 0 5 Z";
                         fill: Theme.accent;
                     }
+
                     VerticalLayout {
                         alignment: center;
                         spacing: 1px;
@@ -622,6 +795,7 @@ export component AppWindow inherits Window {
                             font-weight: 800;
                             letter-spacing: 1.5px;
                         }
+
                         Text {
                             text: "TS · STREAM ANALYZER";
                             color: Theme.text-faint;
@@ -631,7 +805,9 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                Rectangle { width: 6px; }
+                Rectangle {
+                    width: 6px;
+                }
 
                 // Protocolo
                 Rectangle {
@@ -649,12 +825,17 @@ export component AppWindow inherits Window {
                             font-size: 13px;
                             vertical-alignment: center;
                         }
-                        Rectangle { horizontal-stretch: 1; }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
                         // chevron ▾
                         Path {
-                            width: 9px; height: 6px;
+                            width: 9px;
+                            height: 6px;
                             y: (parent.height - 6px) / 2;
-                            viewbox-width: 10; viewbox-height: 6;
+                            viewbox-width: 10;
+                            viewbox-height: 6;
                             commands: "M 0 0 L 5 6 L 10 0 Z";
                             fill: Theme.text-faint;
                         }
@@ -673,10 +854,13 @@ export component AppWindow inherits Window {
                         padding-right: 14px;
                         spacing: 9px;
                         Rectangle {
-                            width: 8px; height: 8px; y: (parent.height - 8px)/2;
+                            width: 8px;
+                            height: 8px;
+                            y: (parent.height - 8px) / 2;
                             border-radius: 4px;
                             background: root.connected ? Theme.green : (root.connecting ? Theme.accent : Theme.text-faint);
                         }
+
                         TextInput {
                             text <=> root.url;
                             color: Theme.text;
@@ -703,6 +887,7 @@ export component AppWindow inherits Window {
                         font-size: 14px;
                         font-weight: 700;
                     }
+
                     ta-conn := TouchArea {
                         enabled: !root.connected;
                         clicked => { root.connect(root.url); }
@@ -721,13 +906,16 @@ export component AppWindow inherits Window {
                         font-size: 14px;
                         font-weight: 600;
                     }
+
                     ta-disc := TouchArea {
                         enabled: root.connected || root.connecting;
                         clicked => { root.disconnect(); }
                     }
                 }
 
-                Rectangle { width: 4px; }
+                Rectangle {
+                    width: 4px;
+                }
 
                 // Toggle Cinema/Broadcast
                 Rectangle {
@@ -742,13 +930,23 @@ export component AppWindow inherits Window {
                         Rectangle {
                             horizontal-stretch: 1;
                             border-radius: 4px;
-                            Text { text: "Cinema"; color: Theme.text-dim; font-size: 13px; }
+                            Text {
+                                text: "Cinema";
+                                color: Theme.text-dim;
+                                font-size: 13px;
+                            }
                         }
+
                         Rectangle {
                             horizontal-stretch: 1;
                             border-radius: 4px;
                             background: Theme.accent;
-                            Text { text: "Broadcast"; color: #1a1206; font-size: 13px; font-weight: 700; }
+                            Text {
+                                text: "Broadcast";
+                                color: #1a1206;
+                                font-size: 13px;
+                                font-weight: 700;
+                            }
                         }
                     }
                 }
@@ -779,26 +977,33 @@ export component AppWindow inherits Window {
                             active: root.active-tab == 0;
                             clicked => { root.active-tab = 0; }
                         }
+
                         TabButton {
                             text: "Tabelas";
                             active: root.active-tab == 1;
                             clicked => { root.active-tab = 1; }
                         }
+
                         TabButton {
                             text: "Serviços";
                             active: root.active-tab == 2;
                             clicked => { root.active-tab = 2; }
                         }
+
                         TabButton {
                             text: "Media Info";
                             active: root.active-tab == 3;
                             clicked => { root.active-tab = 3; }
                         }
                     }
-                    Rectangle { height: 1px; background: Theme.border-soft; }
+
+                    Rectangle {
+                        height: 1px;
+                        background: Theme.border-soft;
+                    }
 
                     // ── Conteúdo: PIDs ──────────────────────────────────
-                    if root.active-tab == 0 : VerticalLayout {
+                    if root.active-tab == 0: VerticalLayout {
                         spacing: 8px;
                         HorizontalLayout {
                             spacing: 8px;
@@ -817,6 +1022,7 @@ export component AppWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                             }
+
                             Text {
                                 text: root.pid-total;
                                 color: Theme.accent;
@@ -826,25 +1032,68 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                         }
+
                         HorizontalLayout {
                             height: 20px;
-                            Text { text: "PID"; width: 60px; color: Theme.text-faint; font-size: 10px; letter-spacing: 0.5px; }
-                            Text { text: "TIPO"; width: 62px; color: Theme.text-faint; font-size: 10px; }
-                            Text { text: "LABEL"; horizontal-stretch: 1; color: Theme.text-faint; font-size: 10px; }
-                            Text { text: "KBPS"; width: 56px; color: Theme.text-faint; font-size: 10px; horizontal-alignment: right; }
-                            Text { text: "CC"; width: 28px; color: Theme.text-faint; font-size: 10px; horizontal-alignment: right; }
-                            Text { text: "PKTS"; width: 48px; color: Theme.text-faint; font-size: 10px; horizontal-alignment: right; }
+                            Text {
+                                text: "PID";
+                                width: 60px;
+                                color: Theme.text-faint;
+                                font-size: 10px;
+                                letter-spacing: 0.5px;
+                            }
+
+                            Text {
+                                text: "TIPO";
+                                width: 62px;
+                                color: Theme.text-faint;
+                                font-size: 10px;
+                            }
+
+                            Text {
+                                text: "LABEL";
+                                horizontal-stretch: 1;
+                                color: Theme.text-faint;
+                                font-size: 10px;
+                            }
+
+                            Text {
+                                text: "KBPS";
+                                width: 56px;
+                                color: Theme.text-faint;
+                                font-size: 10px;
+                                horizontal-alignment: right;
+                            }
+
+                            Text {
+                                text: "CC";
+                                width: 28px;
+                                color: Theme.text-faint;
+                                font-size: 10px;
+                                horizontal-alignment: right;
+                            }
+
+                            Text {
+                                text: "PKTS";
+                                width: 48px;
+                                color: Theme.text-faint;
+                                font-size: 10px;
+                                horizontal-alignment: right;
+                            }
                         }
+
                         ListView {
                             vertical-stretch: 1;
-                            for row in root.pid-rows : Rectangle {
+                            for row in root.pid-rows: Rectangle {
                                 height: 38px;
                                 background: row.selected ? Theme.accent.with-alpha(0.12) : (touch.has-hover ? Theme.panel-alt : transparent);
                                 border-radius: 4px;
                                 Rectangle {
-                                    x: 0; width: 2px;
+                                    x: 0;
+                                    width: 2px;
                                     background: row.selected ? Theme.accent : transparent;
                                 }
+
                                 HorizontalLayout {
                                     padding-left: 7px;
                                     padding-right: 2px;
@@ -858,6 +1107,7 @@ export component AppWindow inherits Window {
                                             font-weight: 600;
                                             font-family: Theme.mono;
                                         }
+
                                         Text {
                                             text: row.pid-hex;
                                             color: Theme.text-faint;
@@ -865,6 +1115,7 @@ export component AppWindow inherits Window {
                                             font-family: Theme.mono;
                                         }
                                     }
+
                                     Rectangle {
                                         width: 62px;
                                         TypeBadge {
@@ -874,6 +1125,7 @@ export component AppWindow inherits Window {
                                             filled: row.kind != "—";
                                         }
                                     }
+
                                     Text {
                                         horizontal-stretch: 1;
                                         text: row.label;
@@ -882,6 +1134,7 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                         overflow: elide;
                                     }
+
                                     Text {
                                         width: 56px;
                                         text: row.kbps;
@@ -891,6 +1144,7 @@ export component AppWindow inherits Window {
                                         horizontal-alignment: right;
                                         vertical-alignment: center;
                                     }
+
                                     Text {
                                         width: 28px;
                                         text: row.cc;
@@ -900,6 +1154,7 @@ export component AppWindow inherits Window {
                                         horizontal-alignment: right;
                                         vertical-alignment: center;
                                     }
+
                                     Text {
                                         width: 48px;
                                         text: row.pkts;
@@ -910,6 +1165,7 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                 }
+
                                 touch := TouchArea {
                                     clicked => { root.select-pid(row.pid); }
                                 }
@@ -918,25 +1174,44 @@ export component AppWindow inherits Window {
                     }
 
                     // ── Conteúdo: Tabelas (grade PSI/SI) ───────────────
-                    if root.active-tab == 1 : ScrollView {
+                    if root.active-tab == 1: ScrollView {
                         VerticalLayout {
                             spacing: 8px;
-                            SectionHeader { title: "TABELAS PSI / SI"; trailing: "DVB · ATSC · ISDB"; }
-                            for prow in root.psi-rows : HorizontalLayout {
-                                spacing: 8px;
-                                PsiCardView { horizontal-stretch: 1; card: prow.a; }
-                                if prow.has-b : PsiCardView { horizontal-stretch: 1; card: prow.b; }
-                                if !prow.has-b : Rectangle { horizontal-stretch: 1; }
+                            SectionHeader {
+                                title: "TABELAS PSI / SI";
+                                trailing: "DVB · ATSC · ISDB";
                             }
-                            Rectangle { vertical-stretch: 1; }
+
+                            for prow in root.psi-rows: HorizontalLayout {
+                                spacing: 8px;
+                                PsiCardView {
+                                    horizontal-stretch: 1;
+                                    card: prow.a;
+                                }
+
+                                if prow.has-b: PsiCardView {
+                                    horizontal-stretch: 1;
+                                    card: prow.b;
+                                }
+                                if !prow.has-b: Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                            Rectangle {
+                                vertical-stretch: 1;
+                            }
                         }
                     }
 
                     // ── Conteúdo: Serviços ─────────────────────────────
-                    if root.active-tab == 2 : VerticalLayout {
+                    if root.active-tab == 2: VerticalLayout {
                         spacing: 8px;
-                        SectionHeader { title: "SERVIÇOS DVB"; trailing: "SDT"; }
-                        if root.services.length == 0 : Text {
+                        SectionHeader {
+                            title: "SERVIÇOS DVB";
+                            trailing: "SDT";
+                        }
+
+                        if root.services.length == 0: Text {
                             text: "Nenhum serviço descrito (SDT) recebido.";
                             color: Theme.text-faint;
                             font-size: 12px;
@@ -944,11 +1219,16 @@ export component AppWindow inherits Window {
                         }
                         ListView {
                             vertical-stretch: 1;
-                            for svc in root.services : Rectangle {
+                            for svc in root.services: Rectangle {
                                 height: 50px;
                                 background: svc.selected ? Theme.accent.with-alpha(0.12) : (sta.has-hover ? Theme.panel-alt : transparent);
                                 border-radius: 5px;
-                                Rectangle { x: 0; width: 2px; background: svc.selected ? Theme.accent : transparent; }
+                                Rectangle {
+                                    x: 0;
+                                    width: 2px;
+                                    background: svc.selected ? Theme.accent : transparent;
+                                }
+
                                 HorizontalLayout {
                                     padding-left: 10px;
                                     padding-right: 8px;
@@ -963,6 +1243,7 @@ export component AppWindow inherits Window {
                                             font-weight: 600;
                                             overflow: elide;
                                         }
+
                                         Text {
                                             text: svc.provider;
                                             color: Theme.text-faint;
@@ -970,7 +1251,11 @@ export component AppWindow inherits Window {
                                             overflow: elide;
                                         }
                                     }
-                                    Rectangle { horizontal-stretch: 1; }
+
+                                    Rectangle {
+                                        horizontal-stretch: 1;
+                                    }
+
                                     VerticalLayout {
                                         alignment: center;
                                         spacing: 2px;
@@ -981,6 +1266,7 @@ export component AppWindow inherits Window {
                                             font-family: Theme.mono;
                                             horizontal-alignment: right;
                                         }
+
                                         Text {
                                             text: svc.scrambled ? "CA · " + svc.running : svc.running;
                                             color: svc.scrambled ? Theme.accent : Theme.green;
@@ -989,6 +1275,7 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
+
                                 sta := TouchArea {
                                     clicked => { root.select-service(svc.service-id); }
                                 }
@@ -997,19 +1284,48 @@ export component AppWindow inherits Window {
                     }
 
                     // ── Conteúdo: Media Info ───────────────────────────
-                    if root.active-tab == 3 : ScrollView {
+                    if root.active-tab == 3: ScrollView {
                         VerticalLayout {
                             spacing: 4px;
-                            Text { text: "VÍDEO"; color: Theme.accent; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; }
-                            if root.video-info.length == 0 : Text {
-                                text: "Aguardando análise do stream...";
-                                color: Theme.text-faint; font-size: 12px;
+                            Text {
+                                text: "VÍDEO";
+                                color: Theme.accent;
+                                font-size: 11px;
+                                font-weight: 700;
+                                letter-spacing: 1.5px;
                             }
-                            for i in root.video-info : InfoLine { key: i.key; value: i.value; accent: i.accent; }
-                            Rectangle { height: 10px; }
-                            Text { text: "ÁUDIO"; color: Theme.accent; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; }
-                            for i in root.audio-info : InfoLine { key: i.key; value: i.value; accent: i.accent; }
-                            Rectangle { vertical-stretch: 1; min-height: 8px; }
+
+                            if root.video-info.length == 0: Text {
+                                text: "Aguardando análise do stream...";
+                                color: Theme.text-faint;
+                                font-size: 12px;
+                            }
+                            for i in root.video-info: InfoLine {
+                                key: i.key;
+                                value: i.value;
+                                accent: i.accent;
+                            }
+                            Rectangle {
+                                height: 10px;
+                            }
+
+                            Text {
+                                text: "ÁUDIO";
+                                color: Theme.accent;
+                                font-size: 11px;
+                                font-weight: 700;
+                                letter-spacing: 1.5px;
+                            }
+
+                            for i in root.audio-info: InfoLine {
+                                key: i.key;
+                                value: i.value;
+                                accent: i.accent;
+                            }
+                            Rectangle {
+                                vertical-stretch: 1;
+                                min-height: 8px;
+                            }
                         }
                     }
                 }
@@ -1020,7 +1336,7 @@ export component AppWindow inherits Window {
                 horizontal-stretch: 1;
                 spacing: 12px;
                 Rectangle {
-                    vertical-stretch: 3;
+                    vertical-stretch: 13;
                     background: #050607;
                     border-radius: Theme.radius;
                     border-width: 1px;
@@ -1036,7 +1352,7 @@ export component AppWindow inherits Window {
                         property <length> vid-w: pillarbox ? parent.height * root.video-display-aspect : parent.width;
                         property <length> vid-h: pillarbox ? parent.height : parent.width / root.video-display-aspect;
 
-                        if root.video-has-signal : Image {
+                        if root.video-has-signal: Image {
                             x: (parent.width - vid-w) / 2;
                             y: (parent.height - vid-h) / 2;
                             width: vid-w;
@@ -1044,7 +1360,7 @@ export component AppWindow inherits Window {
                             source: root.video-frame;
                             image-fit: fill;
                         }
-                        if !root.video-has-signal : VerticalLayout {
+                        if !root.video-has-signal: VerticalLayout {
                             alignment: center;
                             Text {
                                 text: "SINAL DE VÍDEO · " + root.video-res;
@@ -1053,6 +1369,7 @@ export component AppWindow inherits Window {
                                 letter-spacing: 2px;
                                 horizontal-alignment: center;
                             }
+
                             Text {
                                 text: root.video-caption;
                                 color: #3a434d;
@@ -1064,7 +1381,8 @@ export component AppWindow inherits Window {
 
                         // chip de codec (sup. esquerdo)
                         Rectangle {
-                            x: 14px; y: 14px;
+                            x: 14px;
+                            y: 14px;
                             width: cap.preferred-width + 22px;
                             height: 26px;
                             background: #0b0d10dd;
@@ -1080,7 +1398,7 @@ export component AppWindow inherits Window {
                         }
 
                         // AO VIVO (sup. direito)
-                        if root.live : Rectangle {
+                        if root.live: Rectangle {
                             x: parent.width - self.width - 14px;
                             y: 14px;
                             width: 98px;
@@ -1095,10 +1413,13 @@ export component AppWindow inherits Window {
                                 spacing: 7px;
                                 alignment: center;
                                 Rectangle {
-                                    width: 7px; height: 7px; border-radius: 3.5px;
+                                    width: 7px;
+                                    height: 7px;
+                                    border-radius: 3.5px;
                                     y: (parent.height - 7px) / 2;
                                     background: Theme.red;
                                 }
+
                                 Text {
                                     text: "AO VIVO";
                                     color: Theme.red;
@@ -1122,12 +1443,15 @@ export component AppWindow inherits Window {
                                     spacing: 8px;
                                     alignment: start;
                                     Path {
-                                        width: 11px; height: 12px;
+                                        width: 11px;
+                                        height: 12px;
                                         y: (parent.height - 12px) / 2;
-                                        viewbox-width: 10; viewbox-height: 12;
+                                        viewbox-width: 10;
+                                        viewbox-height: 12;
                                         commands: "M 0 0 L 10 6 L 0 12 Z";
                                         fill: root.connected ? Theme.green : Theme.text-faint;
                                     }
+
                                     Text {
                                         text: root.connected ? "Reproduzindo" : "Parado";
                                         color: Theme.text;
@@ -1135,7 +1459,11 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                 }
-                                Rectangle { horizontal-stretch: 1; }
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+
                                 Text {
                                     text: root.timecode;
                                     color: Theme.accent;
@@ -1164,8 +1492,9 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+
                 HorizontalLayout {
-                    vertical-stretch: 2;
+                    vertical-stretch: 1;
                     spacing: 12px;
                     ChartCard {
                         horizontal-stretch: 1;
@@ -1177,6 +1506,7 @@ export component AppWindow inherits Window {
                         line-commands: root.bitrate-line;
                         line-color: Theme.green;
                     }
+
                     ChartCard {
                         horizontal-stretch: 1;
                         title: "PCR JITTER";
@@ -1187,6 +1517,14 @@ export component AppWindow inherits Window {
                         line-color: Theme.blue;
                         dashed-guides: true;
                     }
+
+                    InfoCard {
+                        horizontal-stretch: 1;
+                        title: "PIPELINE";
+                        rows-left: root.pipeline-info-left;
+                        rows-mid: root.pipeline-info-mid;
+                        rows-right: root.pipeline-info-right;
+                    }
                 }
             }
         }
@@ -1195,7 +1533,12 @@ export component AppWindow inherits Window {
         Rectangle {
             height: 28px;
             background: Theme.panel;
-            Rectangle { y: 0; height: 1px; background: Theme.border; }
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: Theme.border;
+            }
+
             HorizontalLayout {
                 padding-left: 14px;
                 padding-right: 14px;
@@ -1204,9 +1547,13 @@ export component AppWindow inherits Window {
                     spacing: 7px;
                     alignment: start;
                     Rectangle {
-                        width: 8px; height: 8px; y: (parent.height - 8px)/2; border-radius: 4px;
+                        width: 8px;
+                        height: 8px;
+                        y: (parent.height - 8px) / 2;
+                        border-radius: 4px;
                         background: root.connected ? Theme.green : Theme.text-faint;
                     }
+
                     Text {
                         text: root.conn-label;
                         color: Theme.text-dim;
@@ -1215,12 +1562,50 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                 }
-                Rectangle { horizontal-stretch: 1; }
-                Text { text: root.total-mbps + " Mbps"; color: Theme.text-dim; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
-                Text { text: "CC " + root.cc-total; color: Theme.text-dim; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
-                Text { text: "buf " + root.buffer-pct; color: Theme.text-dim; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
-                Text { text: root.audio-summary; color: Theme.text-dim; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
-                Text { text: root.hw-summary; color: Theme.text-faint; font-size: 11px; font-family: Theme.mono; vertical-alignment: center; }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                Text {
+                    text: root.total-mbps + " Mbps";
+                    color: Theme.text-dim;
+                    font-size: 11px;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "CC " + root.cc-total;
+                    color: Theme.text-dim;
+                    font-size: 11px;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "buf " + root.buffer-pct;
+                    color: Theme.text-dim;
+                    font-size: 11px;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.audio-summary;
+                    color: Theme.text-dim;
+                    font-size: 11px;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.hw-summary;
+                    color: Theme.text-faint;
+                    font-size: 11px;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                }
             }
         }
     }

@@ -117,6 +117,20 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
             };
         });
     }
+    let hwaccel_choice = Rc::new(RefCell::new(HwAccelChoice::default()));
+    {
+        let cmd_tx = handles.cmd_tx.clone();
+        let choice_ref = hwaccel_choice.clone();
+        window.on_set_hwaccel(move |id| {
+            let choice = match id {
+                1 => HwAccelChoice::D3d11va,
+                2 => HwAccelChoice::None,
+                _ => HwAccelChoice::Auto,
+            };
+            *choice_ref.borrow_mut() = choice;
+            let _ = cmd_tx.try_send(AppCommand::SetHwAccel { choice });
+        });
+    }
     let selected_service: Rc<RefCell<Option<u16>>> = Rc::new(RefCell::new(None));
     {
         let cmd_tx = handles.cmd_tx.clone();
@@ -194,6 +208,7 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         selected_pid,
         selected_service,
         aspect_ratio,
+        hwaccel_choice,
         video_dims: None,
         tick: 0,
         video: VideoState::new(handles.video_frames_rx, handles.audio_clock_rx),
@@ -386,6 +401,9 @@ struct Poller {
     selected_service: Rc<RefCell<Option<u16>>>,
     /// Modo de proporção escolhido no menu de contexto.
     aspect_ratio: Rc<RefCell<AspectRatioMode>>,
+    /// Modo de hwaccel escolhido no menu de contexto (espelho local do último
+    /// comando enviado; o backend confirma via `PipelineMetrics.hw_decode_active`).
+    hwaccel_choice: Rc<RefCell<HwAccelChoice>>,
     /// Dimensões do último frame `(width, height)` corrigidas por SAR.
     video_dims: Option<(u32, u32)>,
     tick: u64,
@@ -426,6 +444,15 @@ impl Poller {
         let refresh_meta = self.tick % 15 == 0;
         self.poll_table_events();
         self.poll_snapshot();
+
+        // Contadores de sync A/V da VideoQueue — o aggregator (`ts`) sempre os
+        // publica zerados; é responsabilidade da UI sobrescrevê-los aqui a
+        // partir da fila/clock real de vídeo (ver doc de `MetricsSnapshot`).
+        self.state.metrics.video_queue_depth = self.video.queue.len() as u16;
+        self.state.metrics.late_frames_dropped = self.video.queue.dropped_late;
+        self.state.metrics.early_frames_held = self.video.queue.held_early;
+        self.state.metrics.pts_discontinuities = self.video.queue.discontinuities;
+        self.state.metrics.av_sync_offset_ms = self.video.last_sync_offset_ms;
 
         if refresh_meta {
             self.apply_to_window(win);
@@ -554,13 +581,22 @@ impl Poller {
         win.set_jitter_sub(SharedString::from(j_sub));
         win.set_jitter_line(SharedString::from(j_line));
 
-        let (ctx_svc, ctx_vid, ctx_aud, ctx_sub, ctx_ar) =
-            context_menu::build_menu_models(st, *self.aspect_ratio.borrow());
+        let (ctx_svc, ctx_vid, ctx_aud, ctx_sub, ctx_ar, ctx_dec) = context_menu::build_menu_models(
+            st,
+            *self.aspect_ratio.borrow(),
+            *self.hwaccel_choice.borrow(),
+        );
         win.set_ctx_services(ctx_svc);
         win.set_ctx_videos(ctx_vid);
         win.set_ctx_audio(ctx_aud);
         win.set_ctx_subtitles(ctx_sub);
         win.set_ctx_aspect(ctx_ar);
+        win.set_ctx_decode(ctx_dec);
+
+        let (pipeline_left, pipeline_mid, pipeline_right) = build_pipeline_info(st);
+        win.set_pipeline_info_left(ModelRc::new(VecModel::from(pipeline_left)));
+        win.set_pipeline_info_mid(ModelRc::new(VecModel::from(pipeline_mid)));
+        win.set_pipeline_info_right(ModelRc::new(VecModel::from(pipeline_right)));
     }
 
     /// Atualiza propriedades leves a cada tick (conexão, status bar, timecode).
@@ -614,6 +650,10 @@ struct VideoState {
     adopted_audio_id: Option<usize>,
     pts_interval: Option<i64>,
     last_pts: Option<i64>,
+    /// Offset de sincronismo A/V (vídeo − áudio, em ms) do último frame exibido.
+    ///
+    /// SPEC-METRICS-SYNC-001
+    last_sync_offset_ms: i32,
 }
 
 impl VideoState {
@@ -628,6 +668,7 @@ impl VideoState {
             adopted_audio_id: None,
             pts_interval: None,
             last_pts: None,
+            last_sync_offset_ms: 0,
         }
     }
 
@@ -640,6 +681,7 @@ impl VideoState {
         self.adopted_audio_id = None;
         self.pts_interval = None;
         self.last_pts = None;
+        self.last_sync_offset_ms = 0;
         if let Ok(mut g) = self.audio_clock_rx.write() {
             *g = None;
         }
@@ -711,10 +753,18 @@ impl VideoState {
         let allow_resync = self.clock.audio_handle().is_none();
         let clock_pts = self.clock.now_pts90();
         match self.queue.pop_ready_with_resync(clock_pts, allow_resync) {
-            PopResult::Ready(f) => Some(f),
+            PopResult::Ready(f) => {
+                if let Some(pts) = f.pts() {
+                    self.last_sync_offset_ms = ((pts as i64 - clock_pts) / 90) as i32;
+                }
+                Some(f)
+            }
             PopResult::Resync { frame, new_anchor } => {
                 if allow_resync {
                     self.clock.reset(new_anchor);
+                }
+                if let Some(pts) = frame.pts() {
+                    self.last_sync_offset_ms = ((pts as i64 - clock_pts) / 90) as i32;
                 }
                 Some(frame)
             }
@@ -1180,6 +1230,101 @@ fn hw_summary(st: &AppState) -> String {
         Some(name) => format!("{name} · {mode}"),
         None => mode.to_string(),
     }
+}
+
+/// Constrói as linhas do card "PIPELINE" (paridade com o antigo painel de debug
+/// A/V do egui — decode/hwaccel/deinterlace/color/sync), divididas em três
+/// colunas para caber na altura reduzida do card.
+fn build_pipeline_info(st: &AppState) -> (Vec<InfoRow>, Vec<InfoRow>, Vec<InfoRow>) {
+    let p = &st.metrics.pipeline;
+    let mut rows = Vec::new();
+
+    let decode_mode = if p.hw_decode_active {
+        format!(
+            "GPU ({})",
+            p.hw_decode_codec.as_deref().unwrap_or("d3d11va")
+        )
+    } else {
+        "CPU".to_string()
+    };
+    rows.push(info("Decode", decode_mode, true));
+    if let Some(reason) = &p.hw_decode_fallback_reason {
+        rows.push(info("Fallback", reason.clone(), false));
+    }
+    if let Some(name) = &p.gpu_adapter_name {
+        rows.push(info("Adapter", name.clone(), false));
+    }
+    rows.push(info("Threads", p.decoder_threads_used.to_string(), false));
+
+    let deint = if p.deinterlacer_active {
+        "ativo"
+    } else {
+        "inativo"
+    };
+    let scan = p.scan_type.as_deref().unwrap_or("—");
+    rows.push(info("Deinterlace", format!("{deint} ({scan})"), false));
+    if let Some(reason) = &p.deinterlace_reason {
+        rows.push(info("Deint. motivo", reason.clone(), false));
+    }
+
+    let color = format!(
+        "{} ({})",
+        p.colorspace.as_deref().unwrap_or("—"),
+        p.color_range.as_deref().unwrap_or("—")
+    );
+    rows.push(info("Color", color, false));
+
+    rows.push(info(
+        "GPU upload",
+        format!("{:.1} MB/s", p.gpu_upload_bytes_per_sec as f64 / 1_000_000.0),
+        false,
+    ));
+    rows.push(info(
+        "Pool GPU",
+        format!("{} frames", p.hw_frame_pool_in_use),
+        false,
+    ));
+    rows.push(info("TDR", p.tdr_recoveries.to_string(), false));
+
+    if let (Some(p50), Some(p99)) = (
+        p.decode_time_ms_p50.values().next(),
+        p.decode_time_ms_p99.values().next(),
+    ) {
+        rows.push(info(
+            "Decode p50/p99",
+            format!("{p50:.1} / {p99:.1} ms"),
+            false,
+        ));
+    }
+
+    rows.push(info(
+        "Sync A/V",
+        format!("{} ms", st.metrics.av_sync_offset_ms),
+        false,
+    ));
+    rows.push(info(
+        "Drops/Holds",
+        format!(
+            "{} / {}",
+            st.metrics.late_frames_dropped, st.metrics.early_frames_held
+        ),
+        false,
+    ));
+    rows.push(info(
+        "PTS disc.",
+        st.metrics.pts_discontinuities.to_string(),
+        false,
+    ));
+    rows.push(info(
+        "Fila vídeo",
+        format!("{} frames", st.metrics.video_queue_depth),
+        false,
+    ));
+
+    let third = rows.len().div_ceil(3);
+    let mut mid_and_right = rows.split_off(third.min(rows.len()));
+    let right = mid_and_right.split_off(third.min(mid_and_right.len()));
+    (rows, mid_and_right, right)
 }
 
 /// Timecode derivado do tempo decorrido desde a conexão (HH:MM:SS:FF).

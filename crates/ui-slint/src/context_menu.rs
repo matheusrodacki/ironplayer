@@ -2,16 +2,19 @@
 
 use slint::{ModelRc, SharedString, VecModel};
 
-use crate::state::{AppState, AspectRatioMode, ConnectionState};
+use crate::state::{AppState, AspectRatioMode, ConnectionState, HwAccelChoice};
 use crate::MenuEntry;
 use ts::tables::PmtStream;
 use ts::Pid;
 
 /// Monta os modelos do menu de contexto a partir do estado atual.
+#[allow(clippy::type_complexity)]
 pub fn build_menu_models(
     state: &AppState,
     aspect_ratio: AspectRatioMode,
+    hwaccel_choice: HwAccelChoice,
 ) -> (
+    ModelRc<MenuEntry>,
     ModelRc<MenuEntry>,
     ModelRc<MenuEntry>,
     ModelRc<MenuEntry>,
@@ -25,6 +28,7 @@ pub fn build_menu_models(
         ModelRc::new(VecModel::from(build_audio(state, connected))),
         ModelRc::new(VecModel::from(build_subtitles(state))),
         ModelRc::new(VecModel::from(build_aspect(aspect_ratio))),
+        ModelRc::new(VecModel::from(build_decode(hwaccel_choice))),
     )
 }
 
@@ -183,6 +187,22 @@ fn build_aspect(mode: AspectRatioMode) -> Vec<MenuEntry> {
             active,
             enabled: true,
         }
+    })
+    .collect()
+}
+
+fn build_decode(current: HwAccelChoice) -> Vec<MenuEntry> {
+    [
+        (HwAccelChoice::Auto, "Auto", 0),
+        (HwAccelChoice::D3d11va, "GPU (D3D11VA)", 1),
+        (HwAccelChoice::None, "CPU", 2),
+    ]
+    .into_iter()
+    .map(|(mode, label, id)| MenuEntry {
+        label: SharedString::from(label),
+        id,
+        active: mode == current,
+        enabled: true,
     })
     .collect()
 }

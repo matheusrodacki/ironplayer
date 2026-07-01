@@ -197,6 +197,7 @@ fn apply_audio_frame_metadata(status: &mut ui_slint::AudioStatusSnapshot, frame:
 struct StreamResetTargets<'a> {
     selected_service: &'a Arc<std::sync::RwLock<Option<u16>>>,
     selected_audio_pid: &'a Arc<std::sync::RwLock<Option<u16>>>,
+    selected_video_pid: &'a Arc<std::sync::RwLock<Option<u16>>>,
     table_cmd_tx: &'a crossbeam_channel::Sender<TableCommand>,
     agg_net_tx: &'a crossbeam_channel::Sender<AggregatorNetEvent>,
     demux_cmd_tx: &'a crossbeam_channel::Sender<DemuxCommand>,
@@ -211,6 +212,9 @@ fn reset_stream_routing(targets: StreamResetTargets<'_>) {
     }
     if let Ok(mut audio_pid) = targets.selected_audio_pid.write() {
         *audio_pid = None;
+    }
+    if let Ok(mut video_pid) = targets.selected_video_pid.write() {
+        *video_pid = None;
     }
     if targets.table_cmd_tx.try_send(TableCommand::Reset).is_err() {
         tracing::warn!("canal table-control cheio — Reset descartado");
@@ -376,6 +380,8 @@ fn main() -> anyhow::Result<()> {
         Arc::new(std::sync::RwLock::new(None));
     let selected_audio_pid: Arc<std::sync::RwLock<Option<u16>>> =
         Arc::new(std::sync::RwLock::new(None));
+    let selected_video_pid: Arc<std::sync::RwLock<Option<u16>>> =
+        Arc::new(std::sync::RwLock::new(None));
     let (table_cmd_tx, table_cmd_rx) = crossbeam_channel::bounded::<TableCommand>(32);
 
     // 7. Instancia MetricsAggregator
@@ -405,6 +411,7 @@ fn main() -> anyhow::Result<()> {
         decode_cmd_tx.clone(),
         selected_service.clone(),
         selected_audio_pid.clone(),
+        selected_video_pid.clone(),
         audio_status.clone(),
         true,
         Some(table_cmd_rx),
@@ -1140,6 +1147,7 @@ fn main() -> anyhow::Result<()> {
         let current_net_stop = current_net_stop.clone();
         let selected_service = selected_service.clone();
         let selected_audio_pid = selected_audio_pid.clone();
+        let selected_video_pid = selected_video_pid.clone();
         let demux_cmd_tx = demux_cmd_tx.clone();
         let pes_cmd_tx = pes_cmd_tx.clone();
         let decode_cmd_tx = decode_cmd_tx.clone();
@@ -1165,6 +1173,7 @@ fn main() -> anyhow::Result<()> {
                             reset_stream_routing(StreamResetTargets {
                                 selected_service: &selected_service,
                                 selected_audio_pid: &selected_audio_pid,
+                                selected_video_pid: &selected_video_pid,
                                 table_cmd_tx: &table_cmd_tx,
                                 agg_net_tx: &agg_net_tx,
                                 demux_cmd_tx: &demux_cmd_tx,
@@ -1249,6 +1258,7 @@ fn main() -> anyhow::Result<()> {
                             reset_stream_routing(StreamResetTargets {
                                 selected_service: &selected_service,
                                 selected_audio_pid: &selected_audio_pid,
+                                selected_video_pid: &selected_video_pid,
                                 table_cmd_tx: &table_cmd_tx,
                                 agg_net_tx: &agg_net_tx,
                                 demux_cmd_tx: &demux_cmd_tx,
@@ -1278,6 +1288,9 @@ fn main() -> anyhow::Result<()> {
                             if let Ok(mut audio_pid) = selected_audio_pid.write() {
                                 *audio_pid = None;
                             }
+                            if let Ok(mut video_pid) = selected_video_pid.write() {
+                                *video_pid = None;
+                            }
                             if audio_cmd_tx.try_send(AudioCommand::Reset).is_err() {
                                 tracing::warn!("canal audio-control cheio — Reset descartado");
                             }
@@ -1303,6 +1316,11 @@ fn main() -> anyhow::Result<()> {
                                 tracing::warn!("canal audio-control cheio — Reset descartado");
                             }
                             tracing::info!(service_id, pid, "trilha de áudio selecionada pelo usuário");
+                        }
+                        ui_slint::AppCommand::SelectVideo { service_id, pid } => {
+                            *selected_service.write().unwrap() = Some(service_id);
+                            *selected_video_pid.write().unwrap() = Some(pid);
+                            tracing::info!(service_id, pid, "trilha de vídeo selecionada pelo usuário");
                         }
                         ui_slint::AppCommand::SetHwAccel { choice } => {
                             let cfg_choice: config::HwAccelChoice = choice.into();
@@ -1363,6 +1381,7 @@ fn main() -> anyhow::Result<()> {
         conn_rx: conn_state,
         audio_rx: audio_status,
         selected_service_rx: selected_service,
+        selected_video_pid_rx: selected_video_pid,
         table_events_rx,
         video_frames_rx,
         pipeline_metrics_rx: pipeline_metrics_ui,

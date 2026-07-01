@@ -6,6 +6,7 @@
 
 slint::include_modules!();
 
+mod context_menu;
 mod state;
 mod video;
 
@@ -36,6 +37,7 @@ use ts::{Pid, StreamKind};
 type SharedConn = Arc<RwLock<ConnectionState>>;
 type SharedAudio = Arc<RwLock<AudioStatusSnapshot>>;
 type SharedService = Arc<RwLock<Option<u16>>>;
+type SharedVideoPid = Arc<RwLock<Option<u16>>>;
 type SharedPipeline = Arc<RwLock<ts::metrics::PipelineMetrics>>;
 type SharedAudioClock = Arc<RwLock<Option<av::AudioClockHandle>>>;
 type SharedMediaInfo = Arc<RwLock<ts::MediaInfoCodecSnapshot>>;
@@ -47,6 +49,7 @@ pub struct PipelineHandles {
     pub conn_rx: SharedConn,
     pub audio_rx: SharedAudio,
     pub selected_service_rx: SharedService,
+    pub selected_video_pid_rx: SharedVideoPid,
     pub table_events_rx: Receiver<TableEvent>,
     pub video_frames_rx: Receiver<VideoFrame>,
     pub pipeline_metrics_rx: SharedPipeline,
@@ -103,6 +106,42 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
             });
         });
     }
+    let aspect_ratio = Rc::new(RefCell::new(AspectRatioMode::default()));
+    {
+        let aspect = aspect_ratio.clone();
+        window.on_set_aspect_ratio(move |mode| {
+            *aspect.borrow_mut() = match mode {
+                1 => AspectRatioMode::Force16x9,
+                2 => AspectRatioMode::Force4x3,
+                _ => AspectRatioMode::Dar,
+            };
+        });
+    }
+    let selected_service: Rc<RefCell<Option<u16>>> = Rc::new(RefCell::new(None));
+    {
+        let cmd_tx = handles.cmd_tx.clone();
+        let svc = selected_service.clone();
+        window.on_select_audio(move |pid| {
+            if let Some(service_id) = *svc.borrow() {
+                let _ = cmd_tx.try_send(AppCommand::SelectAudio {
+                    service_id,
+                    pid: pid as Pid,
+                });
+            }
+        });
+    }
+    {
+        let cmd_tx = handles.cmd_tx.clone();
+        let svc = selected_service.clone();
+        window.on_select_video(move |pid| {
+            if let Some(service_id) = *svc.borrow() {
+                let _ = cmd_tx.try_send(AppCommand::SelectVideo {
+                    service_id,
+                    pid: pid as Pid,
+                });
+            }
+        });
+    }
 
     // ── Modo de render: GPU (zero-copy) ou CPU (fallback) ─────────────────
     let (render, gpu_bridge) = match gpu {
@@ -145,6 +184,7 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         conn_rx: handles.conn_rx,
         audio_rx: handles.audio_rx,
         selected_service_rx: handles.selected_service_rx,
+        selected_video_pid_rx: handles.selected_video_pid_rx,
         table_events_rx: handles.table_events_rx,
         pipeline_metrics_rx: handles.pipeline_metrics_rx,
         media_info_rx: handles.media_info_rx,
@@ -152,6 +192,9 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         last_snapshot_ts: None,
         seen_jitter: 0,
         selected_pid,
+        selected_service,
+        aspect_ratio,
+        video_dims: None,
         tick: 0,
         video: VideoState::new(handles.video_frames_rx, handles.audio_clock_rx),
         render,
@@ -331,6 +374,7 @@ struct Poller {
     conn_rx: SharedConn,
     audio_rx: SharedAudio,
     selected_service_rx: SharedService,
+    selected_video_pid_rx: SharedVideoPid,
     table_events_rx: Receiver<TableEvent>,
     pipeline_metrics_rx: SharedPipeline,
     media_info_rx: SharedMediaInfo,
@@ -338,6 +382,12 @@ struct Poller {
     last_snapshot_ts: Option<Instant>,
     seen_jitter: usize,
     selected_pid: Rc<RefCell<Option<Pid>>>,
+    /// Serviço ativo (espelho para callbacks do menu de contexto).
+    selected_service: Rc<RefCell<Option<u16>>>,
+    /// Modo de proporção escolhido no menu de contexto.
+    aspect_ratio: Rc<RefCell<AspectRatioMode>>,
+    /// Dimensões do último frame `(width, height)` corrigidas por SAR.
+    video_dims: Option<(u32, u32)>,
     tick: u64,
     video: VideoState,
     /// Estratégia de exibição (GPU zero-copy ou CPU via worker).
@@ -349,26 +399,26 @@ impl Poller {
         self.tick = self.tick.wrapping_add(1);
 
         // Vídeo a cada tick (~60 Hz): resolve o timing; render GPU no notifier.
-        match &self.render {
-            RenderMode::Gpu(bridge) => {
-                if let Some(frame) = self.video.poll() {
+        if let Some(frame) = self.video.poll() {
+            self.update_video_dims(&frame);
+            match &self.render {
+                RenderMode::Gpu(bridge) => {
                     bridge.set_pending(frame);
                     win.window().request_redraw();
                 }
-            }
-            // CPU: despacha p/ o worker e exibe o buffer convertido mais recente.
-            RenderMode::Cpu { frame_tx, img_rx } => {
-                if let Some(frame) = self.video.poll() {
+                RenderMode::Cpu { frame_tx, .. } => {
                     let _ = frame_tx.try_send(frame);
                 }
-                let mut latest = None;
-                while let Ok(buf) = img_rx.try_recv() {
-                    latest = Some(buf);
-                }
-                if let Some(buf) = latest {
-                    win.set_video_frame(Image::from_rgba8(buf));
-                    win.set_video_has_signal(true);
-                }
+            }
+        }
+        if let RenderMode::Cpu { img_rx, .. } = &self.render {
+            let mut latest = None;
+            while let Ok(buf) = img_rx.try_recv() {
+                latest = Some(buf);
+            }
+            if let Some(buf) = latest {
+                win.set_video_frame(Image::from_rgba8(buf));
+                win.set_video_has_signal(true);
             }
         }
 
@@ -399,7 +449,30 @@ impl Poller {
         self.state.reset_stream_data();
         self.last_snapshot_ts = None;
         self.seen_jitter = 0;
+        self.video_dims = None;
         self.video.reset();
+    }
+
+    fn update_video_dims(&mut self, frame: &VideoFrame) {
+        let frame_w = frame.width();
+        let frame_h = frame.height();
+        let sar_num = frame.sar_num();
+        let sar_den = frame.sar_den();
+        let display_h = if sar_num > 1 || sar_den > 1 {
+            let h64 = frame_h as u64 * sar_den as u64;
+            (h64 / sar_num.max(1) as u64) as u32
+        } else {
+            frame_h
+        };
+        self.video_dims = Some((frame_w, display_h.max(1)));
+    }
+
+    fn effective_video_aspect(&self) -> f32 {
+        let stream_aspect = self
+            .video_dims
+            .map(|(w, h)| w as f32 / h.max(1) as f32)
+            .unwrap_or(16.0 / 9.0);
+        self.aspect_ratio.borrow().effective_aspect(stream_aspect)
     }
 
     fn poll_snapshot(&mut self) {
@@ -424,6 +497,10 @@ impl Poller {
         }
         if let Ok(s) = self.selected_service_rx.read() {
             self.state.selected_service = *s;
+            *self.selected_service.borrow_mut() = *s;
+        }
+        if let Ok(v) = self.selected_video_pid_rx.read() {
+            self.state.selected_video_pid = *v;
         }
         if let Ok(p) = self.pipeline_metrics_rx.read() {
             self.state.metrics.pipeline = p.clone();
@@ -476,6 +553,14 @@ impl Poller {
         win.set_jitter_value(SharedString::from(j_val));
         win.set_jitter_sub(SharedString::from(j_sub));
         win.set_jitter_line(SharedString::from(j_line));
+
+        let (ctx_svc, ctx_vid, ctx_aud, ctx_sub, ctx_ar) =
+            context_menu::build_menu_models(st, *self.aspect_ratio.borrow());
+        win.set_ctx_services(ctx_svc);
+        win.set_ctx_videos(ctx_vid);
+        win.set_ctx_audio(ctx_aud);
+        win.set_ctx_subtitles(ctx_sub);
+        win.set_ctx_aspect(ctx_ar);
     }
 
     /// Atualiza propriedades leves a cada tick (conexão, status bar, timecode).
@@ -508,6 +593,7 @@ impl Poller {
         win.set_hw_summary(SharedString::from(hw_summary(st)));
 
         win.set_timecode(SharedString::from(timecode(st)));
+        win.set_video_display_aspect(self.effective_video_aspect());
         if !connected {
             win.set_video_has_signal(false);
         }

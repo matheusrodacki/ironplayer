@@ -67,6 +67,92 @@ export struct ServiceRow {
     service-id: int,
 }
 
+export struct MenuEntry {
+    label: string,
+    id: int,
+    active: bool,
+    enabled: bool,
+}
+
+// ─── Menu de contexto (desenhado pelo Slint, não-nativo) ────────────────────
+// Moldura de menu: fundo, borda e sombra. Conteúdo via @children.
+// Largura fixa; altura se adapta ao conteúdo (layout vertical natural).
+component CtxFrame inherits Rectangle {
+    background: Theme.panel;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    drop-shadow-color: #00000066;
+    drop-shadow-blur: 7px;
+    drop-shadow-offset-y: 2px;
+    @children
+}
+
+// Linha de menu (categoria ou item). `arrow` marca submenu; `checked` mostra ✓;
+// `current` realça a categoria cujo submenu está aberto.
+component CtxRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> checked: false;
+    in property <bool> enabled: true;
+    in property <bool> arrow: false;
+    in property <bool> current: false;
+    callback entered();
+    callback chosen();
+    height: 28px;
+    border-radius: 4px;
+    background: transparent;
+    // TouchArea ENVOLVE o conteúdo (padrão do MenuItemBase do Slint) → hover/clique
+    // captados em toda a linha.
+    ta := TouchArea {
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        changed has-hover => {
+            if (root.enabled && ta.has-hover) { root.entered(); }
+        }
+        clicked => { if (root.enabled) { root.chosen(); } }
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 9px;
+            spacing: 6px;
+            Text {
+                width: 13px;
+                text: root.checked ? "✓" : "";
+                color: Theme.accent;
+                font-size: 12px;
+                font-weight: 700;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.label;
+                color: root.enabled ? Theme.text : Theme.text-faint;
+                font-size: 13px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            if root.arrow : Path {
+                width: 5px;
+                height: 9px;
+                y: (parent.height - 9px) / 2;
+                viewbox-width: 5;
+                viewbox-height: 10;
+                commands: "M 0 0 L 5 5 L 0 10 Z";
+                fill: (root.current || ta.has-hover) ? Theme.accent : Theme.text-faint;
+            }
+        }
+    }
+    // Feedback de hover via `states` (padrão do MenuItemBase do Slint), com cor
+    // de acento bem visível.
+    states [
+        active when root.current && root.enabled : {
+            root.background: Theme.accent.with-alpha(0.22);
+        }
+        hovered when ta.has-hover && root.enabled : {
+            root.background: Theme.accent.with-alpha(0.14);
+        }
+    ]
+}
+
 // ─── Badge de tipo de PID ────────────────────────────────────────────────────
 component TypeBadge inherits Rectangle {
     in property <string> text;
@@ -303,6 +389,14 @@ export component AppWindow inherits Window {
     in property <bool> video-has-signal: false;
     in property <string> video-caption: "sem sinal";
     in property <string> video-res: "—";
+    /// Proporção efetiva para letterboxing (DAR ou forçada pelo usuário).
+    in property <float> video-display-aspect: 16.0 / 9.0;
+
+    in property <[MenuEntry]> ctx-services: [];
+    in property <[MenuEntry]> ctx-videos: [];
+    in property <[MenuEntry]> ctx-audio: [];
+    in property <[MenuEntry]> ctx-subtitles: [];
+    in property <[MenuEntry]> ctx-aspect: [];
 
     in property <[PidRow]> pid-rows: [];
     in property <string> pid-total: "—";
@@ -329,6 +423,171 @@ export component AppWindow inherits Window {
     callback disconnect();
     callback select-pid(int);
     callback select-service(int);
+    callback select-video(int);
+    callback select-audio(int);
+    callback set-aspect-ratio(int);
+
+    // ── Estado do menu de contexto (interno) ───────────────────────────────
+    // Posição do clique direito (relativa à janela).
+    property <length> ctx-x: 0px;
+    property <length> ctx-y: 0px;
+    // Seção do submenu aberto: -1 nenhum · 0 Serviço · 1 Vídeo · 2 Áudio ·
+    // 3 Legenda · 4 Proporção. Move-se conforme o hover nas categorias.
+    property <int> ctx-section: -1;
+    // Topo do submenu, alinhado à categoria sob o cursor (coord. do popup raiz).
+    property <length> ctx-sub-y: 0px;
+    // Itens do submenu da seção ativa (modelos vindos do Rust).
+    property <[MenuEntry]> ctx-sub-entries:
+        root.ctx-section == 1 ? root.ctx-videos :
+        root.ctx-section == 2 ? root.ctx-audio :
+        root.ctx-section == 3 ? root.ctx-subtitles :
+        root.ctx-section == 4 ? root.ctx-aspect :
+        root.ctx-services;
+
+    // Fecha o menu de forma diferida após escolher um item — evita re-entrar no
+    // event do TouchArea do item (que geraria panic, igual ao menu fluent do Slint).
+    ctx-close-timer := Timer {
+        interval: 1ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            ctx-menu.close();
+            root.ctx-section = -1;
+        }
+    }
+
+    // Menu de contexto desenhado pelo Slint (PopupWindow → mesmo event loop, NÃO
+    // usa ContextMenuArea, que no Windows abre o menu nativo muda/TrackPopupMenu
+    // modal e congela o vídeo). É UM ÚNICO popup: coluna de categorias + submenu
+    // flutuante interno (mesmo espaço de coordenadas → hover/clique confiáveis).
+    // PopupWindow no winit é child-window embarcado e redimensiona reativamente,
+    // então a área cresce/encolhe conforme a seção (altura adaptativa).
+    ctx-menu := PopupWindow {
+        x: root.ctx-x;
+        y: root.ctx-y;
+        close-policy: close-on-click-outside;
+
+        // min-width/min-height (abaixo) são obrigatórios: o runtime do Slint resolve
+        // o hit-test do PopupWindow (item_geometry via layout_info().min, não
+        // .preferred) de forma reativa a cada mudança de propriedade. O PopupWindow
+        // em si não tem width/height explícitos — só o Rectangle filho tem — então,
+        // sem um min casando o tamanho real, layout_info().min cai para 0 assim que a
+        // primeira reavaliação roda (quase imediatamente após show()), colapsando a
+        // área de hit-test para 0x0 mesmo com o conteúdo continuando a ser desenhado
+        // no tamanho certo (o Rectangle filho tem width/height próprios). Resultado:
+        // o menu aparece normalmente, mas nenhuma posição do mouse — nem hover nem
+        // clique fora — nunca mais é considerada "dentro" do popup.
+        min-width: container.width;
+        min-height: container.height;
+
+        // Métricas (mantêm o cálculo de tamanho coerente com o conteúdo).
+        property <length> cat-w: 184px;
+        property <length> sub-w: 264px;
+        property <length> row-h: 28px;
+        property <length> pad: 5px;
+        property <length> step: self.row-h + 1px;         // linha + spacing
+        property <length> sep-h: 9px;
+        property <length> cat-h: self.pad * 2 + 5 * self.row-h + self.sep-h + 5 * 1px;
+        property <int> sub-n: max(root.ctx-sub-entries.length, 1);
+        property <length> sub-h: self.pad * 2 + self.sub-n * self.row-h + (self.sub-n - 1) * 1px;
+        property <bool> sub-open: root.ctx-section >= 0;
+
+        // Contagem de itens por seção (mín. 1 p/ o placeholder "(nenhum)").
+        property <int> n-service: max(root.ctx-services.length, 1);
+        property <int> n-video: max(root.ctx-videos.length, 1);
+        property <int> n-audio: max(root.ctx-audio.length, 1);
+        property <int> n-subtitle: max(root.ctx-subtitles.length, 1);
+        property <int> n-aspect: max(root.ctx-aspect.length, 1);
+
+        pure function sub-h-of(n: int) -> length {
+            return self.pad * 2 + n * self.row-h + (n - 1) * 1px;
+        }
+
+        // Alcance vertical (topo do submenu + sua altura) de cada seção. Reserva-se
+        // de saída altura suficiente para a MAIOR seção possível — em vez de
+        // redimensionar o container a cada troca de seção — porque o
+        // redimensionamento reativo do PopupWindow roda num timer de 0ms; mudar o
+        // tamanho a cada hover produzia um "pulo" visível (SPEC bug report).
+        property <length> max-sub-reach: max(
+            self.sub-h-of(self.n-service),
+            max(self.step * 1 + self.sub-h-of(self.n-video),
+            max(self.step * 2 + self.sub-h-of(self.n-audio),
+            max(self.step * 3 + self.sub-h-of(self.n-subtitle),
+                self.step * 4 + self.sep-h + 1px + self.sub-h-of(self.n-aspect)))));
+
+        // Contêiner: largura/altura fixas desde o primeiro frame (reservam espaço
+        // para o submenu mais largo/alto possível) — o popup nunca precisa
+        // redimensionar depois de show(), só a caixa do submenu aparece/some via
+        // `if ctx-menu.sub-open`.
+        container := Rectangle {
+            width: ctx-menu.cat-w - 4px + ctx-menu.sub-w;
+            height: max(ctx-menu.cat-h, ctx-menu.max-sub-reach);
+
+            // ── Coluna de categorias ──────────────────────────────────────
+            CtxFrame {
+                x: 0;
+                y: 0;
+                width: ctx-menu.cat-w;
+                height: ctx-menu.cat-h;
+                VerticalLayout {
+                    padding: ctx-menu.pad;
+                    spacing: 1px;
+                    CtxRow {
+                        label: "Serviço"; arrow: true; current: root.ctx-section == 0;
+                        entered => { root.ctx-section = 0; root.ctx-sub-y = 0px; }
+                        chosen => { root.ctx-section = 0; root.ctx-sub-y = 0px; }
+                    }
+                    CtxRow {
+                        label: "Vídeo"; arrow: true; current: root.ctx-section == 1;
+                        entered => { root.ctx-section = 1; root.ctx-sub-y = ctx-menu.step * 1; }
+                        chosen => { root.ctx-section = 1; root.ctx-sub-y = ctx-menu.step * 1; }
+                    }
+                    CtxRow {
+                        label: "Áudio"; arrow: true; current: root.ctx-section == 2;
+                        entered => { root.ctx-section = 2; root.ctx-sub-y = ctx-menu.step * 2; }
+                        chosen => { root.ctx-section = 2; root.ctx-sub-y = ctx-menu.step * 2; }
+                    }
+                    CtxRow {
+                        label: "Legenda"; arrow: true; current: root.ctx-section == 3;
+                        entered => { root.ctx-section = 3; root.ctx-sub-y = ctx-menu.step * 3; }
+                        chosen => { root.ctx-section = 3; root.ctx-sub-y = ctx-menu.step * 3; }
+                    }
+                    Rectangle { height: ctx-menu.sep-h; Rectangle { y: 4px; height: 1px; background: Theme.border-soft; } }
+                    CtxRow {
+                        label: "Proporção"; arrow: true; current: root.ctx-section == 4;
+                        entered => { root.ctx-section = 4; root.ctx-sub-y = ctx-menu.step * 4 + ctx-menu.sep-h + 1px; }
+                        chosen => { root.ctx-section = 4; root.ctx-sub-y = ctx-menu.step * 4 + ctx-menu.sep-h + 1px; }
+                    }
+                }
+            }
+
+            // ── Submenu flutuante (à direita da categoria sob o cursor) ────
+            if ctx-menu.sub-open : CtxFrame {
+                x: ctx-menu.cat-w - 4px;
+                y: root.ctx-sub-y;
+                width: ctx-menu.sub-w;
+                height: ctx-menu.sub-h;
+                VerticalLayout {
+                    padding: ctx-menu.pad;
+                    spacing: 1px;
+                    for e in root.ctx-sub-entries : CtxRow {
+                        label: e.label;
+                        checked: e.active;
+                        enabled: e.enabled;
+                        chosen => {
+                            if (e.enabled) {
+                                if (root.ctx-section == 0) { root.select-service(e.id); }
+                                if (root.ctx-section == 1) { root.select-video(e.id); }
+                                if (root.ctx-section == 2) { root.select-audio(e.id); }
+                                if (root.ctx-section == 4) { root.set-aspect-ratio(e.id); }
+                                ctx-close-timer.running = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     VerticalLayout {
         // ══ TOP BAR ══════════════════════════════════════════════════════
@@ -768,112 +1027,139 @@ export component AppWindow inherits Window {
                     border-color: Theme.border;
                     clip: true;
 
-                    if root.video-has-signal : Image {
+                    video-shell := Rectangle {
                         width: 100%;
                         height: 100%;
-                        source: root.video-frame;
-                        image-fit: contain;
-                    }
-                    if !root.video-has-signal : VerticalLayout {
-                        alignment: center;
-                        Text {
-                            text: "SINAL DE VÍDEO · " + root.video-res;
-                            color: Theme.text-faint;
-                            font-size: 14px;
-                            letter-spacing: 2px;
-                            horizontal-alignment: center;
-                        }
-                        Text {
-                            text: root.video-caption;
-                            color: #3a434d;
-                            font-size: 11px;
-                            letter-spacing: 1px;
-                            horizontal-alignment: center;
-                        }
-                    }
 
-                    // chip de codec (sup. esquerdo)
-                    Rectangle {
-                        x: 14px; y: 14px;
-                        width: cap.preferred-width + 22px;
-                        height: 26px;
-                        background: #0b0d10dd;
-                        border-radius: 5px;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        cap := Text {
-                            text: root.video-caption;
-                            color: Theme.text;
-                            font-size: 12px;
-                            font-family: Theme.mono;
-                        }
-                    }
+                        // Letterboxing conforme proporção efetiva (DAR ou forçada).
+                        property <bool> pillarbox: (parent.width / 1px) / (parent.height / 1px) > root.video-display-aspect;
+                        property <length> vid-w: pillarbox ? parent.height * root.video-display-aspect : parent.width;
+                        property <length> vid-h: pillarbox ? parent.height : parent.width / root.video-display-aspect;
 
-                    // AO VIVO (sup. direito)
-                    if root.live : Rectangle {
-                        x: parent.width - self.width - 14px;
-                        y: 14px;
-                        width: 98px;
-                        height: 26px;
-                        background: Theme.red.with-alpha(0.16);
-                        border-radius: 5px;
-                        border-width: 1px;
-                        border-color: Theme.red.with-alpha(0.55);
-                        HorizontalLayout {
-                            padding-left: 11px;
-                            padding-right: 11px;
-                            spacing: 7px;
+                        if root.video-has-signal : Image {
+                            x: (parent.width - vid-w) / 2;
+                            y: (parent.height - vid-h) / 2;
+                            width: vid-w;
+                            height: vid-h;
+                            source: root.video-frame;
+                            image-fit: fill;
+                        }
+                        if !root.video-has-signal : VerticalLayout {
                             alignment: center;
-                            Rectangle {
-                                width: 7px; height: 7px; border-radius: 3.5px;
-                                y: (parent.height - 7px) / 2;
-                                background: Theme.red;
+                            Text {
+                                text: "SINAL DE VÍDEO · " + root.video-res;
+                                color: Theme.text-faint;
+                                font-size: 14px;
+                                letter-spacing: 2px;
+                                horizontal-alignment: center;
                             }
                             Text {
-                                text: "AO VIVO";
-                                color: Theme.red;
+                                text: root.video-caption;
+                                color: #3a434d;
                                 font-size: 11px;
-                                font-weight: 700;
-                                letter-spacing: 0.5px;
-                                vertical-alignment: center;
+                                letter-spacing: 1px;
+                                horizontal-alignment: center;
                             }
                         }
-                    }
 
-                    // barra inferior: reproduzindo + timecode
-                    Rectangle {
-                        x: 14px;
-                        y: parent.height - 40px;
-                        width: parent.width - 28px;
-                        height: 28px;
-                        HorizontalLayout {
-                            spacing: 8px;
+                        // chip de codec (sup. esquerdo)
+                        Rectangle {
+                            x: 14px; y: 14px;
+                            width: cap.preferred-width + 22px;
+                            height: 26px;
+                            background: #0b0d10dd;
+                            border-radius: 5px;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            cap := Text {
+                                text: root.video-caption;
+                                color: Theme.text;
+                                font-size: 12px;
+                                font-family: Theme.mono;
+                            }
+                        }
+
+                        // AO VIVO (sup. direito)
+                        if root.live : Rectangle {
+                            x: parent.width - self.width - 14px;
+                            y: 14px;
+                            width: 98px;
+                            height: 26px;
+                            background: Theme.red.with-alpha(0.16);
+                            border-radius: 5px;
+                            border-width: 1px;
+                            border-color: Theme.red.with-alpha(0.55);
                             HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                // play ▶
-                                Path {
-                                    width: 11px; height: 12px;
-                                    y: (parent.height - 12px) / 2;
-                                    viewbox-width: 10; viewbox-height: 12;
-                                    commands: "M 0 0 L 10 6 L 0 12 Z";
-                                    fill: root.connected ? Theme.green : Theme.text-faint;
+                                padding-left: 11px;
+                                padding-right: 11px;
+                                spacing: 7px;
+                                alignment: center;
+                                Rectangle {
+                                    width: 7px; height: 7px; border-radius: 3.5px;
+                                    y: (parent.height - 7px) / 2;
+                                    background: Theme.red;
                                 }
                                 Text {
-                                    text: root.connected ? "Reproduzindo" : "Parado";
-                                    color: Theme.text;
-                                    font-size: 13px;
+                                    text: "AO VIVO";
+                                    color: Theme.red;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    letter-spacing: 0.5px;
                                     vertical-alignment: center;
                                 }
                             }
-                            Rectangle { horizontal-stretch: 1; }
-                            Text {
-                                text: root.timecode;
-                                color: Theme.accent;
-                                font-size: 14px;
-                                font-weight: 700;
-                                font-family: Theme.mono;
-                                vertical-alignment: center;
+                        }
+
+                        // barra inferior: reproduzindo + timecode
+                        Rectangle {
+                            x: 14px;
+                            y: parent.height - 40px;
+                            width: parent.width - 28px;
+                            height: 28px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Path {
+                                        width: 11px; height: 12px;
+                                        y: (parent.height - 12px) / 2;
+                                        viewbox-width: 10; viewbox-height: 12;
+                                        commands: "M 0 0 L 10 6 L 0 12 Z";
+                                        fill: root.connected ? Theme.green : Theme.text-faint;
+                                    }
+                                    Text {
+                                        text: root.connected ? "Reproduzindo" : "Parado";
+                                        color: Theme.text;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text {
+                                    text: root.timecode;
+                                    color: Theme.accent;
+                                    font-size: 14px;
+                                    font-weight: 700;
+                                    font-family: Theme.mono;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        // Botão direito → menu de contexto desenhado pelo Slint.
+                        // Não usa ContextMenuArea (que no Windows abre um menu nativo
+                        // muda/TrackPopupMenu modal e congela o event loop/vídeo).
+                        TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                                    root.ctx-section = -1;
+                                    root.ctx-x = self.absolute-position.x + self.mouse-x;
+                                    root.ctx-y = self.absolute-position.y + self.mouse-y;
+                                    ctx-menu.show();
+                                }
                             }
                         }
                     }

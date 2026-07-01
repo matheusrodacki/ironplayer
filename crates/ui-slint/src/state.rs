@@ -305,6 +305,8 @@ pub struct AppState {
     pub media_info_tables_ctx: MediaInfoTablesCtx,
     pub selected_pid: Option<Pid>,
     pub selected_service: Option<u16>,
+    /// PID de vídeo escolhido manualmente no serviço ativo (`None` = primeira trilha).
+    pub selected_video_pid: Option<Pid>,
     /// Histórico de bitrate total dos últimos 60 s.
     pub bitrate_history: VecDeque<(Instant, f64)>,
     /// Histórico de jitter de PCR por PID.
@@ -322,6 +324,7 @@ impl AppState {
         self.media_info_tables_ctx = MediaInfoTablesCtx::default();
         self.selected_pid = None;
         self.selected_service = None;
+        self.selected_video_pid = None;
         self.bitrate_history.clear();
         self.pcr_history.clear();
         self.av_sync_history.clear();
@@ -409,6 +412,8 @@ pub enum AppCommand {
     SelectService { service_id: u16 },
     /// Seleciona uma trilha de áudio dentro do serviço DVB atual.
     SelectAudio { service_id: u16, pid: Pid },
+    /// Seleciona uma trilha de vídeo dentro do serviço DVB atual.
+    SelectVideo { service_id: u16, pid: Pid },
     /// Seleciona um PID para destaque nas métricas.
     SelectPid { pid: Pid },
     /// Ajusta o volume de áudio (0.0 – 1.0).

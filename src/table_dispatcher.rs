@@ -125,12 +125,16 @@ pub struct TableDispatcher {
     selected_service: Arc<RwLock<Option<u16>>>,
     /// PID de áudio selecionado manualmente no serviço atual.
     selected_audio_pid: Arc<RwLock<Option<Pid>>>,
+    /// PID de vídeo selecionado manualmente no serviço atual.
+    selected_video_pid: Arc<RwLock<Option<Pid>>>,
     /// Snapshot compartilhado de telemetria e estado operacional do áudio.
     audio_status: Arc<RwLock<AudioStatusSnapshot>>,
     /// Última leitura do serviço selecionado (para detectar trocas).
     last_selected_service: Option<u16>,
     /// Última leitura do PID de áudio selecionado (para detectar trocas).
     last_selected_audio_pid: Option<Pid>,
+    /// Última leitura do PID de vídeo selecionado (para detectar trocas).
+    last_selected_video_pid: Option<Pid>,
     /// Seleciona automaticamente o primeiro serviço com A/V válidos se ainda
     /// não houver seleção manual (`selected_service == None`).
     auto_play: bool,
@@ -164,6 +168,7 @@ impl TableDispatcher {
             decode_tx,
             selected_service,
             Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(None)),
             audio_status,
             false,
         )
@@ -179,6 +184,7 @@ impl TableDispatcher {
         decode_tx: Sender<DecodeCommand>,
         selected_service: Arc<RwLock<Option<u16>>>,
         selected_audio_pid: Arc<RwLock<Option<Pid>>>,
+        selected_video_pid: Arc<RwLock<Option<Pid>>>,
         audio_status: Arc<RwLock<AudioStatusSnapshot>>,
         auto_play: bool,
     ) -> Self {
@@ -190,6 +196,7 @@ impl TableDispatcher {
             decode_tx,
             selected_service,
             selected_audio_pid,
+            selected_video_pid,
             audio_status,
             auto_play,
             None,
@@ -206,6 +213,7 @@ impl TableDispatcher {
         decode_tx: Sender<DecodeCommand>,
         selected_service: Arc<RwLock<Option<u16>>>,
         selected_audio_pid: Arc<RwLock<Option<Pid>>>,
+        selected_video_pid: Arc<RwLock<Option<Pid>>>,
         audio_status: Arc<RwLock<AudioStatusSnapshot>>,
         auto_play: bool,
         control_rx: Option<Receiver<TableCommand>>,
@@ -225,9 +233,11 @@ impl TableDispatcher {
             active_av_pids: HashSet::new(),
             selected_service,
             selected_audio_pid,
+            selected_video_pid,
             audio_status,
             last_selected_service: None,
             last_selected_audio_pid: None,
+            last_selected_video_pid: None,
             auto_play,
             auto_play_triggered: false,
             probe_cmd_tx: None,
@@ -258,13 +268,21 @@ impl TableDispatcher {
             // Verifica troca de serviço antes de processar cada seção.
             let current_service = self.selected_service.read().map(|g| *g).unwrap_or(None);
             let current_audio_pid = self.selected_audio_pid.read().map(|g| *g).unwrap_or(None);
+            let current_video_pid = self.selected_video_pid.read().map(|g| *g).unwrap_or(None);
             if current_service != self.last_selected_service {
                 self.on_service_changed(current_service);
                 self.last_selected_service = current_service;
                 self.last_selected_audio_pid = current_audio_pid;
-            } else if current_audio_pid != self.last_selected_audio_pid {
-                self.on_audio_changed(current_service, current_audio_pid);
-                self.last_selected_audio_pid = current_audio_pid;
+                self.last_selected_video_pid = current_video_pid;
+            } else {
+                if current_audio_pid != self.last_selected_audio_pid {
+                    self.on_audio_changed(current_service, current_audio_pid);
+                    self.last_selected_audio_pid = current_audio_pid;
+                }
+                if current_video_pid != self.last_selected_video_pid {
+                    self.on_video_changed(current_service, current_video_pid);
+                    self.last_selected_video_pid = current_video_pid;
+                }
             }
 
             trace!(
@@ -299,6 +317,7 @@ impl TableDispatcher {
         self.active_probe_pids.clear();
         self.last_selected_service = None;
         self.last_selected_audio_pid = None;
+        self.last_selected_video_pid = None;
         self.auto_play_triggered = false;
 
         if let Ok(mut audio_status) = self.audio_status.write() {
@@ -541,9 +560,13 @@ impl TableDispatcher {
     fn registerable_streams(&self, pmt: &Pmt) -> Vec<(Pid, MediaCodec)> {
         let mut registerable = Vec::new();
         let selected_audio_pid = self.selected_audio_pid.read().map(|g| *g).unwrap_or(None);
+        let selected_video_pid = self.selected_video_pid.read().map(|g| *g).unwrap_or(None);
         let active_audio_pid = selected_audio_pid
             .filter(|pid| pmt_audio_codec(pmt, *pid).is_some())
             .or_else(|| first_audio_track_from_pmt(pmt).map(|track| track.pid));
+        let active_video_pid = selected_video_pid
+            .filter(|pid| pmt_video_codec(pmt, *pid).is_some())
+            .or_else(|| first_video_track_from_pmt(pmt));
 
         for stream in &pmt.streams {
             let Some(codec) = MediaCodec::from_pmt_stream(stream) else {
@@ -551,7 +574,10 @@ impl TableDispatcher {
             };
 
             match codec {
-                MediaCodec::Video(_) => registerable.push((stream.elementary_pid, codec)),
+                MediaCodec::Video(_) if Some(stream.elementary_pid) == active_video_pid => {
+                    registerable.push((stream.elementary_pid, codec));
+                }
+                MediaCodec::Video(_) => {}
                 MediaCodec::Audio(_) if Some(stream.elementary_pid) == active_audio_pid => {
                     registerable.push((stream.elementary_pid, codec));
                 }
@@ -628,6 +654,41 @@ impl TableDispatcher {
         }
 
         self.sync_active_audio_track();
+    }
+
+    fn on_video_changed(&mut self, selected_service: Option<u16>, selected_video_pid: Option<Pid>) {
+        let Some(service_id) = selected_service else {
+            return;
+        };
+        let Some(pmt) = self.pmt_cache.get(&service_id).cloned() else {
+            return;
+        };
+
+        for stream in &pmt.streams {
+            if let Some(MediaCodec::Video(_)) = MediaCodec::from_pmt_stream(stream) {
+                if self.active_av_pids.remove(&stream.elementary_pid) {
+                    self.send_demux_command(DemuxCommand::DeregisterAvPid(stream.elementary_pid));
+                    self.send_pes_command(PesCommand::DeregisterPid {
+                        pid: stream.elementary_pid,
+                    });
+                }
+            }
+        }
+
+        let active_video_pid = selected_video_pid
+            .filter(|pid| pmt_video_codec(&pmt, *pid).is_some())
+            .or_else(|| first_video_track_from_pmt(&pmt));
+        if let Some(pid) = active_video_pid {
+            if let Some(codec) = pmt_video_codec(&pmt, pid) {
+                self.active_av_pids.insert(pid);
+                self.send_demux_command(DemuxCommand::RegisterAvPid(pid));
+                self.send_pes_command(PesCommand::RegisterPid { pid, codec });
+            }
+        }
+
+        if self.decode_tx.try_send(DecodeCommand::Reset).is_err() {
+            warn!("canal decode-control cheio — Reset descartado após troca de vídeo");
+        }
     }
 
     fn dispatch_full_section<T, F, E>(
@@ -868,6 +929,28 @@ fn pmt_audio_codec(pmt: &Pmt, pid: Pid) -> Option<MediaCodec> {
         match MediaCodec::from_pmt_stream(stream)? {
             codec @ MediaCodec::Audio(_) => Some(codec),
             MediaCodec::Video(_) => None,
+        }
+    })
+}
+
+fn pmt_video_codec(pmt: &Pmt, pid: Pid) -> Option<MediaCodec> {
+    pmt.streams.iter().find_map(|stream| {
+        if stream.elementary_pid != pid {
+            return None;
+        }
+        match MediaCodec::from_pmt_stream(stream)? {
+            codec @ MediaCodec::Video(_) => Some(codec),
+            MediaCodec::Audio(_) => None,
+        }
+    })
+}
+
+fn first_video_track_from_pmt(pmt: &Pmt) -> Option<Pid> {
+    pmt.streams.iter().find_map(|stream| {
+        let codec = MediaCodec::from_pmt_stream(stream)?;
+        match codec {
+            MediaCodec::Video(_) => Some(stream.elementary_pid),
+            MediaCodec::Audio(_) => None,
         }
     })
 }
@@ -1545,6 +1628,7 @@ mod tests {
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_read = Arc::clone(&selected_service);
         let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
+        let selected_video_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
         let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new_with_auto_play(
@@ -1555,6 +1639,7 @@ mod tests {
             decode_cmd_tx,
             selected_service,
             selected_audio_pid,
+            selected_video_pid,
             audio_status,
             true,
         );
@@ -1607,6 +1692,7 @@ mod tests {
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_ctrl = Arc::clone(&selected_service);
         let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
+        let selected_video_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
         let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new_with_auto_play(
@@ -1617,6 +1703,7 @@ mod tests {
             decode_cmd_tx,
             selected_service,
             selected_audio_pid,
+            selected_video_pid,
             audio_status,
             true,
         );
@@ -1658,6 +1745,7 @@ mod tests {
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_ctrl = Arc::clone(&selected_service);
         let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
+        let selected_video_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
         let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new_with_auto_play(
@@ -1668,6 +1756,7 @@ mod tests {
             decode_cmd_tx,
             selected_service,
             selected_audio_pid,
+            selected_video_pid,
             audio_status,
             true,
         );
@@ -1717,6 +1806,7 @@ mod tests {
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(None));
         let selected_service_ctrl = Arc::clone(&selected_service);
         let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
+        let selected_video_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
         let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let dispatcher = TableDispatcher::new_with_auto_play(
@@ -1727,6 +1817,7 @@ mod tests {
             decode_cmd_tx,
             selected_service,
             selected_audio_pid,
+            selected_video_pid,
             audio_status,
             false,
         );
@@ -2129,6 +2220,7 @@ mod tests {
         let bounded_tx = BoundedSender::new(table_events_tx, "test_manual_audio_switch");
         let selected_service: Arc<RwLock<Option<u16>>> = Arc::new(RwLock::new(Some(1)));
         let selected_audio_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
+        let selected_video_pid: Arc<RwLock<Option<Pid>>> = Arc::new(RwLock::new(None));
         let audio_status = Arc::new(RwLock::new(AudioStatusSnapshot::default()));
 
         let mut dispatcher = TableDispatcher::new_with_auto_play(
@@ -2139,6 +2231,7 @@ mod tests {
             decode_cmd_tx,
             selected_service,
             Arc::clone(&selected_audio_pid),
+            Arc::clone(&selected_video_pid),
             Arc::clone(&audio_status),
             false,
         );

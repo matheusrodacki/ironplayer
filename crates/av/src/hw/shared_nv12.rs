@@ -29,7 +29,8 @@ use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence,
-    ID3D11Resource, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE, D3D11_FENCE_FLAG_SHARED,
+    ID3D11Resource, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_FENCE_FLAG_SHARED,
     D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT,
 };
@@ -145,7 +146,8 @@ impl SharedNvPool {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            // VP output exige RENDER_TARGET (MSDN); SRV mantido para zero-copy wgpu.
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET).0 as u32,
             CPUAccessFlags: 0,
             MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED.0) as u32,
         };
@@ -257,6 +259,88 @@ impl SharedNvPool {
             self.context.Flush();
         }
 
+        Ok(SharedNvFrame {
+            pool: Arc::downgrade(self),
+            slot: slot_idx,
+            texture_handle: tex_handle.0 as isize,
+            fence_handle: self.fence_handle.0 as isize,
+            fence_value,
+            width: w,
+            height: h,
+        })
+    }
+
+    /// Descarta todos os slots (ex.: troca de perfil VP que exige bind flags diferentes).
+    ///
+    /// SPEC-AV-006
+    pub fn clear_slots(&self) {
+        let mut state = self.state.lock().unwrap();
+        for slot in state.slots.drain(..) {
+            unsafe {
+                let _ = CloseHandle(slot.handle);
+            }
+        }
+        state.free.clear();
+        state.dims = None;
+    }
+
+    /// Reserva um slot NV12 compartilhável para escrita direta (ex.: D3D11 VP).
+    ///
+    /// SPEC-AV-006
+    pub fn reserve_output_slot(
+        self: &Arc<Self>,
+        w: u32,
+        h: u32,
+    ) -> Result<(ID3D11Texture2D, usize, u64, HANDLE), AvError> {
+        let mut state = self.state.lock().unwrap();
+
+        if state.dims != Some((w, h)) {
+            for slot in state.slots.drain(..) {
+                unsafe {
+                    let _ = CloseHandle(slot.handle);
+                }
+            }
+            state.free.clear();
+            state.dims = Some((w, h));
+        }
+
+        let idx = match state.free.pop() {
+            Some(i) => i,
+            None => {
+                if state.slots.len() >= MAX_SLOTS {
+                    return Err(AvError::HwInitFailed(
+                        "pool de texturas compartilhadas esgotado".into(),
+                    ));
+                }
+                let slot = self.create_slot(w, h)?;
+                state.slots.push(slot);
+                state.slots.len() - 1
+            }
+        };
+
+        state.next_fence_value += 1;
+        let fence_value = state.next_fence_value;
+        let slot = &state.slots[idx];
+        Ok((slot.texture.clone(), idx, fence_value, slot.handle))
+    }
+
+    /// Finaliza slot após escrita GPU (VP) — sinaliza fence.
+    ///
+    /// SPEC-AV-006
+    pub fn finalize_output_slot(
+        self: &Arc<Self>,
+        slot_idx: usize,
+        fence_value: u64,
+        w: u32,
+        h: u32,
+        tex_handle: HANDLE,
+    ) -> Result<SharedNvFrame, AvError> {
+        unsafe {
+            self.context
+                .Signal(&self.fence, fence_value)
+                .map_err(|e| AvError::HwInitFailed(format!("fence Signal VP: {e}")))?;
+            self.context.Flush();
+        }
         Ok(SharedNvFrame {
             pool: Arc::downgrade(self),
             slot: slot_idx,

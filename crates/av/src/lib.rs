@@ -33,7 +33,7 @@ pub mod video_queue;
 
 pub use audio::{AudioFrame, AudioOutput, AudioRingBuffer, AudioStreamInfo};
 pub use clock::{AudioClockHandle, Clock, MasterClock, Pts90, WallClockHandle};
-pub use codec::{AudioCodec, CodecConfig, DeinterlaceMode, MediaCodec, ThreadType, VideoCodec};
+pub use codec::{AudioCodec, CodecConfig, DeinterlaceProfile, MediaCodec, ThreadType, VideoCodec};
 pub use decoder::{DecodedFrame, FfmpegDecoder};
 pub use error::AvError;
 pub use hw::{

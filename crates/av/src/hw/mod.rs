@@ -13,6 +13,10 @@
 #[cfg(windows)]
 mod d3d11_impl;
 #[cfg(windows)]
+pub(crate) mod d3d11_vp;
+#[cfg(windows)]
+pub(crate) use d3d11_vp::D3d11VideoProcessor;
+#[cfg(windows)]
 pub(crate) use d3d11_impl::com_addref;
 #[cfg(windows)]
 pub use d3d11_impl::{

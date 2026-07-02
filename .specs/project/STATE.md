@@ -166,8 +166,8 @@ Debug do sintoma "GPU decode não funciona no feat/slint, no main funcionava". S
 
 | Sintoma | Causa raiz | Invariante obrigatória |
 | ------- | ---------- | ----------------------- |
-| Achou-se que HW decode "não funcionava" | Conteúdo 1080i força bwdif (CPU-only) → decoder migra HW→SW (`decoder.rs` ~l.696). **Idêntico ao `main`** — não é regressão; é arquitetural (confirmado por diff + teste A/B) | Não "consertar" a migração HW→SW no deinterlace; ela é esperada e correta |
-| Zero-copy GPU (Fase 2, [zero-copy-plan.md](../features/spec-11-slint/zero-copy-plan.md)) tratado como não-validado | Validado em runtime com HW real (`deinterlace=off`, teste): 720/720 frames compartilhados, zero falhas de fence/import | Ao mexer em `SharedNvImporter`/`shared_nv12.rs`, validar com os mesmos contadores (ok/fence_wait_skips/import_fail) antes de merge |
+| Achou-se que HW decode "não funcionava" | Conteúdo 1080i com perfil **Quality** força bwdif (CPU) → decoder migra HW→SW (`decoder.rs`). Perfil **Performance** (padrão) mantém D3D11VA + D3D11 VP | Performance não deve migrar HW→SW; Quality sim (bwdif CPU-only) |
+| Zero-copy GPU (Fase 2, [zero-copy-plan.md](../features/spec-11-slint/zero-copy-plan.md)) tratado como não-validado | Validado em runtime com HW real (perfil **Desligado** ou **Performance**, teste): frames compartilhados sem falha de fence/import | Ao mexer em `SharedNvImporter`/`shared_nv12.rs` ou `d3d11_vp.rs`, validar contadores antes de merge |
 | Vídeo do Slint a ~17 fps com 3000+ frames tardios (até 9,6 s de atraso) vs 31 fps constante e 0 drops no `main`, no mesmo stream 1080i (decode SW em ambos) | (1) `ironstream.toml` de teste desatualizado; (2) `VideoState::poll` tirava **1 frame por tick** de um timer que caía a ~25 Hz sob carga de render → fila envelhecia além do `DROP_PTS` (100 ms); (3) timer de 16 ms + `request_redraw` por frame batia de fase com o vsync; (4) femtovg redesenha a cena inteira por frame sem cache | Ver checklist completo e fixes em [perf-debug-1080i.md](../features/spec-11-slint/perf-debug-1080i.md) |
 
 **Fixes aplicados (não regredir):**
@@ -177,7 +177,11 @@ Debug do sintoma "GPU decode não funciona no feat/slint, no main funcionava". S
 
 **Pendência em aberto:** fill-rate do femtovg ainda limita a ~21 fps em 1400×900 (cena completa ~29 ms/frame > 16.7 ms de vsync) — o custo é desenhar a UI ao redor do vídeo, não o vídeo em si. Três opções não implementadas (Skia bloqueado por `+crt-static` e sem zero-copy de textura wgpu; software renderer com partial-render mas sem zero-copy; otimizar mais a cena femtovg) — decisão de arquitetura pendente do usuário. Detalhes completos: [perf-debug-1080i.md](../features/spec-11-slint/perf-debug-1080i.md).
 
-Refs: `crates/ui-slint/src/lib.rs` (`VideoState::poll`, `run`, `set_rendering_notifier`), `crates/ui-slint/ui/appwindow.slint` (`cache-rendering-hint`), `crates/av/src/hw/shared_nv12.rs`, `crates/av/src/renderer.rs` (`SharedNvImporter`).
+Refs: `crates/ui-slint/src/lib.rs` (`VideoState::poll`, `run`, `set_rendering_notifier`), `crates/ui-slint/ui/appwindow.slint` (`cache-rendering-hint`), `crates/av/src/hw/shared_nv12.rs`, `crates/av/src/hw/d3d11_vp.rs`, `crates/av/src/renderer.rs` (`SharedNvImporter`).
+
+### L-008 — D3D11 VP PTS bob (2026-07-02)
+
+Perfil **Performance** em 1080i: o D3D11 Video Processor em modo bob/adaptive pode emitir 2× taxa de campos (50p/59.94p). PTS de saída: `field_pts + n * (time_base/2)` para alinhar com `AudioClock` 90 kHz — ver `vp_output_pts` em `crates/av/src/hw/d3d11_vp.rs`. Perfil **Quality** mantém o rescale bwdif (÷2) documentado em L-003.
 
 ---
 

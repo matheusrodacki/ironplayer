@@ -416,6 +416,21 @@ pub(crate) unsafe fn frame_flags(frame: *mut c_void) -> c_int {
     *((frame as *const u8).add(276) as *const c_int)
 }
 
+pub(crate) unsafe fn frame_top_field_first(frame: *mut c_void) -> bool {
+    const AV_FRAME_FLAG_TOP_FIELD_FIRST: i32 = 1 << 1;
+    frame_flags(frame) & AV_FRAME_FLAG_TOP_FIELD_FIRST != 0
+}
+
+/// Lê `time_base` de um `AVFrame*` opaco (offset 152, AVRational).
+///
+/// SAFETY: `frame` deve ser um ponteiro válido para `AVFrame` FFmpeg 8.x.
+#[inline]
+pub(crate) unsafe fn frame_time_base(frame: *mut c_void) -> (i32, i32) {
+    let num = *((frame as *const u8).add(152) as *const i32);
+    let den = *((frame as *const u8).add(156) as *const i32);
+    (num, den)
+}
+
 #[inline]
 pub(crate) unsafe fn ctx_field_order(ctx: *mut AvCodecContext) -> c_int {
     *((ctx as *const u8).add(AVCTX_FIELD_ORDER_OFFSET) as *const c_int)

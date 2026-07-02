@@ -403,6 +403,7 @@ fn main() -> anyhow::Result<()> {
 
     // 10. Instancia TableDispatcher (auto_play: seleciona o primeiro serviço
     // com A/V automaticamente; o usuário pode trocar via menu do VideoPanel).
+    let table_events_tx_cmd = ch.table_events_tx.clone();
     let table_disp = TableDispatcher::new_with_auto_play_and_control(
         ch.complete_sections_rx,
         ch.table_events_tx,
@@ -710,11 +711,6 @@ fn main() -> anyhow::Result<()> {
                 config::DecoderProfile::Accurate => false,
                 config::DecoderProfile::Default => cfg.decoder.flag2_fast,
             },
-            deinterlace: match cfg.decoder.deinterlace {
-                config::DeinterlaceChoice::Auto => av::DeinterlaceMode::Auto,
-                config::DeinterlaceChoice::Force => av::DeinterlaceMode::Force,
-                config::DeinterlaceChoice::Off => av::DeinterlaceMode::Off,
-            },
         };
         let pipeline_metrics_decode = std::sync::Arc::clone(&pipeline_metrics_shared);
         let d3d11_device_for_decode = d3d11_device_arc.clone();
@@ -805,6 +801,15 @@ fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                                DecodeCommand::SetDeinterlace { profile } => {
+                                    decoder.set_deinterlace_profile(profile);
+                                    decoder.reset_with_hw_state();
+                                    decode_times.clear();
+                                    tracing::info!(
+                                        deinterlace = profile.label(),
+                                        "av-decode: perfil de deinterlace alterado em runtime"
+                                    );
+                                }
                                 DecodeCommand::HandleDeviceRemoved => {
                                     decoder.fallback_to_sw("DXGI_ERROR_DEVICE_REMOVED");
                                     decoder.reset();
@@ -837,6 +842,9 @@ fn main() -> anyhow::Result<()> {
                                     if let Ok(mut m) = pipeline_metrics_decode.write() {
                                         m.decoder_threads_used = decoder.threads_used();
                                         m.deinterlacer_active = decoder.has_deinterlacer_active();
+                                        m.deinterlace_backend = decoder
+                                            .deinterlace_backend()
+                                            .map(str::to_owned);
                                         m.scan_type = Some(
                                             decoder.video_scan_type().label().to_string(),
                                         );
@@ -1152,6 +1160,7 @@ fn main() -> anyhow::Result<()> {
         let pes_cmd_tx = pes_cmd_tx.clone();
         let decode_cmd_tx = decode_cmd_tx.clone();
         let table_cmd_tx = table_cmd_tx.clone();
+        let table_events_tx_cmd = table_events_tx_cmd.clone();
         let agg_net_tx = agg_net_tx.clone();
         let net_raw_tx = sender_guard.net_raw_tx.sender();
         let net_events_tx = ch.net_events_tx.sender();
@@ -1336,6 +1345,28 @@ fn main() -> anyhow::Result<()> {
                                 tracing::info!(
                                     hwaccel = cfg_choice.label(),
                                     "cmd-handler: SetHwAccel enviado ao decoder"
+                                );
+                            }
+                        }
+                        ui_slint::AppCommand::SetDeinterlace { profile } => {
+                            if decode_cmd_tx
+                                .try_send(DecodeCommand::SetDeinterlace {
+                                    profile: profile.to_av(),
+                                })
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "cmd-handler: canal decode_cmd cheio; SetDeinterlace descartado"
+                                );
+                            } else {
+                                if !table_events_tx_cmd.try_send(ui_slint::TableEvent::Reset) {
+                                    tracing::warn!(
+                                        "cmd-handler: canal table-events cheio; Reset UI descartado"
+                                    );
+                                }
+                                tracing::info!(
+                                    deinterlace = ?profile,
+                                    "cmd-handler: SetDeinterlace enviado ao decoder"
                                 );
                             }
                         }

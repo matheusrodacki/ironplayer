@@ -29,20 +29,16 @@ branch do `feat/slint`) rodando o mesmo stream em paralelo.
 
 ## Diagnóstico: duas causas distintas confundidas no sintoma original
 
-### 1. HW→SW no deinterlace (NÃO é regressão)
+### 1. HW→SW no deinterlace (comportamento por perfil)
 
-Conteúdo 1080i real → o decoder migra de D3D11VA para software para aplicar
-o bwdif (`crates/av/src/decoder.rs` ~l.696, `reason="deinterlacing bwdif"`).
-Esse comportamento é **byte-idêntico ao `main`** — confirmado por diff e por
-teste A/B (o `main` também migra HW→SW com este arquivo). bwdif é
-inerentemente CPU-only; **não há regressão de GPU decode aqui**, é
-arquitetural. O decode em software não é o gargalo (p50 medido ~1.5 ms/frame).
+Conteúdo 1080i real com perfil **Quality** (menu de contexto) → o decoder
+migra de D3D11VA para software para aplicar o bwdif (`decoder.rs`).
+Perfil **Performance** (padrão ao abrir o app) mantém D3D11VA e aplica
+D3D11 Video Processor em GPU — **sem** migração HW→SW. Perfil **Desligado**
+mantém HW sem deinterlace (campos visíveis, útil para debug zero-copy).
 
-O caminho zero-copy GPU da Fase 2 (D3D11→wgpu/DX12, fence compartilhada) **foi
-validado em runtime com HW real** rodando com `deinterlace=off` (só para
-teste, não é o modo de produção com 1080i): 720/720 frames compartilhados sem
-nenhuma falha de fence/import. Ver [zero-copy-plan.md](zero-copy-plan.md),
-seção de verificação, item 5 — **validado**.
+O controle de deinterlace é exclusivamente via menu de contexto Slint
+(seção **Deinterlace**); não há mais `[decoder] deinterlace` no TOML.
 
 ### 2. Vídeo picotado no Slint (REGRESSÃO real, corrigida)
 
@@ -128,8 +124,8 @@ precisa de validação equivalente à desta sessão (contadores de
 
 ## Checklist rápido em regressão futura de vídeo picotado no Slint
 
-1. Confirmar `deinterlace` efetivo no `ironstream.toml` de teste e se o
-   stream é interlaced — HW→SW nesse caso é esperado, não é bug.
+1. Confirmar perfil **Deinterlace** no menu de contexto (padrão: Performance)
+   e se o stream é interlaced — HW→SW só é esperado em **Quality**.
 2. Conferir que `VideoState::poll()` ainda drena a janela `Ready` inteira
    (não voltou a 1 pop por tick) — regressão reintroduziria o backlog de
    `DROP_PTS`.

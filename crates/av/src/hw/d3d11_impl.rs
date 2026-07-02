@@ -283,6 +283,20 @@ impl D3d11Device {
         &self.adapter_desc
     }
 
+    /// Referência ao `ID3D11Device` interno (para D3D11 Video Processor).
+    ///
+    /// SPEC-AV-006
+    pub fn d3d11_device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    /// Referência ao `ID3D11DeviceContext` interno.
+    ///
+    /// SPEC-AV-006
+    pub fn d3d11_context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
     /// Ponteiro bruto para o `ID3D11Device` (consumido pelo FFmpeg hwaccel context).
     ///
     /// # Safety
@@ -502,6 +516,13 @@ impl D3d11Texture {
             transfer,
             full_range,
         ))
+    }
+
+    /// Referência à textura D3D11 subjacente (para D3D11 Video Processor).
+    ///
+    /// SPEC-AV-006
+    pub fn d3d11_texture(&self) -> &ID3D11Texture2D {
+        &self.texture
     }
 
     /// Ponteiro bruto para o `ID3D11Texture2D` (consumido pelo FFmpeg hwaccel context).

@@ -208,17 +208,17 @@ pub enum ThreadType {
     Slice,
 }
 
-/// Modo de deinterlacing configurável.
+/// Perfil de deinterlacing em runtime (menu de contexto; não persiste em TOML).
 ///
-/// SPEC-AV-005
+/// SPEC-AV-006
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DeinterlaceMode {
-    /// Detecta automaticamente via SPS / field_order / flags de frame.
+pub enum DeinterlaceProfile {
+    /// D3D11 Video Processor + zero-copy HW (padrão).
     #[default]
-    Auto,
-    /// Força deinterlacing em todo vídeo (útil para streams mal marcados).
-    Force,
-    /// Desativa deinterlacing.
+    Performance,
+    /// bwdif CPU — migra HW→SW em streams entrelaçados.
+    Quality,
+    /// Sem deinterlace (campos visíveis; útil para debug zero-copy).
     Off,
 }
 
@@ -251,10 +251,6 @@ pub struct CodecConfig {
     ///
     /// Desabilitado por padrão (conservador).
     pub flag2_fast: bool,
-    /// Modo de deinterlacing para streams de vídeo.
-    ///
-    /// SPEC-AV-005
-    pub deinterlace: DeinterlaceMode,
 }
 
 impl Default for CodecConfig {
@@ -272,7 +268,19 @@ impl Default for CodecConfig {
             thread_type: ThreadType::Auto,
             skip_loop_filter: false,
             flag2_fast: false,
-            deinterlace: DeinterlaceMode::Auto,
+        }
+    }
+}
+
+impl DeinterlaceProfile {
+    /// Rótulo estável para telemetria e UI.
+    ///
+    /// SPEC-AV-006
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Performance => "Performance",
+            Self::Quality => "Quality",
+            Self::Off => "Off",
         }
     }
 }
@@ -434,7 +442,6 @@ mod tests {
             thread_type: ThreadType::Frame,
             skip_loop_filter: true,
             flag2_fast: false,
-            deinterlace: DeinterlaceMode::Auto,
         };
         assert_eq!(cfg.thread_count, 4);
         assert_eq!(cfg.thread_type, ThreadType::Frame);

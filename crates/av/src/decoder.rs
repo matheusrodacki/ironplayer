@@ -10,14 +10,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioFrame;
-use crate::codec::{AudioCodec, CodecConfig, DeinterlaceMode, MediaCodec, ThreadType, VideoCodec};
-use crate::deinterlace::Deinterlacer;
+use crate::codec::{AudioCodec, CodecConfig, DeinterlaceProfile, MediaCodec, ThreadType, VideoCodec};
+use crate::deinterlace::{DeinterlaceBackend, Deinterlacer};
 use crate::error::AvError;
 use crate::ffi::{
-    find_ffmpeg_dll_dir, frame_flags, FfmpegCodecContext, FfmpegFrame, FfmpegLib, FfmpegPacket,
-    FfmpegParser, FilterLib, AV_CODEC_ID_AAC, AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3,
-    AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO,
-    AV_COL_RANGE_JPEG, AV_FRAME_FLAG_INTERLACED, AV_HWDEVICE_TYPE_D3D11VA,
+    find_ffmpeg_dll_dir, frame_flags, frame_time_base, frame_top_field_first, FfmpegCodecContext,
+    FfmpegFrame, FfmpegLib, FfmpegPacket, FfmpegParser, FilterLib, AV_CODEC_ID_AAC,
+    AV_CODEC_ID_AAC_LATM, AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC,
+    AV_CODEC_ID_MP2, AV_CODEC_ID_MPEG2VIDEO, AV_COL_RANGE_JPEG, AV_FRAME_FLAG_INTERLACED,
+    AV_HWDEVICE_TYPE_D3D11VA,
 };
 #[cfg(windows)]
 use crate::hw::{ColorSpace, TransferFunction};
@@ -97,10 +98,10 @@ struct CodecState {
     /// `None` quando o codec não tem parser registrado (AAC LATM usa split
     /// manual via sync word; ver `split_loas_frames`).
     parser: Option<FfmpegParser>,
-    /// Deinterlacador bwdif, criado lazily na primeira aparição de frame
-    /// interlaced. `None` se o stream não for interlaced ou se `FilterLib`
-    /// não estiver disponível.
-    deinterlacer: Option<Deinterlacer>,
+    /// Backend de deinterlace ativo (bwdif, D3D11 VP ou nenhum).
+    deinterlace: DeinterlaceBackend,
+    /// `true` após fallback VP→Quality neste PID.
+    vp_fallback: bool,
     /// Tipo de varredura detectado para este PID (latched após primeira detecção).
     scan_type: ScanType,
     /// `true` quando o codec de vídeo é H.264 (para parse de SPS).
@@ -160,6 +161,10 @@ pub struct FfmpegDecoder {
     last_hw_codec: Option<String>,
     /// Total de frames descartados pelo bwdif (todos os PIDs).
     deinterlace_drops: u64,
+    /// Perfil de deinterlace em runtime (menu de contexto).
+    ///
+    /// SPEC-AV-006
+    deinterlace_profile: DeinterlaceProfile,
 }
 
 impl FfmpegDecoder {
@@ -213,6 +218,7 @@ impl FfmpegDecoder {
             hw_state: HwAccelState::new(),
             last_hw_codec: None,
             deinterlace_drops: 0,
+            deinterlace_profile: DeinterlaceProfile::default(),
         })
     }
 
@@ -240,6 +246,7 @@ impl FfmpegDecoder {
             hw_state: HwAccelState::new(),
             last_hw_codec: None,
             deinterlace_drops: 0,
+            deinterlace_profile: DeinterlaceProfile::default(),
         }
     }
 
@@ -250,16 +257,47 @@ impl FfmpegDecoder {
     ///
     /// SPEC-AV-002b
     pub fn reset(&mut self) {
+        if let Some(dev) = self.shared_d3d11_device() {
+            if let Some(pool) = dev.shared_nv_pool() {
+                pool.clear_slots();
+                tracing::debug!("decoder reset: pool NV12 compartilhado limpo");
+            }
+        }
         self.states.clear();
     }
 
-    /// Retorna `true` se pelo menos um PID de vídeo tem o deinterlacador bwdif ativo.
+    /// Retorna `true` se pelo menos um PID de vídeo tem deinterlace ativo.
     ///
-    /// SPEC-AV-005
+    /// SPEC-AV-006
     pub fn has_deinterlacer_active(&self) -> bool {
         self.states
             .values()
-            .any(|s| s.is_video && s.deinterlacer.is_some())
+            .any(|s| s.is_video && s.deinterlace.is_active())
+    }
+
+    /// Rótulo do backend de deinterlace ativo (`"D3D11 VP"`, `"bwdif"`, ou `None`).
+    ///
+    /// SPEC-AV-006
+    pub fn deinterlace_backend(&self) -> Option<&'static str> {
+        self.states
+            .values()
+            .find_map(|s| s.deinterlace.label())
+    }
+
+    /// Perfil de deinterlace em runtime.
+    ///
+    /// SPEC-AV-006
+    pub fn deinterlace_profile(&self) -> DeinterlaceProfile {
+        self.deinterlace_profile
+    }
+
+    /// Altera o perfil de deinterlace em runtime.
+    ///
+    /// O caller deve chamar `reset_with_hw_state()` após esta chamada.
+    ///
+    /// SPEC-AV-006
+    pub fn set_deinterlace_profile(&mut self, profile: DeinterlaceProfile) {
+        self.deinterlace_profile = profile;
     }
 
     /// Retorna `true` quando `avfilter` foi carregado com sucesso.
@@ -290,16 +328,16 @@ impl FfmpegDecoder {
     ///
     /// SPEC-AV-005
     pub fn deinterlace_reason(&self) -> DeinterlaceReason {
-        if self.codec_config.deinterlace == DeinterlaceMode::Off {
+        if self.deinterlace_profile == DeinterlaceProfile::Off {
             return DeinterlaceReason::Off;
         }
-        if self.filter_lib.is_none() {
+        if self.states.values().any(|s| s.vp_fallback) {
+            return DeinterlaceReason::VpFallback;
+        }
+        if self.deinterlace_profile == DeinterlaceProfile::Quality && self.filter_lib.is_none() {
             return DeinterlaceReason::NoAvfilter;
         }
         if self.has_deinterlacer_active() {
-            if self.codec_config.deinterlace == DeinterlaceMode::Force {
-                return DeinterlaceReason::Forced;
-            }
             return DeinterlaceReason::Active;
         }
         DeinterlaceReason::NotDetected
@@ -430,6 +468,12 @@ impl FfmpegDecoder {
     ///
     /// SPEC-AV-HW-DEC-001
     pub fn reset_with_hw_state(&mut self) {
+        if let Some(dev) = self.shared_d3d11_device() {
+            if let Some(pool) = dev.shared_nv_pool() {
+                pool.clear_slots();
+                tracing::debug!("decoder reset_with_hw_state: pool NV12 compartilhado limpo");
+            }
+        }
         self.states.clear();
         self.hw_state = HwAccelState::new();
         self.last_hw_codec = None;
@@ -459,18 +503,15 @@ impl FfmpegDecoder {
             let is_h264 = matches!(pes.codec, MediaCodec::Video(VideoCodec::H264));
             let is_hevc = matches!(pes.codec, MediaCodec::Video(VideoCodec::Hevc));
 
-            let initial_scan = if self.codec_config.deinterlace == DeinterlaceMode::Force {
-                ScanType::Interlaced
-            } else if is_h264 {
+            let initial_scan = if is_h264 {
                 detect_h264_scan_type(&pes.payload).unwrap_or(ScanType::Unknown)
             } else {
                 ScanType::Unknown
             };
 
-            // Vídeo entrelaçado requer decoder SW + bwdif — não abrir D3D11VA.
+            // Vídeo entrelaçado + perfil Quality requer decoder SW + bwdif.
             let skip_hw_for_deinterlace = is_video
-                && (initial_scan.is_interlaced()
-                    || self.codec_config.deinterlace == DeinterlaceMode::Force);
+                && should_skip_hw_for_deinterlace(self.deinterlace_profile, initial_scan.is_interlaced());
 
             // HEVC 4:2:2/4:4:4 não é decodificado pelo D3D11VA — abrir SW direto.
             let skip_hw_for_hevc_chroma = is_hevc && hevc_hwaccel_unsupported(&pes.payload);
@@ -564,7 +605,8 @@ impl FfmpegDecoder {
                     frame,
                     is_video,
                     parser,
-                    deinterlacer: None,
+                    deinterlace: DeinterlaceBackend::None,
+                    vp_fallback: false,
                     scan_type: initial_scan,
                     is_h264,
                     deinterlace_drops: 0,
@@ -686,14 +728,16 @@ impl FfmpegDecoder {
             if state.is_video {
                 state.scan_type = update_scan_type(
                     state.scan_type,
-                    self.codec_config.deinterlace,
+                    self.deinterlace_profile,
                     state.is_h264,
                     &pkt_bytes,
                     false,
                     state.codec_ctx.field_order(),
                 );
 
-                if state.hw_decode && state.scan_type.is_interlaced() {
+                if state.hw_decode
+                    && should_migrate_hw_to_sw(self.deinterlace_profile, state.scan_type, false)
+                {
                     reopen_sw_codec_from_hw(
                         &self.lib,
                         &self.codec_config,
@@ -736,7 +780,7 @@ impl FfmpegDecoder {
                                 let frame_interlaced = frame_is_interlaced(&state.frame);
                                 state.scan_type = update_scan_type(
                                     state.scan_type,
-                                    self.codec_config.deinterlace,
+                                    self.deinterlace_profile,
                                     state.is_h264,
                                     &pkt_bytes,
                                     frame_interlaced,
@@ -745,13 +789,21 @@ impl FfmpegDecoder {
 
                                 let needs_di = needs_deinterlace(
                                     state.scan_type,
-                                    self.codec_config.deinterlace,
+                                    self.deinterlace_profile,
                                 );
-                                if needs_di || frame_interlaced {
+
+                                // Perfil Quality: migra HW→SW para bwdif.
+                                if needs_di
+                                    && should_migrate_hw_to_sw(
+                                        self.deinterlace_profile,
+                                        state.scan_type,
+                                        frame_interlaced,
+                                    )
+                                {
                                     tracing::debug!(
                                         pid = pid_raw,
                                         scan = state.scan_type.label(),
-                                        "frame HW em stream entrelaçado — migrando para SW"
+                                        "frame HW em stream entrelaçado — migrando para SW (Quality)"
                                     );
                                     state.frame.unref();
                                     reopen_sw_codec_from_hw(
@@ -772,6 +824,79 @@ impl FfmpegDecoder {
                                 state.hw_init_deadline = None;
 
                                 let decoded_hw = if let Some(d3d_dev) = shared_d3d.as_deref() {
+                                    if needs_di
+                                        && self.deinterlace_profile
+                                            == DeinterlaceProfile::Performance
+                                        && !state.vp_fallback
+                                    {
+                                        let hw_meta = {
+                                            let f = &state.frame;
+                                            (
+                                                f.hw_frame_info(),
+                                                unsafe {
+                                                    frame_top_field_first(f.as_ptr())
+                                                },
+                                                unsafe { frame_time_base(f.as_ptr()) },
+                                            )
+                                        };
+                                        match hw_meta.0 {
+                                            Ok(info) => {
+                                                match try_hw_vp_zero_copy(
+                                                    info,
+                                                    hw_meta.1,
+                                                    hw_meta.2,
+                                                    d3d_dev,
+                                                    state,
+                                                    pid_raw,
+                                                ) {
+                                                    Ok(vfs) if !vfs.is_empty() => {
+                                                        hw_frames_ok += vfs.len();
+                                                        frames.extend(vfs);
+                                                        state.frame.unref();
+                                                        continue;
+                                                    }
+                                                    Ok(_) => {
+                                                        state.frame.unref();
+                                                        continue;
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            %e,
+                                                            pid = pid_raw,
+                                                            "D3D11 VP falhou — fallback Quality (bwdif)"
+                                                        );
+                                                        state.vp_fallback = true;
+                                                        state.deinterlace.clear();
+                                                        reopen_sw_codec_from_hw(
+                                                            &self.lib,
+                                                            &self.codec_config,
+                                                            state,
+                                                            pes.codec,
+                                                            pid_raw,
+                                                            "VP fallback bwdif",
+                                                        )?;
+                                                        if let Err(e) =
+                                                            state.codec_ctx.send_packet(&pkt)
+                                                        {
+                                                            tracing::debug!(
+                                                                %e,
+                                                                pid = pid_raw,
+                                                                "re-send após VP fallback"
+                                                            );
+                                                        }
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    %e,
+                                                    pid = pid_raw,
+                                                    "hw_frame_info falhou no caminho VP"
+                                                );
+                                            }
+                                        }
+                                    }
                                     match try_hw_zero_copy(&state.frame, d3d_dev) {
                                         Ok(vf) => Some(vf),
                                         Err(e) => {
@@ -820,7 +945,7 @@ impl FfmpegDecoder {
                                 let frame_interlaced = frame_is_interlaced(&state.frame);
                                 state.scan_type = update_scan_type(
                                     state.scan_type,
-                                    self.codec_config.deinterlace,
+                                    self.deinterlace_profile,
                                     state.is_h264,
                                     &pkt_bytes,
                                     frame_interlaced,
@@ -829,19 +954,20 @@ impl FfmpegDecoder {
 
                                 let needs_di = needs_deinterlace(
                                     state.scan_type,
-                                    self.codec_config.deinterlace,
+                                    self.deinterlace_profile,
                                 );
-                                let deint_all = state.scan_type.is_interlaced()
-                                    || self.codec_config.deinterlace == DeinterlaceMode::Force;
+                                let deint_all = state.scan_type.is_interlaced();
 
                                 if needs_di {
                                     if let Some(fl) = &self.filter_lib {
-                                        if state.deinterlacer.is_none() {
-                                            state.deinterlacer = Some(Deinterlacer::new(
-                                                Arc::clone(fl),
-                                                Arc::clone(&self.lib),
-                                                deint_all,
-                                            ));
+                                        if !matches!(state.deinterlace, DeinterlaceBackend::Bwdif(_)) {
+                                            state.deinterlace = DeinterlaceBackend::Bwdif(
+                                                Deinterlacer::new(
+                                                    Arc::clone(fl),
+                                                    Arc::clone(&self.lib),
+                                                    deint_all,
+                                                ),
+                                            );
                                             tracing::info!(
                                                 pid = pid_raw,
                                                 scan = state.scan_type.label(),
@@ -852,7 +978,7 @@ impl FfmpegDecoder {
                                 }
 
                                 let di_output: Option<FfmpegFrame> = if needs_di {
-                                    if let Some(di) = state.deinterlacer.as_mut() {
+                                    if let Some(di) = state.deinterlace.bwdif_mut() {
                                         match di.process(&state.frame) {
                                             Ok(Some(f)) => Some(f),
                                             Ok(None) => {
@@ -1011,8 +1137,40 @@ fn reopen_sw_codec_from_hw(
     state.codec_ctx = FfmpegCodecContext::open(Arc::clone(lib), avid, config)?;
     state.hw_decode = false;
     state.hw_init_deadline = None;
-    state.deinterlacer = None;
+    state.deinterlace.clear();
+    state.vp_fallback = false;
     Ok(())
+}
+
+/// Retorna `true` quando o decoder deve abrir SW em vez de HW por deinterlace.
+///
+/// SPEC-AV-006
+pub(crate) fn should_skip_hw_for_deinterlace(
+    profile: DeinterlaceProfile,
+    is_interlaced: bool,
+) -> bool {
+    profile == DeinterlaceProfile::Quality && is_interlaced
+}
+
+/// Retorna `true` quando um decoder HW ativo deve migrar para SW (bwdif).
+///
+/// SPEC-AV-006
+pub(crate) fn should_migrate_hw_to_sw(
+    profile: DeinterlaceProfile,
+    scan_type: ScanType,
+    frame_interlaced: bool,
+) -> bool {
+    profile == DeinterlaceProfile::Quality && (scan_type.is_interlaced() || frame_interlaced)
+}
+
+/// Retorna `true` quando o pipeline deve aplicar deinterlace neste stream.
+///
+/// SPEC-AV-006
+pub(crate) fn needs_deinterlace(scan_type: ScanType, profile: DeinterlaceProfile) -> bool {
+    match profile {
+        DeinterlaceProfile::Off => false,
+        DeinterlaceProfile::Performance | DeinterlaceProfile::Quality => scan_type.is_interlaced(),
+    }
 }
 
 /// Retorna `true` quando o `AVFrame` está marcado como entrelaçado.
@@ -1022,15 +1180,115 @@ fn frame_is_interlaced(frame: &FfmpegFrame) -> bool {
     unsafe { frame_flags(frame.as_ptr()) & AV_FRAME_FLAG_INTERLACED != 0 }
 }
 
-/// Retorna `true` quando o pipeline deve aplicar bwdif neste stream.
+/// Metadados da textura D3D11 de um frame HW (ponteiro, dimensões, PTS, SAR, cores).
+type HwVpInputInfo = (
+    *mut std::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    i64,
+    (u32, u32),
+    i32,
+    i32,
+    i32,
+);
+
+/// Caminho HW + D3D11 Video Processor (perfil Performance, streams entrelaçados).
 ///
-/// SPEC-AV-005
-fn needs_deinterlace(scan_type: ScanType, mode: DeinterlaceMode) -> bool {
-    match mode {
-        DeinterlaceMode::Off => false,
-        DeinterlaceMode::Force => true,
-        DeinterlaceMode::Auto => scan_type.is_interlaced(),
+/// SPEC-AV-006
+#[cfg(windows)]
+fn try_hw_vp_zero_copy(
+    hw_info: HwVpInputInfo,
+    top_field_first: bool,
+    time_base: (i32, i32),
+    d3d_dev: &D3d11Device,
+    state: &mut CodecState,
+    pid_raw: u16,
+) -> Result<Vec<DecodedFrame>, AvError> {
+    use crate::deinterlace::DeinterlaceBackend;
+    use crate::hw::D3d11VideoProcessor;
+    use crate::video_queue::HwSurface;
+
+    let (tex_ptr, slice, w, h, pts_raw, sar, trc, cs, cr) = hw_info;
+
+    let pool = d3d_dev
+        .shared_nv_pool()
+        .ok_or_else(|| AvError::HwInitFailed("pool NV12 indisponível para VP".into()))?;
+
+    let tex = unsafe {
+        crate::hw::D3d11Texture::from_raw_addref(
+            tex_ptr,
+            slice,
+            w,
+            h,
+            ColorSpace::from_avutil(cs),
+            TransferFunction::from_avutil(trc),
+            cr == AV_COL_RANGE_JPEG,
+        )?
+    };
+
+    let (tb_num, tb_den) = time_base;
+
+    if !matches!(state.deinterlace, DeinterlaceBackend::D3d11Vp(_)) {
+        // Slots criados pelo caminho acquire_copy (só SRV) são inválidos para VP output.
+        pool.clear_slots();
+        let vp = D3d11VideoProcessor::new(
+            d3d_dev.d3d11_device(),
+            d3d_dev.d3d11_context(),
+            w,
+            h,
+            top_field_first,
+            if tb_num > 0 { tb_num } else { 1 },
+            if tb_den > 0 { tb_den } else { 90_000 },
+        )?;
+        state.deinterlace = DeinterlaceBackend::D3d11Vp(vp);
+        tracing::info!(pid = pid_raw, "D3D11 Video Processor ativado");
     }
+
+    let vp_outputs = if let DeinterlaceBackend::D3d11Vp(vp) = &mut state.deinterlace {
+        vp.process(&pool, &tex, pts_raw, top_field_first)?
+    } else {
+        return Err(AvError::HwInitFailed("VP não inicializado".into()));
+    };
+
+    let colorspace = match ColorSpace::from_avutil(cs) {
+        ColorSpace::Bt601 => YuvColorspace::Bt601,
+        ColorSpace::Bt709 => YuvColorspace::Bt709,
+        ColorSpace::Bt2020 => YuvColorspace::Bt2020,
+    };
+    let color_range = if cr == AV_COL_RANGE_JPEG {
+        YuvColorRange::Full
+    } else {
+        YuvColorRange::Limited
+    };
+
+    let mut out = Vec::with_capacity(vp_outputs.len());
+    for vp_out in vp_outputs {
+        out.push(DecodedFrame::Video(VideoFrame::Hw(HwVideoFrame {
+            surface: HwSurface::Shared(vp_out.shared),
+            colorspace,
+            color_range,
+            transfer: TransferFunction::from_avutil(trc),
+            pts: vp_out.pts,
+            width: w,
+            height: h,
+            sar_num: sar.0,
+            sar_den: sar.1,
+        })));
+    }
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+fn try_hw_vp_zero_copy(
+    _hw_info: HwVpInputInfo,
+    _top_field_first: bool,
+    _time_base: (i32, i32),
+    _d3d_dev: &D3d11Device,
+    _state: &mut CodecState,
+    _pid_raw: u16,
+) -> Result<Vec<DecodedFrame>, AvError> {
+    Err(AvError::HwInitFailed("VP só disponível no Windows".into()))
 }
 
 /// Extrai os planos NV12/P010 de um frame HW D3D11VA para `VideoFrame::Hw`.
@@ -1545,24 +1803,74 @@ mod tests {
 
     // ── Hwaccel API (Fase B) ────────────────────────────────────────────────
 
-    /// SPEC-AV-005: `needs_deinterlace` respeita modo Off / Force / Auto.
+    /// SPEC-AV-006: `needs_deinterlace` respeita perfil Off / Performance / Quality.
+    #[test]
+    fn spec_av_006_needs_deinterlace_profiles() {
+        assert!(!super::needs_deinterlace(
+            ScanType::Interlaced,
+            DeinterlaceProfile::Off
+        ));
+        assert!(super::needs_deinterlace(
+            ScanType::Interlaced,
+            DeinterlaceProfile::Performance
+        ));
+        assert!(super::needs_deinterlace(
+            ScanType::Interlaced,
+            DeinterlaceProfile::Quality
+        ));
+        assert!(!super::needs_deinterlace(
+            ScanType::Progressive,
+            DeinterlaceProfile::Performance
+        ));
+    }
+
+    /// SPEC-AV-006: Performance não pula HW para deinterlace.
+    #[test]
+    fn spec_av_006_performance_skips_hw_migration() {
+        assert!(!super::should_skip_hw_for_deinterlace(
+            DeinterlaceProfile::Performance,
+            true
+        ));
+        assert!(!super::should_migrate_hw_to_sw(
+            DeinterlaceProfile::Performance,
+            ScanType::Interlaced,
+            true
+        ));
+    }
+
+    /// SPEC-AV-006: Quality migra HW→SW em streams entrelaçados.
+    #[test]
+    fn spec_av_006_quality_migrates_to_sw() {
+        assert!(super::should_skip_hw_for_deinterlace(
+            DeinterlaceProfile::Quality,
+            true
+        ));
+        assert!(super::should_migrate_hw_to_sw(
+            DeinterlaceProfile::Quality,
+            ScanType::Interlaced,
+            false
+        ));
+    }
+
+    /// SPEC-AV-006: Off não ativa deinterlace.
+    #[test]
+    fn spec_av_006_off_no_deinterlace() {
+        assert!(!super::needs_deinterlace(
+            ScanType::Interlaced,
+            DeinterlaceProfile::Off
+        ));
+    }
+
+    /// SPEC-AV-005: `needs_deinterlace` legado — substituído por spec_av_006.
     #[test]
     fn spec_av_005_needs_deinterlace_modes() {
         assert!(!super::needs_deinterlace(
             ScanType::Interlaced,
-            DeinterlaceMode::Off
-        ));
-        assert!(super::needs_deinterlace(
-            ScanType::Unknown,
-            DeinterlaceMode::Force
+            DeinterlaceProfile::Off
         ));
         assert!(super::needs_deinterlace(
             ScanType::Interlaced,
-            DeinterlaceMode::Auto
-        ));
-        assert!(!super::needs_deinterlace(
-            ScanType::Progressive,
-            DeinterlaceMode::Auto
+            DeinterlaceProfile::Quality
         ));
     }
 

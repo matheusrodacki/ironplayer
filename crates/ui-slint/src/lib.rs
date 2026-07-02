@@ -12,7 +12,8 @@ mod video;
 
 pub use state::{
     AppCommand, AppState, AspectRatioMode, AudioErrorSnapshot, AudioOperationalState,
-    AudioStatusSnapshot, AudioTrackInfo, ConnectionState, HwAccelChoice, TableEvent, TablesSnapshot,
+    AudioStatusSnapshot, AudioTrackInfo, ConnectionState, DeinterlaceProfileChoice,
+    HwAccelChoice, TableEvent, TablesSnapshot,
 };
 
 use std::cell::{Cell, RefCell};
@@ -25,7 +26,7 @@ use crossbeam_channel::{Receiver, Sender};
 use slint::{Color, ComponentHandle, Image, ModelRc, RenderingState, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use slint::wgpu_29::{wgpu, WGPUConfiguration};
 
-use av::video_queue::PopResult;
+use av::video_queue::{HwSurface, PopResult};
 use av::{Clock, MasterClock, VideoFrame, VideoQueue};
 use ts::metrics::{AudioCodec, MetricsSnapshot, PidEntry, PidType, VideoCodec};
 use ts::{Pid, StreamKind};
@@ -118,6 +119,7 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         });
     }
     let hwaccel_choice = Rc::new(RefCell::new(HwAccelChoice::default()));
+    let deinterlace_choice = Rc::new(RefCell::new(DeinterlaceProfileChoice::default()));
     {
         let cmd_tx = handles.cmd_tx.clone();
         let choice_ref = hwaccel_choice.clone();
@@ -129,6 +131,19 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
             };
             *choice_ref.borrow_mut() = choice;
             let _ = cmd_tx.try_send(AppCommand::SetHwAccel { choice });
+        });
+    }
+    {
+        let cmd_tx = handles.cmd_tx.clone();
+        let choice_ref = deinterlace_choice.clone();
+        window.on_set_deinterlace(move |id| {
+            let profile = match id {
+                1 => DeinterlaceProfileChoice::Quality,
+                2 => DeinterlaceProfileChoice::Off,
+                _ => DeinterlaceProfileChoice::Performance,
+            };
+            *choice_ref.borrow_mut() = profile;
+            let _ = cmd_tx.try_send(AppCommand::SetDeinterlace { profile });
         });
     }
     let selected_service: Rc<RefCell<Option<u16>>> = Rc::new(RefCell::new(None));
@@ -196,7 +211,7 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         let weak = window.as_weak();
         let video = video_state.clone();
         let dims_cell = video_dims_shared.clone();
-        let bridge_opt = gpu_bridge;
+        let bridge_opt = gpu_bridge.clone();
         if let Err(e) = window.window().set_rendering_notifier(move |state, _api| {
             match state {
                 RenderingState::BeforeRendering => {
@@ -248,11 +263,13 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         selected_service,
         aspect_ratio,
         hwaccel_choice,
+        deinterlace_choice,
         video_dims: None,
         tick: 0,
         video: video_state,
         video_dims_shared,
         render,
+        gpu_bridge,
     };
 
     // Preenche já no primeiro tick.
@@ -287,11 +304,18 @@ impl GpuVideoBridge {
         }
     }
 
+    /// Limpa cache de importação D3D11→wgpu após troca de serviço.
+    fn reset_cache(&self) {
+        if let Ok(mut r) = self.renderer.lock() {
+            r.reset_shared_cache();
+        }
+    }
+
     /// Chamado em `RenderingState::BeforeRendering` — roda o shader e atualiza a `Image`.
     fn render_frame(&self, win: &AppWindow, frame: &VideoFrame) {
         let mut renderer = self.renderer.lock().expect("gpu bridge renderer");
-        if let Some(tex) = renderer.render_to_texture(frame) {
-            match Image::try_from(tex) {
+        match renderer.render_to_texture(frame) {
+            Some(tex) => match Image::try_from(tex) {
                 Ok(img) => {
                     win.set_video_frame(img);
                     win.set_video_has_signal(true);
@@ -299,6 +323,34 @@ impl GpuVideoBridge {
                 Err(e) => {
                     tracing::warn!(error = ?e, "slint: Image::try_from(texture) falhou")
                 }
+            },
+            None => {
+                // #region agent log
+                {
+                    use std::io::Write;
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let (handle, pts) = match frame {
+                        VideoFrame::Hw(f) => match &f.surface {
+                            HwSurface::Shared(s) => (s.texture_handle, f.pts),
+                            _ => (0, f.pts),
+                        },
+                        VideoFrame::Sw(f) => (0, f.pts),
+                    };
+                    let line = format!(
+                        r#"{{"sessionId":"831551","hypothesisId":"P","location":"lib.rs:render_frame","message":"render skipped","data":{{"tex_handle":{handle},"pts":{pts:?}}},"timestamp":{ts}}}"#
+                    );
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("debug-831551.log")
+                    {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
+                // #endregion
             }
         }
     }
@@ -435,6 +487,8 @@ struct Poller {
     /// Modo de hwaccel escolhido no menu de contexto (espelho local do último
     /// comando enviado; o backend confirma via `PipelineMetrics.hw_decode_active`).
     hwaccel_choice: Rc<RefCell<HwAccelChoice>>,
+    /// Perfil de deinterlace escolhido no menu de contexto.
+    deinterlace_choice: Rc<RefCell<DeinterlaceProfileChoice>>,
     /// Dimensões do último frame `(width, height)` corrigidas por SAR.
     video_dims: Option<(u32, u32)>,
     tick: u64,
@@ -446,6 +500,8 @@ struct Poller {
     video_dims_shared: Rc<Cell<Option<(u32, u32, u32, u32)>>>,
     /// Estratégia de exibição (GPU zero-copy ou CPU via worker).
     render: RenderMode,
+    /// Ponte GPU (cache de texturas compartilhadas); `None` no modo CPU.
+    gpu_bridge: Option<Arc<GpuVideoBridge>>,
 }
 
 impl Poller {
@@ -487,7 +543,7 @@ impl Poller {
 
         // Métricas/tabelas a ~4 Hz (snapshots chegam a 1 Hz).
         let refresh_meta = self.tick % 15 == 0;
-        self.poll_table_events();
+        self.poll_table_events(win);
         self.poll_snapshot();
 
         // Contadores de sync A/V da VideoQueue — o aggregator (`ts`) sempre os
@@ -509,23 +565,49 @@ impl Poller {
         self.apply_live(win);
     }
 
-    fn poll_table_events(&mut self) {
+    fn poll_table_events(&mut self, win: &AppWindow) {
         let events: Vec<TableEvent> = self.table_events_rx.try_iter().take(512).collect();
         for event in events {
             if matches!(event, TableEvent::Reset) {
-                self.reset_stream();
+                self.reset_stream(win);
                 continue;
             }
             self.state.apply_table_event(event);
         }
     }
 
-    fn reset_stream(&mut self) {
+    fn reset_stream(&mut self, win: &AppWindow) {
+        // #region agent log
+        {
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let line = format!(
+                r#"{{"sessionId":"831551","hypothesisId":"O","location":"lib.rs:reset_stream","message":"UI stream reset","data":{{"queue_len":{}}},"timestamp":{}}}"#,
+                self.video.borrow().queue.len(),
+                ts
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("debug-831551.log")
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        // #endregion
         self.state.reset_stream_data();
         self.last_snapshot_ts = None;
         self.seen_jitter = 0;
         self.video_dims = None;
+        self.video_dims_shared.set(None);
         self.video.borrow_mut().reset();
+        if let Some(bridge) = &self.gpu_bridge {
+            bridge.reset_cache();
+        }
+        win.set_video_has_signal(false);
     }
 
     fn update_video_dims_raw(&mut self, frame_w: u32, frame_h: u32, sar_num: u32, sar_den: u32) {
@@ -625,16 +707,19 @@ impl Poller {
         win.set_jitter_sub(SharedString::from(j_sub));
         win.set_jitter_line(SharedString::from(j_line));
 
-        let (ctx_svc, ctx_vid, ctx_aud, ctx_sub, ctx_ar, ctx_dec) = context_menu::build_menu_models(
-            st,
-            *self.aspect_ratio.borrow(),
-            *self.hwaccel_choice.borrow(),
-        );
+        let (ctx_svc, ctx_vid, ctx_aud, ctx_sub, ctx_ar, ctx_deint, ctx_dec) =
+            context_menu::build_menu_models(
+                st,
+                *self.aspect_ratio.borrow(),
+                *self.hwaccel_choice.borrow(),
+                *self.deinterlace_choice.borrow(),
+            );
         win.set_ctx_services(ctx_svc);
         win.set_ctx_videos(ctx_vid);
         win.set_ctx_audio(ctx_aud);
         win.set_ctx_subtitles(ctx_sub);
         win.set_ctx_aspect(ctx_ar);
+        win.set_ctx_deinterlace(ctx_deint);
         win.set_ctx_decode(ctx_dec);
 
         let (pipeline_left, pipeline_mid, pipeline_right) = build_pipeline_info(st);
@@ -1313,10 +1398,12 @@ fn build_pipeline_info(st: &AppState) -> (Vec<InfoRow>, Vec<InfoRow>, Vec<InfoRo
     }
     rows.push(info("Threads", p.decoder_threads_used.to_string(), false));
 
-    let deint = if p.deinterlacer_active {
-        "ativo"
+    let deint = if let Some(backend) = &p.deinterlace_backend {
+        format!("{backend} Ativo")
+    } else if p.deinterlacer_active {
+        "bwdif Ativo".to_string()
     } else {
-        "inativo"
+        "Desligado".to_string()
     };
     let scan = p.scan_type.as_deref().unwrap_or("—");
     rows.push(info("Deinterlace", format!("{deint} ({scan})"), false));

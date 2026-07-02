@@ -283,8 +283,12 @@ pub struct PipelineMetrics {
     /// Igual a `CodecConfig::thread_count` resolvido; 0 antes da primeira
     /// decodificação.
     pub decoder_threads_used: u32,
-    /// `true` quando o deinterlacador bwdif está ativo em pelo menos um PID.
+    /// `true` quando o deinterlacador está ativo em pelo menos um PID.
     pub deinterlacer_active: bool,
+    /// Backend ativo: `"D3D11 VP"`, `"bwdif"`, ou ausente.
+    ///
+    /// SPEC-AV-006
+    pub deinterlace_backend: Option<String>,
     /// Tipo de varredura do vídeo (`"Interlaced"`, `"Progressive"`, `"Unknown"`).
     ///
     /// SPEC-AV-005

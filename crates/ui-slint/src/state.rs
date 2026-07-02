@@ -426,6 +426,10 @@ pub enum AppCommand {
     ///
     /// SPEC-CFG-HW-001
     SetHwAccel { choice: HwAccelChoice },
+    /// Solicita troca do perfil de deinterlace em runtime.
+    ///
+    /// SPEC-AV-006
+    SetDeinterlace { profile: DeinterlaceProfileChoice },
     /// Notifica o backend que o renderer encontrou `DXGI_ERROR_DEVICE_REMOVED`.
     GpuDeviceRemoved,
 }
@@ -460,6 +464,37 @@ impl HwAccelChoice {
 }
 
 // ---------------------------------------------------------------------------
+// DeinterlaceProfileChoice
+// ---------------------------------------------------------------------------
+
+/// Seleção de perfil de deinterlace exposta para a UI (menu de contexto).
+///
+/// SPEC-AV-006
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeinterlaceProfileChoice {
+    /// D3D11 Video Processor + zero-copy HW (padrão).
+    #[default]
+    Performance,
+    /// bwdif CPU (migra HW→SW em 1080i).
+    Quality,
+    /// Sem deinterlace.
+    Off,
+}
+
+impl DeinterlaceProfileChoice {
+    /// Converte para o enum do crate `av`.
+    ///
+    /// SPEC-AV-006
+    pub fn to_av(self) -> av::DeinterlaceProfile {
+        match self {
+            Self::Performance => av::DeinterlaceProfile::Performance,
+            Self::Quality => av::DeinterlaceProfile::Quality,
+            Self::Off => av::DeinterlaceProfile::Off,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Testes
 // ---------------------------------------------------------------------------
 
@@ -478,6 +513,14 @@ mod tests {
         assert!(state.selected_service.is_none());
         assert!(state.bitrate_history.is_empty());
         assert!(state.pcr_history.is_empty());
+    }
+
+    #[test]
+    fn spec_ui_deinterlace_default_is_performance() {
+        assert_eq!(
+            DeinterlaceProfileChoice::default(),
+            DeinterlaceProfileChoice::Performance
+        );
     }
 
     #[test]

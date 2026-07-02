@@ -1,19 +1,13 @@
-//! Deinterlacing via bwdif da libavfilter.
+//! Deinterlacing: bwdif (CPU) e D3D11 Video Processor (GPU).
 //!
-//! Ativado quando o stream é detectado como entrelaçado (SPS / field_order /
-//! `AV_FRAME_FLAG_INTERLACED`) ou quando `[decoder] deinterlace = force`.
+//! O backend ativo depende de [`DeinterlaceProfile`] e da detecção de scan type.
 //!
-//! # Invariantes (não regredir)
+//! # Invariantes bwdif (não regredir — L-003)
 //!
-//! 1. **Buffer source** do grafo deve declarar `colorspace` e `range` do frame
-//!    de entrada. Sem isso, libavfilter reconfigura o link a cada frame e o
-//!    bwdif perde contexto temporal (vídeo congela no primeiro frame).
-//! 2. **PTS de saída** deve passar por [`crate::ffi::rescale_bwdif_output_pts`]:
-//!    o filtro dobra o tick count (time_base de saída = metade do de entrada).
-//!    Sem a divisão por 2, a `VideoQueue` retém todo frame como `TooEarly` vs
-//!    o `AudioClock` (90 kHz). Ver L-003 em `.specs/project/STATE.md`.
+//! 1. Buffer source do grafo declara `colorspace` e `range`.
+//! 2. PTS de saída passa por [`crate::ffi::rescale_bwdif_output_pts`] (÷2).
 //!
-//! SPEC-AV-005
+//! SPEC-AV-005 · SPEC-AV-006
 
 use std::sync::Arc;
 
@@ -23,10 +17,49 @@ use crate::ffi::{
     FfmpegFilterGraph, FfmpegFrame, FfmpegLib, FilterLib,
 };
 
-/// Deinterlacador baseado em bwdif da libavfilter.
+/// Backend de deinterlace ativo para um PID de vídeo.
 ///
-/// Criado por PID de vídeo quando o stream é entrelaçado ou forçado via config.
-/// Recria o grafo automaticamente se as dimensões do frame mudarem.
+/// SPEC-AV-006
+pub(crate) enum DeinterlaceBackend {
+    /// Nenhum processamento de deinterlace.
+    None,
+    /// bwdif via libavfilter (perfil Quality).
+    Bwdif(Deinterlacer),
+    /// D3D11 Video Processor (perfil Performance).
+    #[cfg(windows)]
+    D3d11Vp(crate::hw::D3d11VideoProcessor),
+}
+
+impl DeinterlaceBackend {
+    /// Limpa qualquer estado de deinterlace.
+    pub(crate) fn clear(&mut self) {
+        *self = Self::None;
+    }
+
+    /// Rótulo para telemetria (`"bwdif"`, `"D3D11 VP"`, ou `None`).
+    pub(crate) fn label(&self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Bwdif(_) => Some("bwdif"),
+            #[cfg(windows)]
+            Self::D3d11Vp(_) => Some("D3D11 VP"),
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Retorna referência mutável ao bwdif, se ativo.
+    pub(crate) fn bwdif_mut(&mut self) -> Option<&mut Deinterlacer> {
+        match self {
+            Self::Bwdif(di) => Some(di),
+            _ => None,
+        }
+    }
+}
+
+/// Deinterlacador baseado em bwdif da libavfilter.
 ///
 /// SPEC-AV-005
 pub(crate) struct Deinterlacer {
@@ -41,8 +74,6 @@ pub(crate) struct Deinterlacer {
 
 impl Deinterlacer {
     /// Cria um novo `Deinterlacer` sem grafo ativo.
-    ///
-    /// O grafo é criado lazily na primeira chamada a `process`.
     ///
     /// SPEC-AV-005
     pub(crate) fn new(
@@ -61,14 +92,8 @@ impl Deinterlacer {
 
     /// Processa um frame através do bwdif.
     ///
-    /// Cria o grafo lazily na primeira chamada ou quando as dimensões mudam.
-    ///
-    /// Retorna `Ok(Some(frame))` com o frame deinterlaced, ou `Ok(None)` se o
-    /// filtro bwdif ainda estiver acumulando contexto temporal (AVERROR_EAGAIN).
-    ///
     /// SPEC-AV-005
     pub(crate) fn process(&mut self, frame: &FfmpegFrame) -> Result<Option<FfmpegFrame>, AvError> {
-        // SAFETY: frame.as_ptr() aponta para um AVFrame válido e preenchido.
         let (width, height, pix_fmt, colorspace, color_range) = unsafe {
             (
                 frame_width(frame.as_ptr()) as u32,
@@ -79,9 +104,6 @@ impl Deinterlacer {
             )
         };
 
-        // Recria o grafo se as dimensões, formato de pixel, colorspace ou range
-        // mudaram. Incluir colorspace/range na chave evita reconfiguração
-        // implícita do buffer source a cada frame.
         let dims = (width, height, pix_fmt, colorspace, color_range);
         if self.graph_dims != Some(dims) {
             tracing::debug!(

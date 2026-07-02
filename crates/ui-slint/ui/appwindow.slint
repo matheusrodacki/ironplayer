@@ -519,6 +519,7 @@ export component AppWindow inherits Window {
     in property <[MenuEntry]> ctx-audio: [];
     in property <[MenuEntry]> ctx-subtitles: [];
     in property <[MenuEntry]> ctx-aspect: [];
+    in property <[MenuEntry]> ctx-deinterlace: [];
     in property <[MenuEntry]> ctx-decode: [];
 
     in property <[PidRow]> pid-rows: [];
@@ -552,6 +553,7 @@ export component AppWindow inherits Window {
     callback select-video(int);
     callback select-audio(int);
     callback set-aspect-ratio(int);
+    callback set-deinterlace(int);
     callback set-hwaccel(int);
 
     // ── Estado do menu de contexto (interno) ───────────────────────────────
@@ -559,7 +561,7 @@ export component AppWindow inherits Window {
     property <length> ctx-x: 0px;
     property <length> ctx-y: 0px;
     // Seção do submenu aberto: -1 nenhum · 0 Serviço · 1 Vídeo · 2 Áudio ·
-    // 3 Legenda · 4 Proporção · 5 Decodificação. Move-se conforme o hover nas categorias.
+    // 3 Legenda · 4 Proporção · 5 Deinterlace · 6 Decodificação.
     property <int> ctx-section: -1;
     // Topo do submenu, alinhado à categoria sob o cursor (coord. do popup raiz).
     property <length> ctx-sub-y: 0px;
@@ -569,7 +571,8 @@ export component AppWindow inherits Window {
         root.ctx-section == 2 ? root.ctx-audio :
         root.ctx-section == 3 ? root.ctx-subtitles :
         root.ctx-section == 4 ? root.ctx-aspect :
-        root.ctx-section == 5 ? root.ctx-decode :
+        root.ctx-section == 5 ? root.ctx-deinterlace :
+        root.ctx-section == 6 ? root.ctx-decode :
         root.ctx-services;
 
     // Fecha o menu de forma diferida após escolher um item — evita re-entrar no
@@ -615,7 +618,7 @@ export component AppWindow inherits Window {
         property <length> pad: 5px;
         property <length> step: self.row-h + 1px;         // linha + spacing
         property <length> sep-h: 9px;
-        property <length> cat-h: self.pad * 2 + 6 * self.row-h + 2 * self.sep-h + 7 * 1px;
+        property <length> cat-h: self.pad * 2 + 7 * self.row-h + 2 * self.sep-h + 8 * 1px;
         property <int> sub-n: max(root.ctx-sub-entries.length, 1);
         property <length> sub-h: self.pad * 2 + self.sub-n * self.row-h + (self.sub-n - 1) * 1px;
         property <bool> sub-open: root.ctx-section >= 0;
@@ -626,6 +629,7 @@ export component AppWindow inherits Window {
         property <int> n-audio: max(root.ctx-audio.length, 1);
         property <int> n-subtitle: max(root.ctx-subtitles.length, 1);
         property <int> n-aspect: max(root.ctx-aspect.length, 1);
+        property <int> n-deinterlace: max(root.ctx-deinterlace.length, 1);
         property <int> n-decode: max(root.ctx-decode.length, 1);
 
         pure function sub-h-of(n: int) -> length {
@@ -643,7 +647,8 @@ export component AppWindow inherits Window {
             max(self.step * 2 + self.sub-h-of(self.n-audio),
             max(self.step * 3 + self.sub-h-of(self.n-subtitle),
             max(self.step * 4 + self.sep-h + 1px + self.sub-h-of(self.n-aspect),
-                self.step * 5 + self.sep-h * 2 + 2px + self.sub-h-of(self.n-decode))))));
+            max(self.step * 5 + self.sep-h * 2 + 2px + self.sub-h-of(self.n-deinterlace),
+                self.step * 6 + self.sep-h * 2 + 2px + self.sub-h-of(self.n-decode)))))));
 
         // Contêiner: largura/altura fixas desde o primeiro frame (reservam espaço
         // para o submenu mais largo/alto possível) — o popup nunca precisa
@@ -721,11 +726,19 @@ export component AppWindow inherits Window {
                     }
 
                     CtxRow {
-                        label: "Decodificação";
+                        label: "Deinterlace";
                         arrow: true;
                         current: root.ctx-section == 5;
                         entered => { root.ctx-section = 5; root.ctx-sub-y = ctx-menu.step * 5 + ctx-menu.sep-h * 2 + 2px; }
                         chosen => { root.ctx-section = 5; root.ctx-sub-y = ctx-menu.step * 5 + ctx-menu.sep-h * 2 + 2px; }
+                    }
+
+                    CtxRow {
+                        label: "Decodificação";
+                        arrow: true;
+                        current: root.ctx-section == 6;
+                        entered => { root.ctx-section = 6; root.ctx-sub-y = ctx-menu.step * 6 + ctx-menu.sep-h * 2 + 2px; }
+                        chosen => { root.ctx-section = 6; root.ctx-sub-y = ctx-menu.step * 6 + ctx-menu.sep-h * 2 + 2px; }
                     }
                 }
             }
@@ -749,7 +762,8 @@ export component AppWindow inherits Window {
                                 if (root.ctx-section == 1) { root.select-video(e.id); }
                                 if (root.ctx-section == 2) { root.select-audio(e.id); }
                                 if (root.ctx-section == 4) { root.set-aspect-ratio(e.id); }
-                                if (root.ctx-section == 5) { root.set-hwaccel(e.id); }
+                                if (root.ctx-section == 5) { root.set-deinterlace(e.id); }
+                                if (root.ctx-section == 6) { root.set-hwaccel(e.id); }
                                 ctx-close-timer.running = true;
                             }
                         }

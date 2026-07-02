@@ -70,6 +70,12 @@ pub enum DecodeCommand {
     SetHwAccel {
         choice: crate::config::HwAccelChoice,
     },
+    /// Aplica um novo perfil de deinterlace em runtime.
+    ///
+    /// SPEC-AV-006
+    SetDeinterlace {
+        profile: av::DeinterlaceProfile,
+    },
     /// Notifica o decoder que o render encontrou `DXGI_ERROR_DEVICE_REMOVED`.
     HandleDeviceRemoved,
 }
@@ -538,9 +544,14 @@ impl TableDispatcher {
             self.send_pes_command(PesCommand::DeregisterPid { pid });
         }
 
-        // Reinicia o decodificador para descartar contextos obsoletos.
-        if should_reset_decoder && self.decode_tx.try_send(DecodeCommand::Reset).is_err() {
-            warn!("canal decode-control cheio — Reset descartado");
+        // Reinicia o decodificador e a fila de vídeo na UI (frames antigos).
+        if should_reset_decoder {
+            if self.decode_tx.try_send(DecodeCommand::Reset).is_err() {
+                warn!("canal decode-control cheio — Reset descartado");
+            }
+            if !self.tx.try_send(TableEvent::Reset) {
+                warn!("canal table-events cheio — Reset UI descartado");
+            }
         }
 
         // Registra PIDs do novo serviço (se a PMT já foi recebida).

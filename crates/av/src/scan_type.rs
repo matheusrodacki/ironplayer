@@ -4,7 +4,7 @@
 //!
 //! SPEC-AV-005
 
-use crate::codec::DeinterlaceMode;
+use crate::codec::DeinterlaceProfile;
 
 /// Tipo de varredura do vídeo detectado por PID.
 ///
@@ -57,7 +57,8 @@ pub enum DeinterlaceReason {
     Off,
     NoAvfilter,
     Active,
-    Forced,
+    /// Fallback automático de D3D11 VP para bwdif (perfil Performance).
+    VpFallback,
 }
 
 impl DeinterlaceReason {
@@ -70,7 +71,7 @@ impl DeinterlaceReason {
             Self::Off => "Off",
             Self::NoAvfilter => "NoAvfilter",
             Self::Active => "Active",
-            Self::Forced => "Forced",
+            Self::VpFallback => "VpFallback",
         }
     }
 }
@@ -87,7 +88,7 @@ const AV_FIELD_INTERLACED_MIN: i32 = 2;
 /// SPEC-AV-005
 pub fn update_scan_type(
     current: ScanType,
-    mode: DeinterlaceMode,
+    profile: DeinterlaceProfile,
     is_h264: bool,
     pkt_bytes: &[u8],
     frame_interlaced: bool,
@@ -97,10 +98,8 @@ pub fn update_scan_type(
         return current;
     }
 
-    match mode {
-        DeinterlaceMode::Force => return ScanType::Interlaced,
-        DeinterlaceMode::Off => return current,
-        DeinterlaceMode::Auto => {}
+    if profile == DeinterlaceProfile::Off {
+        return current;
     }
 
     if frame_interlaced {
@@ -487,7 +486,7 @@ mod tests {
     fn spec_av_005_field_order_progressive_without_sps_stays_unknown() {
         let updated = update_scan_type(
             ScanType::Unknown,
-            DeinterlaceMode::Auto,
+            DeinterlaceProfile::Performance,
             true,
             &[],
             false,
@@ -506,7 +505,7 @@ mod tests {
         ];
         let updated = update_scan_type(
             ScanType::Unknown,
-            DeinterlaceMode::Auto,
+            DeinterlaceProfile::Performance,
             true,
             &au,
             false,
@@ -538,22 +537,22 @@ mod tests {
     #[test]
     fn spec_av_005_frame_flag_latches_interlaced() {
         let updated =
-            update_scan_type(ScanType::Unknown, DeinterlaceMode::Auto, true, &[], true, 0);
+            update_scan_type(ScanType::Unknown, DeinterlaceProfile::Performance, true, &[], true, 0);
         assert_eq!(updated, ScanType::Interlaced);
     }
 
-    /// SPEC-AV-005: modo Force sempre retorna Interlaced.
+    /// SPEC-AV-005: perfil Off não altera scan type em detecção.
     #[test]
-    fn spec_av_005_force_mode_latches_interlaced() {
+    fn spec_av_005_off_profile_leaves_scan_unknown() {
         let updated = update_scan_type(
             ScanType::Unknown,
-            DeinterlaceMode::Force,
+            DeinterlaceProfile::Off,
             false,
             &[],
             false,
             0,
         );
-        assert_eq!(updated, ScanType::Interlaced);
+        assert_eq!(updated, ScanType::Unknown);
     }
 
     /// SPEC-AV-005: scan type resolvido não regride.
@@ -561,7 +560,7 @@ mod tests {
     fn spec_av_005_resolved_scan_type_is_stable() {
         let updated = update_scan_type(
             ScanType::Interlaced,
-            DeinterlaceMode::Auto,
+            DeinterlaceProfile::Performance,
             true,
             &[],
             false,
@@ -601,7 +600,7 @@ mod tests {
     fn spec_av_005_hevc_progressive_resolves_via_field_order() {
         let hevc = update_scan_type(
             ScanType::Unknown,
-            DeinterlaceMode::Auto,
+            DeinterlaceProfile::Performance,
             false, // is_h264
             &[],
             false, // frame_interlaced
@@ -612,7 +611,7 @@ mod tests {
         // H.264 não deve fixar Progressive só por field_order (cautela MBAFF).
         let h264 = update_scan_type(
             ScanType::Unknown,
-            DeinterlaceMode::Auto,
+            DeinterlaceProfile::Performance,
             true, // is_h264
             &[],
             false,

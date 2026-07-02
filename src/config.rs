@@ -186,21 +186,6 @@ pub enum DecoderProfile {
     Accurate,
 }
 
-/// Modo de deinterlacing (`[decoder] deinterlace` no ironstream.toml).
-///
-/// SPEC-AV-005
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeinterlaceChoice {
-    /// Detecta entrelaçamento via SPS / field_order / flags de frame.
-    #[default]
-    Auto,
-    /// Força bwdif em todo vídeo.
-    Force,
-    /// Desativa deinterlacing.
-    Off,
-}
-
 /// Configurações do decodificador FFmpeg (bloco `[decoder]` no ironstream.toml).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -219,10 +204,6 @@ pub struct DecoderConfig {
     /// `accurate` sobrescreve ambos para `false`.
     /// `default` usa os valores individuais acima.
     pub profile: DecoderProfile,
-    /// Modo de deinterlacing para vídeo entrelaçado (bwdif).
-    ///
-    /// SPEC-AV-005
-    pub deinterlace: DeinterlaceChoice,
 }
 
 impl Default for DecoderConfig {
@@ -236,7 +217,6 @@ impl Default for DecoderConfig {
             skip_loop_filter: true,
             flag2_fast: false,
             profile: DecoderProfile::Default,
-            deinterlace: DeinterlaceChoice::Auto,
         }
     }
 }
@@ -515,13 +495,6 @@ window_height = 1080
         assert!(cfg.ui.dark_theme);
         assert_eq!(cfg.ui.window_width, 1400);
         assert_eq!(cfg.ui.window_height, 900);
-    }
-
-    /// SPEC-CFG-001 — bloco [decoder] padrão inclui deinterlace auto.
-    #[test]
-    fn spec_cfg_001_decoder_deinterlace_default_is_auto() {
-        let cfg = AppConfig::default();
-        assert_eq!(cfg.decoder.deinterlace, DeinterlaceChoice::Auto);
     }
 
     /// SPEC-CFG-001 — bloco [decoder] padrão: conservador (flags desabilitadas)

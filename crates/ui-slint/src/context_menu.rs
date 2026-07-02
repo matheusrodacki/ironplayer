@@ -2,7 +2,7 @@
 
 use slint::{ModelRc, SharedString, VecModel};
 
-use crate::state::{AppState, AspectRatioMode, ConnectionState, HwAccelChoice};
+use crate::state::{AppState, AspectRatioMode, ConnectionState, DeinterlaceProfileChoice, HwAccelChoice};
 use crate::MenuEntry;
 use ts::tables::PmtStream;
 use ts::Pid;
@@ -13,7 +13,9 @@ pub fn build_menu_models(
     state: &AppState,
     aspect_ratio: AspectRatioMode,
     hwaccel_choice: HwAccelChoice,
+    deinterlace_choice: DeinterlaceProfileChoice,
 ) -> (
+    ModelRc<MenuEntry>,
     ModelRc<MenuEntry>,
     ModelRc<MenuEntry>,
     ModelRc<MenuEntry>,
@@ -28,6 +30,7 @@ pub fn build_menu_models(
         ModelRc::new(VecModel::from(build_audio(state, connected))),
         ModelRc::new(VecModel::from(build_subtitles(state))),
         ModelRc::new(VecModel::from(build_aspect(aspect_ratio))),
+        ModelRc::new(VecModel::from(build_deinterlace(deinterlace_choice))),
         ModelRc::new(VecModel::from(build_decode(hwaccel_choice))),
     )
 }
@@ -187,6 +190,22 @@ fn build_aspect(mode: AspectRatioMode) -> Vec<MenuEntry> {
             active,
             enabled: true,
         }
+    })
+    .collect()
+}
+
+fn build_deinterlace(current: DeinterlaceProfileChoice) -> Vec<MenuEntry> {
+    [
+        (DeinterlaceProfileChoice::Performance, "Performance (GPU)", 0),
+        (DeinterlaceProfileChoice::Quality, "Qualidade (bwdif)", 1),
+        (DeinterlaceProfileChoice::Off, "Desligado", 2),
+    ]
+    .into_iter()
+    .map(|(mode, label, id)| MenuEntry {
+        label: SharedString::from(label),
+        id,
+        active: mode == current,
+        enabled: true,
     })
     .collect()
 }

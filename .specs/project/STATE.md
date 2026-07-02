@@ -160,6 +160,25 @@ POC da UI Slint (spec-11-slint, [D-009](#decisões-arquiteturais)). Em uso ao vi
 
 Refs: `crates/ui-slint/src/video.rs` (conversão CPU), `crates/ui-slint/src/lib.rs` (`VideoState`, worker `slint-video-convert`), `crates/av/src/renderer.rs` (pipelines GPU de referência), `.specs/features/spec-11-slint/plan.md`.
 
+### L-007 — Zero-copy GPU validado; vídeo picotado no Slint era timer/render-loop, não decode (2026-07-02)
+
+Debug do sintoma "GPU decode não funciona no feat/slint, no main funcionava". Stream real 1080i H.264 (TSDuck replay). A/B contra `main` (`71bcdbd`, ponto de branch) no mesmo stream, via `git worktree`.
+
+| Sintoma | Causa raiz | Invariante obrigatória |
+| ------- | ---------- | ----------------------- |
+| Achou-se que HW decode "não funcionava" | Conteúdo 1080i força bwdif (CPU-only) → decoder migra HW→SW (`decoder.rs` ~l.696). **Idêntico ao `main`** — não é regressão; é arquitetural (confirmado por diff + teste A/B) | Não "consertar" a migração HW→SW no deinterlace; ela é esperada e correta |
+| Zero-copy GPU (Fase 2, [zero-copy-plan.md](../features/spec-11-slint/zero-copy-plan.md)) tratado como não-validado | Validado em runtime com HW real (`deinterlace=off`, teste): 720/720 frames compartilhados, zero falhas de fence/import | Ao mexer em `SharedNvImporter`/`shared_nv12.rs`, validar com os mesmos contadores (ok/fence_wait_skips/import_fail) antes de merge |
+| Vídeo do Slint a ~17 fps com 3000+ frames tardios (até 9,6 s de atraso) vs 31 fps constante e 0 drops no `main`, no mesmo stream 1080i (decode SW em ambos) | (1) `ironstream.toml` de teste desatualizado; (2) `VideoState::poll` tirava **1 frame por tick** de um timer que caía a ~25 Hz sob carga de render → fila envelhecia além do `DROP_PTS` (100 ms); (3) timer de 16 ms + `request_redraw` por frame batia de fase com o vsync; (4) femtovg redesenha a cena inteira por frame sem cache | Ver checklist completo e fixes em [perf-debug-1080i.md](../features/spec-11-slint/perf-debug-1080i.md) |
+
+**Fixes aplicados (não regredir):**
+1. `VideoState::poll()` drena toda a janela `Ready` da `VideoQueue` num tick e devolve o frame mais recente — não voltar a "1 pop por tick".
+2. Modo GPU: o poll de vídeo roda em `RenderingState::BeforeRendering`/redraw agendado em `AfterRendering` (render-loop contínuo alinhado ao vsync) — não voltar a timer+`request_redraw` desacoplado.
+3. `cache-rendering-hint: true` nos blocos estáticos do `appwindow.slint` (painel esquerdo, top bar, status bar, `ChartCard`, `InfoCard`).
+
+**Pendência em aberto:** fill-rate do femtovg ainda limita a ~21 fps em 1400×900 (cena completa ~29 ms/frame > 16.7 ms de vsync) — o custo é desenhar a UI ao redor do vídeo, não o vídeo em si. Três opções não implementadas (Skia bloqueado por `+crt-static` e sem zero-copy de textura wgpu; software renderer com partial-render mas sem zero-copy; otimizar mais a cena femtovg) — decisão de arquitetura pendente do usuário. Detalhes completos: [perf-debug-1080i.md](../features/spec-11-slint/perf-debug-1080i.md).
+
+Refs: `crates/ui-slint/src/lib.rs` (`VideoState::poll`, `run`, `set_rendering_notifier`), `crates/ui-slint/ui/appwindow.slint` (`cache-rendering-hint`), `crates/av/src/hw/shared_nv12.rs`, `crates/av/src/renderer.rs` (`SharedNvImporter`).
+
 ---
 
 ## Pendências
@@ -168,6 +187,6 @@ Refs: `crates/ui-slint/src/video.rs` (conversão CPU), `crates/ui-slint/src/lib.
 - [ ] Criar script de geração de fixtures sintéticas para tabelas DVB
 - [ ] Escolher entre `tokio::sync::watch` vs `arc-swap` para snapshot da UI
 - [ ] Definir política de versionamento semântico (SemVer vs CalVer)
-- [ ] **Zero-copy GPU para a UI Slint** (`slint::wgpu_28`) — resolver o stutter de vídeo (cf. L-006)
+- [ ] **Fill-rate do femtovg na UI Slint** — cena completa ~29 ms/frame em 1400×900 (>16.7 ms de vsync), caps o vídeo a ~21 fps; decidir entre Skia (bloqueado por `+crt-static` + sem zero-copy wgpu), software renderer (partial-render mas sem zero-copy) ou otimizar a cena femtovg (cf. L-007)
 - [ ] Abas Tabelas/Serviços do Slint: detalhar conteúdo (árvore PSI/SI, EIT p/f) além da grade/lista atual
 - [ ] Avaliar migrar o modo **Cinema** para Slint (hoje só stub visual no toggle)

@@ -15,7 +15,7 @@ pub use state::{
     AudioStatusSnapshot, AudioTrackInfo, ConnectionState, HwAccelChoice, TableEvent, TablesSnapshot,
 };
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock};
@@ -165,7 +165,7 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
                 av::set_gpu_zero_copy_enabled(hw_zc);
                 tracing::info!(hw_zero_copy = hw_zc, "vídeo: pipeline GPU ativo");
                 let bridge = Arc::new(GpuVideoBridge::new(renderer));
-                (RenderMode::Gpu(bridge.clone()), Some(bridge))
+                (RenderMode::Gpu, Some(bridge))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "vídeo: VideoRenderer GPU falhou; fallback CPU");
@@ -175,18 +175,57 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         None => (spawn_cpu_worker(), None),
     };
 
-    // GPU: converte YUV→RGBA no `BeforeRendering` do Slint (mesmo ciclo de
-    // apresentação), em vez de bloquear o timer da UI com `queue.submit`.
-    if let Some(bridge) = gpu_bridge {
+    // ── Estado de vídeo compartilhado entre o timer e o rendering notifier ──
+    let video_state = Rc::new(RefCell::new(VideoState::new(
+        handles.video_frames_rx,
+        handles.audio_clock_rx,
+    )));
+    let video_dims_shared: Rc<Cell<Option<(u32, u32, u32, u32)>>> = Rc::new(Cell::new(None));
+
+    // Modo GPU: o vídeo é dirigido pelo PRÓPRIO ciclo de render do Slint
+    // (render-loop contínuo alinhado ao vsync), não pelo timer da UI.
+    //
+    // Por quê: um timer de 16 ms + `request_redraw` por frame cria batimento de
+    // fase com o vsync — cada redraw pedido "no meio" do período espera o
+    // próximo vsync, o que degrada o loop efetivo para bem abaixo de 60 Hz e
+    // afoga a fila de vídeo (frames envelhecem até o drop-late). Ancorando o
+    // poll no `BeforeRendering` e re-agendando o redraw no `AfterRendering`,
+    // o loop roda a 1 render por vsync e o vídeo é amostrado na taxa de
+    // apresentação real.
+    {
         let weak = window.as_weak();
+        let video = video_state.clone();
+        let dims_cell = video_dims_shared.clone();
+        let bridge_opt = gpu_bridge;
         if let Err(e) = window.window().set_rendering_notifier(move |state, _api| {
-            if !matches!(state, RenderingState::BeforeRendering) {
-                return;
+            match state {
+                RenderingState::BeforeRendering => {
+                    let Some(bridge) = &bridge_opt else {
+                        return;
+                    };
+                    let Some(win) = weak.upgrade() else {
+                        return;
+                    };
+                    if let Some(frame) = video.borrow_mut().poll() {
+                        dims_cell.set(Some((
+                            frame.width(),
+                            frame.height(),
+                            frame.sar_num(),
+                            frame.sar_den(),
+                        )));
+                        bridge.render_frame(&win, &frame);
+                    }
+                }
+                RenderingState::AfterRendering => {
+                    // Render-loop contínuo (modo GPU): agenda o próximo ciclo.
+                    if bridge_opt.is_some() {
+                        if let Some(win) = weak.upgrade() {
+                            win.window().request_redraw();
+                        }
+                    }
+                }
+                _ => {}
             }
-            let Some(win) = weak.upgrade() else {
-                return;
-            };
-            bridge.render_pending(&win);
         }) {
             tracing::warn!(error = ?e, "slint: set_rendering_notifier falhou");
         }
@@ -211,7 +250,8 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         hwaccel_choice,
         video_dims: None,
         tick: 0,
-        video: VideoState::new(handles.video_frames_rx, handles.audio_clock_rx),
+        video: video_state,
+        video_dims_shared,
         render,
     };
 
@@ -234,34 +274,23 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
 // Ponte GPU: timing no timer, render no BeforeRendering do Slint
 // ---------------------------------------------------------------------------
 
-/// Estado compartilhado entre o timer (timing A/V) e o `RenderingNotifier`
-/// (conversão YUV→RGBA na GPU, sincronizada com o ciclo de apresentação).
+/// Renderer GPU de vídeo invocado pelo `RenderingNotifier` a cada ciclo de
+/// apresentação (conversão YUV→RGBA na GPU + import como `slint::Image`).
 struct GpuVideoBridge {
-    pending: Mutex<Option<VideoFrame>>,
     renderer: Mutex<av::VideoRenderer>,
 }
 
 impl GpuVideoBridge {
     fn new(renderer: av::VideoRenderer) -> Self {
         Self {
-            pending: Mutex::new(None),
             renderer: Mutex::new(renderer),
         }
     }
 
-    /// Enfileira o frame mais recente (descarta o anterior se ainda não exibido).
-    fn set_pending(&self, frame: VideoFrame) {
-        *self.pending.lock().expect("gpu bridge pending") = Some(frame);
-    }
-
     /// Chamado em `RenderingState::BeforeRendering` — roda o shader e atualiza a `Image`.
-    fn render_pending(&self, win: &AppWindow) {
-        let frame = self.pending.lock().expect("gpu bridge pending").take();
-        let Some(frame) = frame else {
-            return;
-        };
+    fn render_frame(&self, win: &AppWindow, frame: &VideoFrame) {
         let mut renderer = self.renderer.lock().expect("gpu bridge renderer");
-        if let Some(tex) = renderer.render_to_texture(&frame) {
+        if let Some(tex) = renderer.render_to_texture(frame) {
             match Image::try_from(tex) {
                 Ok(img) => {
                     win.set_video_frame(img);
@@ -282,7 +311,9 @@ impl GpuVideoBridge {
 /// Estratégia de exibição de vídeo escolhida no boot.
 enum RenderMode {
     /// GPU: shader YUV/NV12 → textura RGBA importada como `slint::Image`.
-    Gpu(Arc<GpuVideoBridge>),
+    /// O render em si roda no `RenderingNotifier` (ver `run`); aqui só marca
+    /// o modo para o `Poller` saber que não deve fazer o poll/upload em CPU.
+    Gpu,
     /// CPU: thread worker converte para `SharedPixelBuffer` RGBA.
     Cpu {
         frame_tx: Sender<VideoFrame>,
@@ -407,7 +438,12 @@ struct Poller {
     /// Dimensões do último frame `(width, height)` corrigidas por SAR.
     video_dims: Option<(u32, u32)>,
     tick: u64,
-    video: VideoState,
+    /// Estado de vídeo (fila + clock), compartilhado com o rendering notifier
+    /// no modo GPU (o notifier faz o poll; o tick lê métricas/reset).
+    video: Rc<RefCell<VideoState>>,
+    /// Dims do último frame `(w, h, sar_num, sar_den)` gravadas pelo caminho
+    /// ativo (notifier GPU ou poll CPU) e consumidas no tick.
+    video_dims_shared: Rc<Cell<Option<(u32, u32, u32, u32)>>>,
     /// Estratégia de exibição (GPU zero-copy ou CPU via worker).
     render: RenderMode,
 }
@@ -416,28 +452,37 @@ impl Poller {
     fn tick(&mut self, win: &AppWindow) {
         self.tick = self.tick.wrapping_add(1);
 
-        // Vídeo a cada tick (~60 Hz): resolve o timing; render GPU no notifier.
-        if let Some(frame) = self.video.poll() {
-            self.update_video_dims(&frame);
-            match &self.render {
-                RenderMode::Gpu(bridge) => {
-                    bridge.set_pending(frame);
-                    win.window().request_redraw();
-                }
-                RenderMode::Cpu { frame_tx, .. } => {
+        match &self.render {
+            // GPU: o vídeo é dirigido pelo rendering notifier (render-loop
+            // contínuo). Aqui apenas garantimos que o loop não morra (janela
+            // recém-mostrada, oclusão etc.) — request_redraw é coalescido.
+            RenderMode::Gpu => {
+                win.window().request_redraw();
+            }
+            // CPU: fluxo original — poll no tick + conversão na worker thread.
+            RenderMode::Cpu { frame_tx, img_rx } => {
+                if let Some(frame) = self.video.borrow_mut().poll() {
+                    self.video_dims_shared.set(Some((
+                        frame.width(),
+                        frame.height(),
+                        frame.sar_num(),
+                        frame.sar_den(),
+                    )));
                     let _ = frame_tx.try_send(frame);
+                }
+                let mut latest = None;
+                while let Ok(buf) = img_rx.try_recv() {
+                    latest = Some(buf);
+                }
+                if let Some(buf) = latest {
+                    win.set_video_frame(Image::from_rgba8(buf));
+                    win.set_video_has_signal(true);
                 }
             }
         }
-        if let RenderMode::Cpu { img_rx, .. } = &self.render {
-            let mut latest = None;
-            while let Ok(buf) = img_rx.try_recv() {
-                latest = Some(buf);
-            }
-            if let Some(buf) = latest {
-                win.set_video_frame(Image::from_rgba8(buf));
-                win.set_video_has_signal(true);
-            }
+        // Dims gravadas pelo caminho ativo (notifier GPU ou poll CPU acima).
+        if let Some((w, h, sar_num, sar_den)) = self.video_dims_shared.take() {
+            self.update_video_dims_raw(w, h, sar_num, sar_den);
         }
 
         // Métricas/tabelas a ~4 Hz (snapshots chegam a 1 Hz).
@@ -448,11 +493,14 @@ impl Poller {
         // Contadores de sync A/V da VideoQueue — o aggregator (`ts`) sempre os
         // publica zerados; é responsabilidade da UI sobrescrevê-los aqui a
         // partir da fila/clock real de vídeo (ver doc de `MetricsSnapshot`).
-        self.state.metrics.video_queue_depth = self.video.queue.len() as u16;
-        self.state.metrics.late_frames_dropped = self.video.queue.dropped_late;
-        self.state.metrics.early_frames_held = self.video.queue.held_early;
-        self.state.metrics.pts_discontinuities = self.video.queue.discontinuities;
-        self.state.metrics.av_sync_offset_ms = self.video.last_sync_offset_ms;
+        {
+            let video = self.video.borrow();
+            self.state.metrics.video_queue_depth = video.queue.len() as u16;
+            self.state.metrics.late_frames_dropped = video.queue.dropped_late;
+            self.state.metrics.early_frames_held = video.queue.held_early;
+            self.state.metrics.pts_discontinuities = video.queue.discontinuities;
+            self.state.metrics.av_sync_offset_ms = video.last_sync_offset_ms;
+        }
 
         if refresh_meta {
             self.apply_to_window(win);
@@ -477,14 +525,10 @@ impl Poller {
         self.last_snapshot_ts = None;
         self.seen_jitter = 0;
         self.video_dims = None;
-        self.video.reset();
+        self.video.borrow_mut().reset();
     }
 
-    fn update_video_dims(&mut self, frame: &VideoFrame) {
-        let frame_w = frame.width();
-        let frame_h = frame.height();
-        let sar_num = frame.sar_num();
-        let sar_den = frame.sar_den();
+    fn update_video_dims_raw(&mut self, frame_w: u32, frame_h: u32, sar_num: u32, sar_den: u32) {
         let display_h = if sar_num > 1 || sar_den > 1 {
             let h64 = frame_h as u64 * sar_den as u64;
             (h64 / sar_num.max(1) as u64) as u32
@@ -749,27 +793,40 @@ impl VideoState {
             }
         }
 
-        // 3. Extrai próximo frame pronto.
+        // 3. Extrai o frame pronto MAIS RECENTE, drenando a janela Ready
+        //    inteira num único tick.
+        //
+        //    O timer da UI (16 ms nominal) pode rodar abaixo da taxa do stream
+        //    quando o event loop está ocupado com render (medido ~25 Hz em
+        //    1080i com a cena completa). Extrair apenas 1 frame por tick faria
+        //    a fila acumular atraso até o drop-late de 100 ms (vídeo picotado).
+        //    Drenar até TooEarly/Empty e exibir o último Ready mantém a
+        //    apresentação presa ao clock, não à cadência do timer.
         let allow_resync = self.clock.audio_handle().is_none();
         let clock_pts = self.clock.now_pts90();
-        match self.queue.pop_ready_with_resync(clock_pts, allow_resync) {
-            PopResult::Ready(f) => {
-                if let Some(pts) = f.pts() {
-                    self.last_sync_offset_ms = ((pts as i64 - clock_pts) / 90) as i32;
+        let mut newest: Option<VideoFrame> = None;
+        loop {
+            match self.queue.pop_ready_with_resync(clock_pts, allow_resync) {
+                PopResult::Ready(f) => {
+                    if let Some(pts) = f.pts() {
+                        self.last_sync_offset_ms = ((pts as i64 - clock_pts) / 90) as i32;
+                    }
+                    // Continua: pode haver um frame mais novo já dentro da janela.
+                    newest = Some(f);
                 }
-                Some(f)
+                PopResult::Resync { frame, new_anchor } => {
+                    if allow_resync {
+                        self.clock.reset(new_anchor);
+                    }
+                    if let Some(pts) = frame.pts() {
+                        self.last_sync_offset_ms = ((pts as i64 - clock_pts) / 90) as i32;
+                    }
+                    return Some(frame);
+                }
+                PopResult::TooEarly | PopResult::Empty => break,
             }
-            PopResult::Resync { frame, new_anchor } => {
-                if allow_resync {
-                    self.clock.reset(new_anchor);
-                }
-                if let Some(pts) = frame.pts() {
-                    self.last_sync_offset_ms = ((pts as i64 - clock_pts) / 90) as i32;
-                }
-                Some(frame)
-            }
-            PopResult::TooEarly | PopResult::Empty => None,
         }
+        newest
     }
 }
 

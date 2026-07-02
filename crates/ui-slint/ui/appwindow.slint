@@ -314,6 +314,8 @@ component ChartCard inherits Rectangle {
     border-radius: Theme.radius;
     border-width: 1px;
     border-color: Theme.border-soft;
+    // Plots (Paths) mudam a ≤4 Hz — cachear evita re-tesselação por frame.
+    cache-rendering-hint: true;
     VerticalLayout {
         padding: 6px;
         spacing: 1px;
@@ -429,6 +431,8 @@ component InfoCard inherits Rectangle {
     border-radius: Theme.radius;
     border-width: 1px;
     border-color: Theme.border-soft;
+    // Texto denso que muda a ≤4 Hz — cachear evita re-shaping por frame.
+    cache-rendering-hint: true;
     VerticalLayout {
         padding: 8px;
         spacing: 2px;
@@ -760,6 +764,7 @@ export component AppWindow inherits Window {
         Rectangle {
             height: 64px;
             background: Theme.panel;
+            cache-rendering-hint: true;
             Rectangle {
                 y: parent.height - 1px;
                 height: 1px;
@@ -965,6 +970,10 @@ export component AppWindow inherits Window {
                 border-radius: Theme.radius;
                 border-width: 1px;
                 border-color: Theme.border;
+                // Conteúdo denso em texto que muda a ≤4 Hz: cachear a subtree
+                // evita re-tesselar/re-shapear tudo a cada frame de vídeo
+                // (femtovg redesenha a cena inteira por frame).
+                cache-rendering-hint: true;
                 VerticalLayout {
                     padding: 14px;
                     spacing: 10px;
@@ -1533,6 +1542,7 @@ export component AppWindow inherits Window {
         Rectangle {
             height: 28px;
             background: Theme.panel;
+            cache-rendering-hint: true;
             Rectangle {
                 y: 0;
                 height: 1px;

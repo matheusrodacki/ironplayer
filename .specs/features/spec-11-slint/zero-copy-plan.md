@@ -125,6 +125,8 @@ Restrição técnica: a wgpu no Windows roda em **DX12**, não D3D11; e as textu
 3. **SW path (Fase 1):** rodar `cargo run`, conectar a um TS H.264/HEVC 8-bit por software; confirmar vídeo correto e medir CPU/GPU. Comparar uso de CPU contra o `main` egui (deve cair drasticamente) e contra o estado Slint atual.
 4. **HDR/10-bit:** stream 4K HDR HEVC 10-bit (PQ) — validar tone mapping e cor corretos (a UI Slint atual erra isso). Cruzar com o log de `current_colorspace_label`/`current_color_range_label`.
 5. **HW path (Fase 2):** com D3D11VA ativo, confirmar `hw_decode_active` e que o caminho compartilhado é usado (log de LUID match + "shared NV12"); verificar ausência de "zig-zag"/tearing em movimento rápido; medir banda (`gpu_upload_bytes_per_sec` deve cair para ~0 no upload de planos HW 8-bit).
+
+   **VALIDADO em 2026-07-02** com stream 1080i H.264 real (D3D11VA, `deinterlace=off` para manter HW ativo): 720/720 frames via `SharedNvImporter` sem nenhuma falha de fence ou import. Ver [perf-debug-1080i.md](perf-debug-1080i.md) e [STATE.md L-007](../../project/STATE.md#lições-aprendidas). Nota: com conteúdo 1080i e `deinterlace=auto` (produção), o decoder migra para SW por causa do bwdif e o caminho zero-copy não é exercido — comportamento idêntico ao `main`, não é regressão.
 6. **Fallback:** forçar falha de wgpu (ex.: `WGPU_BACKEND` inválido / desabilitar GPU) e confirmar que cai no femtovg/GL + conversão CPU sem crashar.
 7. **Telemetria de performance:** comparar frame pacing/dropped frames (instrumentação em `src/main.rs`) antes/depois.
 

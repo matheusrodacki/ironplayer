@@ -183,6 +183,20 @@ Refs: `crates/ui-slint/src/lib.rs` (`VideoState::poll`, `run`, `set_rendering_no
 
 Perfil **Performance** em 1080i: o D3D11 Video Processor em modo bob/adaptive pode emitir 2× taxa de campos (50p/59.94p). PTS de saída: `field_pts + n * (time_base/2)` para alinhar com `AudioClock` 90 kHz — ver `vp_output_pts` em `crates/av/src/hw/d3d11_vp.rs`. Perfil **Quality** mantém o rescale bwdif (÷2) documentado em L-003.
 
+### L-009 — D3D11 VP: driver Intel rejeita refs past/future no Blt (2026-07-02)
+
+Sintoma: perfil Performance sempre caía para Quality (bwdif/CPU) — a UI mostrava decode CPU mesmo com Performance selecionado. Causa raiz: `VideoProcessorBlt` retornava `E_INVALIDARG (0x80070057)` na primeira chamada; o tratamento de erro em `decoder.rs` faz fallback permanente por PID para Quality, então uma única falha do VP derrubava o perfil inteiro.
+
+O driver Intel Arc anuncia `PastFrames`/`FutureFrames` > 0 nos `RateConversionCaps`, mas rejeita qualquer referência real (subresource diferente do frame atual) — confirmado isolando 15+ combinações (output rate, rects, frame rates, `VIDEO_SUPPORT`, texturas separadas) em `crates/av/examples/vp_probe.rs`. Refs só "passam" quando degeneram para o mesmo subresource do frame atual (e são ignoradas). É o mesmo approach do mpv `vf_d3d11vpp` — não passar refs.
+
+**Invariante obrigatória:** `D3d11VideoProcessor::process` sempre chama `VideoProcessorBlt` com `PastFrames: 0, FutureFrames: 0`. Não reintroduzir fila de referências sem validar primeiro com `vp_probe` no driver alvo (o comportamento não é documentado pela MSDN e pode variar por vendor/driver).
+
+### L-010 — `TableEvent::Reset` não deve rodar em troca de serviço/perfil (2026-07-02)
+
+Sintoma: ao trocar de serviço (canal) ou de perfil de deinterlace pelo menu, o menu de contexto, a aba Tabelas e a aba Serviços ficavam vazios e não era mais possível trocar de serviço/vídeo/áudio/legenda. Causa: `on_service_changed` (`table_dispatcher.rs`) e o handler de `SetDeinterlace` (`main.rs`) emitiam `TableEvent::Reset`, que zera `TablesSnapshot` (PAT/PMT/SDT cacheados) inteiro na UI. Como o dispatcher deduplica seções por versão, PAT/PMT/SDT já vistas não são reenviadas — a UI ficava permanentemente vazia até o broadcaster subir uma nova versão das tabelas.
+
+**Invariante obrigatória:** operações que só precisam descartar frames de vídeo obsoletos (troca de serviço, troca de perfil de deinterlace) devem emitir `TableEvent::ResetVideo`, não `TableEvent::Reset`. `Reset` é reservado para reset completo de stream (reconexão). Ver teste de regressão `spec_integration_service_switch_via_ui_resets_decoder` em `table_dispatcher.rs`.
+
 ---
 
 ## Pendências

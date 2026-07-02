@@ -40,6 +40,20 @@ mantém HW sem deinterlace (campos visíveis, útil para debug zero-copy).
 O controle de deinterlace é exclusivamente via menu de contexto Slint
 (seção **Deinterlace**); não há mais `[decoder] deinterlace` no TOML.
 
+**Bug validado e corrigido (2026-07-02):** perfil Performance sempre caía
+para Quality — `VideoProcessorBlt` retornava `E_INVALIDARG` porque o driver
+Intel Arc rejeita frames de referência past/future reais (mesmo anunciando
+suporte nos `RateConversionCaps`). Ver `L-009` em
+[STATE.md](../../project/STATE.md) e `crates/av/examples/vp_probe.rs`.
+
+Após o fix (Blt sem refs, `PastFrames: 0, FutureFrames: 0`), validado em
+execução real com stream 1080i via multicast: `D3D11 Video Processor
+ativado` sem nenhum fallback, 1684 frames processados pelo VP com PTS
+monotônico em passos de 3003 ticks (29.97p), 1424/1424 frames renderizados
+com `tex_handle ≠ 0` (zero-copy GPU completo, 0 esperas de fence). **Não
+reintroduzir fila de referências no VP sem revalidar com `vp_probe` no
+driver alvo.**
+
 ### 2. Vídeo picotado no Slint (REGRESSÃO real, corrigida)
 
 Comparação A/B no mesmo stream 1080i (decode SW nos dois, por causa do item 1):

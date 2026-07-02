@@ -545,12 +545,17 @@ impl TableDispatcher {
         }
 
         // Reinicia o decodificador e a fila de vídeo na UI (frames antigos).
+        //
+        // Usa `TableEvent::ResetVideo` (não `Reset`): a troca de serviço não
+        // deve derrubar o cache PAT/PMT/SDT já recebido nem o menu de
+        // contexto — o dispatcher deduplica seções por versão e não as
+        // reenviaria, deixando a UI sem dados até uma nova versão chegar.
         if should_reset_decoder {
             if self.decode_tx.try_send(DecodeCommand::Reset).is_err() {
                 warn!("canal decode-control cheio — Reset descartado");
             }
-            if !self.tx.try_send(TableEvent::Reset) {
-                warn!("canal table-events cheio — Reset UI descartado");
+            if !self.tx.try_send(TableEvent::ResetVideo) {
+                warn!("canal table-events cheio — ResetVideo UI descartado");
             }
         }
 
@@ -1558,7 +1563,7 @@ mod tests {
     #[test]
     fn spec_integration_service_switch_via_ui_resets_decoder() {
         let (_sections_tx, sections_rx) = crossbeam_channel::bounded(64);
-        let (table_events_tx, _table_events_rx) = crossbeam_channel::bounded(64);
+        let (table_events_tx, table_events_rx) = crossbeam_channel::bounded(64);
         let (demux_cmd_tx, demux_cmd_rx) = crossbeam_channel::bounded(64);
         let (pes_cmd_tx, pes_cmd_rx) = crossbeam_channel::bounded(64);
         let (decode_cmd_tx, decode_cmd_rx) = crossbeam_channel::bounded(64);
@@ -1622,6 +1627,23 @@ mod tests {
             decode_cmd_rx.try_recv().unwrap(),
             DecodeCommand::Reset,
             "DecodeCommand::Reset deve ser enviado ao trocar de serviço"
+        );
+        // Regressão: troca de serviço deve emitir ResetVideo (só limpa a fila
+        // de vídeo), NUNCA Reset — que apagaria PAT/PMT/SDT cacheados e o
+        // menu de contexto da UI, impedindo trocas subsequentes até uma nova
+        // versão das tabelas chegar (o dispatcher deduplica por versão e não
+        // as reenviaria).
+        let table_events: Vec<TableEvent> =
+            std::iter::from_fn(|| table_events_rx.try_recv().ok()).collect();
+        assert!(
+            table_events
+                .iter()
+                .any(|e| matches!(e, TableEvent::ResetVideo)),
+            "troca de serviço deve emitir TableEvent::ResetVideo: {table_events:?}"
+        );
+        assert!(
+            !table_events.iter().any(|e| matches!(e, TableEvent::Reset)),
+            "troca de serviço NÃO deve emitir TableEvent::Reset (apagaria tabelas/menu): {table_events:?}"
         );
         while pes_cmd_rx.try_recv().is_ok() {}
     }

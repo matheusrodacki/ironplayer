@@ -2,7 +2,6 @@
 //!
 //! SPEC-AV-006
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use windows::core::Interface;
@@ -26,26 +25,6 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL;
 use crate::error::AvError;
 use crate::hw::{D3d11Texture, SharedNvFrame, SharedNvPool};
 
-// #region agent log
-fn agent_log(hypothesis_id: &str, location: &str, message: &str, data_json: &str) {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let line = format!(
-        r#"{{"sessionId":"831551","hypothesisId":"{hypothesis_id}","location":"{location}","message":"{message}","data":{data_json},"timestamp":{ts}}}"#
-    );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("debug-831551.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{line}");
-    }
-}
-// #endregion
-
 const DEINT_MODE_ADAPTIVE: u32 = 0x4;
 const DEINT_MODE_BOB: u32 = 0x2;
 
@@ -57,12 +36,14 @@ pub struct VpOutput {
     pub pts: Option<u64>,
 }
 
-struct PendingFrame {
-    input_view: ID3D11VideoProcessorInputView,
-    field_pts: i64,
-}
-
 /// Processador D3D11 VP por PID.
+///
+/// NOTA (driver Intel Arc): `VideoProcessorBlt` retorna `E_INVALIDARG` quando
+/// `ppPastSurfaces`/`ppFutureSurfaces` apontam para subresources diferentes do
+/// frame atual — mesmo com contagens iguais aos caps reportados (validado em
+/// `examples/vp_probe.rs`, casos G/N/Q/R–X). Por isso o Blt é submetido **sem**
+/// frames de referência (mesmo approach do mpv `vf_d3d11vpp`); o driver aplica
+/// o deinterlace adaptativo com histórico interno próprio.
 ///
 /// SPEC-AV-006
 pub struct D3d11VideoProcessor {
@@ -74,12 +55,6 @@ pub struct D3d11VideoProcessor {
     width: u32,
     height: u32,
     input_format: D3D11_VIDEO_FRAME_FORMAT,
-    num_past_frames: u32,
-    num_future_frames: u32,
-    /// Frames já processados (referência past para adaptive DI).
-    past: VecDeque<ID3D11VideoProcessorInputView>,
-    /// Fila aguardando referências future.
-    pending: VecDeque<PendingFrame>,
     time_base_num: i32,
     time_base_den: i32,
     last_field_pts: Option<i64>,
@@ -154,17 +129,7 @@ impl D3d11VideoProcessor {
                 .map_err(|e| AvError::HwInitFailed(format!("CreateVideoProcessor: {e}")))?
         };
 
-        let mut num_past = rc_caps.PastFrames;
-        let mut num_future = rc_caps.FutureFrames;
         let processor_caps = rc_caps.ProcessorCaps;
-
-        // BOB/blend não usam ref frames (mpv vf_d3d11vpp.c).
-        if (processor_caps & DEINT_MODE_BOB) == DEINT_MODE_BOB
-            && (processor_caps & DEINT_MODE_ADAPTIVE) != DEINT_MODE_ADAPTIVE
-        {
-            num_past = 0;
-            num_future = 0;
-        }
 
         configure_processor(
             &video_context,
@@ -174,16 +139,13 @@ impl D3d11VideoProcessor {
             input_format,
         );
 
-        // #region agent log
-        agent_log(
-            "R",
-            "d3d11_vp.rs:new",
-            "VP caps selected",
-            &format!(
-                r#"{{"rate_index":{rate_index},"processor_caps":{processor_caps},"past":{num_past},"future":{num_future}}}"#
-            ),
+        tracing::debug!(
+            rate_index,
+            processor_caps,
+            caps_past = rc_caps.PastFrames,
+            caps_future = rc_caps.FutureFrames,
+            "D3D11 VP: rate conversion cap selecionado"
         );
-        // #endregion
 
         Ok(Self {
             video_device,
@@ -194,10 +156,6 @@ impl D3d11VideoProcessor {
             width,
             height,
             input_format,
-            num_past_frames: num_past,
-            num_future_frames: num_future,
-            past: VecDeque::with_capacity(num_past as usize + 1),
-            pending: VecDeque::with_capacity((num_future + 2) as usize),
             time_base_num,
             time_base_den,
             last_field_pts: None,
@@ -245,40 +203,13 @@ impl D3d11VideoProcessor {
         let half_step = self.half_frame_pts_step(field_pts);
         self.last_field_pts = Some(field_pts);
 
+        let current_pts = field_pts;
         let input_view = create_input_view(
             &self.video_device,
             &self.enumerator,
             tex.d3d11_texture(),
             tex.array_slice,
         )?;
-
-        self.pending.push_back(PendingFrame {
-            input_view,
-            field_pts,
-        });
-
-        let needed = 1usize + self.num_future_frames as usize;
-        if self.pending.len() < needed {
-            return Ok(Vec::new());
-        }
-
-        let current_pts = self.pending[0].field_pts;
-        let current_view = self.pending[0].input_view.clone();
-
-        let mut past_views: Vec<Option<ID3D11VideoProcessorInputView>> = self
-            .past
-            .iter()
-            .rev()
-            .take(self.num_past_frames as usize)
-            .map(|v| Some(v.clone()))
-            .collect();
-        past_views.reverse();
-        let past_count = past_views.len() as u32;
-
-        let mut future_views: Vec<Option<ID3D11VideoProcessorInputView>> = (1..=self.num_future_frames as usize)
-            .filter_map(|i| self.pending.get(i).map(|pf| Some(pf.input_view.clone())))
-            .collect();
-        let future_count = future_views.len() as u32;
 
         unsafe {
             self.video_context.VideoProcessorSetStreamFrameFormat(
@@ -299,46 +230,37 @@ impl D3d11VideoProcessor {
         // HALF rate: 1 frame progressivo por frame entrelaçado (25p/29.97p).
         let input_frame_or_field = self.output_seq * 2;
 
+        // Sem refs past/future: ver NOTA no doc da struct (quirk driver Intel).
         let stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             OutputIndex: 0,
             InputFrameOrField: input_frame_or_field,
-            PastFrames: past_count,
-            FutureFrames: future_count,
-            ppPastSurfaces: if past_views.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                past_views.as_mut_ptr()
-            },
-            pInputSurface: std::mem::ManuallyDrop::new(Some(current_view)),
-            ppFutureSurfaces: if future_views.is_empty() {
-                std::ptr::null_mut()
-            } else {
-                future_views.as_mut_ptr()
-            },
+            PastFrames: 0,
+            FutureFrames: 0,
+            ppPastSurfaces: std::ptr::null_mut(),
+            pInputSurface: std::mem::ManuallyDrop::new(Some(input_view)),
+            ppFutureSurfaces: std::ptr::null_mut(),
             ppPastSurfacesRight: std::ptr::null_mut(),
             pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
             ppFutureSurfacesRight: std::ptr::null_mut(),
         };
 
+        let blt_result = unsafe {
+            self.video_context.VideoProcessorBlt(
+                &self.processor,
+                &output_view,
+                self.output_seq,
+                std::slice::from_ref(&stream),
+            )
+        };
+        // Libera a input view retida pelo ManuallyDrop antes de propagar erro.
+        let mut stream = stream;
         unsafe {
-            self.video_context
-                .VideoProcessorBlt(
-                    &self.processor,
-                    &output_view,
-                    self.output_seq,
-                    std::slice::from_ref(&stream),
-                )
-                .map_err(|e| AvError::HwInitFailed(format!("VideoProcessorBlt: {e}")))?;
+            std::mem::ManuallyDrop::drop(&mut stream.pInputSurface);
         }
+        blt_result.map_err(|e| AvError::HwInitFailed(format!("VideoProcessorBlt: {e}")))?;
 
         self.output_seq = self.output_seq.wrapping_add(1);
-        if let Some(done) = self.pending.pop_front() {
-            self.past.push_back(done.input_view);
-            while self.past.len() > self.num_past_frames as usize {
-                self.past.pop_front();
-            }
-        }
 
         let shared = pool.finalize_output_slot(
             slot_idx,
@@ -349,17 +271,6 @@ impl D3d11VideoProcessor {
         )?;
 
         let pts = vp_output_pts(current_pts, 0, half_step);
-
-        // #region agent log
-        agent_log(
-            "I",
-            "d3d11_vp.rs:process",
-            "VP deinterlace output",
-            &format!(
-                r#"{{"field_pts":{current_pts},"half_step":{half_step},"out_pts":{pts},"past":{past_count},"future":{future_count}}}"#
-            ),
-        );
-        // #endregion
 
         unsafe {
             self.d3d_context.Flush();

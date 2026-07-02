@@ -219,6 +219,13 @@ impl AudioStatusSnapshot {
 pub enum TableEvent {
     /// Limpa todos os dados PSI/SI do stream atual.
     Reset,
+    /// Limpa apenas a fila/cache de vídeo (frames obsoletos), preservando
+    /// PAT/PMT/SDT já cacheados — usado em troca de serviço dentro do mesmo
+    /// stream, que não deve derrubar o menu de contexto nem as abas
+    /// Tabelas/Serviços.
+    ///
+    /// SPEC-UI-002
+    ResetVideo,
     /// Snapshot mais recente da PAT.
     Pat(Pat),
     /// Snapshot mais recente de uma PMT.
@@ -337,6 +344,9 @@ impl AppState {
     pub fn apply_table_event(&mut self, event: TableEvent) {
         match event {
             TableEvent::Reset => self.reset_stream_data(),
+            // Interceptado por `poll_table_events` antes de chegar aqui (só
+            // afeta a fila de vídeo, não o snapshot de tabelas).
+            TableEvent::ResetVideo => {}
             TableEvent::Pat(pat) => self.tables.pat = Some(pat),
             TableEvent::Pmt(pmt) => {
                 self.tables.pmts.insert(pmt.program_number, pmt);

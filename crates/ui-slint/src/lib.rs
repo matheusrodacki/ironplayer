@@ -26,7 +26,7 @@ use crossbeam_channel::{Receiver, Sender};
 use slint::{Color, ComponentHandle, Image, ModelRc, RenderingState, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use slint::wgpu_29::{wgpu, WGPUConfiguration};
 
-use av::video_queue::{HwSurface, PopResult};
+use av::video_queue::PopResult;
 use av::{Clock, MasterClock, VideoFrame, VideoQueue};
 use ts::metrics::{AudioCodec, MetricsSnapshot, PidEntry, PidType, VideoCodec};
 use ts::{Pid, StreamKind};
@@ -325,32 +325,7 @@ impl GpuVideoBridge {
                 }
             },
             None => {
-                // #region agent log
-                {
-                    use std::io::Write;
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let (handle, pts) = match frame {
-                        VideoFrame::Hw(f) => match &f.surface {
-                            HwSurface::Shared(s) => (s.texture_handle, f.pts),
-                            _ => (0, f.pts),
-                        },
-                        VideoFrame::Sw(f) => (0, f.pts),
-                    };
-                    let line = format!(
-                        r#"{{"sessionId":"831551","hypothesisId":"P","location":"lib.rs:render_frame","message":"render skipped","data":{{"tex_handle":{handle},"pts":{pts:?}}},"timestamp":{ts}}}"#
-                    );
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("debug-831551.log")
-                    {
-                        let _ = writeln!(f, "{line}");
-                    }
-                }
-                // #endregion
+                tracing::trace!("gpu bridge: render_to_texture retornou None — frame descartado");
             }
         }
     }
@@ -568,37 +543,20 @@ impl Poller {
     fn poll_table_events(&mut self, win: &AppWindow) {
         let events: Vec<TableEvent> = self.table_events_rx.try_iter().take(512).collect();
         for event in events {
-            if matches!(event, TableEvent::Reset) {
-                self.reset_stream(win);
-                continue;
+            match event {
+                TableEvent::Reset => {
+                    self.state.reset_stream_data();
+                    self.reset_video(win);
+                }
+                TableEvent::ResetVideo => self.reset_video(win),
+                other => self.state.apply_table_event(other),
             }
-            self.state.apply_table_event(event);
         }
     }
 
-    fn reset_stream(&mut self, win: &AppWindow) {
-        // #region agent log
-        {
-            use std::io::Write;
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let line = format!(
-                r#"{{"sessionId":"831551","hypothesisId":"O","location":"lib.rs:reset_stream","message":"UI stream reset","data":{{"queue_len":{}}},"timestamp":{}}}"#,
-                self.video.borrow().queue.len(),
-                ts
-            );
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("debug-831551.log")
-            {
-                let _ = writeln!(f, "{line}");
-            }
-        }
-        // #endregion
-        self.state.reset_stream_data();
+    /// Limpa a fila/cache de vídeo (frames obsoletos de troca de serviço ou
+    /// reset completo). Não afeta o snapshot de tabelas PSI/SI.
+    fn reset_video(&mut self, win: &AppWindow) {
         self.last_snapshot_ts = None;
         self.seen_jitter = 0;
         self.video_dims = None;

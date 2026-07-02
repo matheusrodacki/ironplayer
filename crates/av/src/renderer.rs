@@ -743,27 +743,6 @@ impl SharedNvImporter {
         // A cópia do produtor já terminou? (Quase sempre sim — frame ficou na
         // fila por dezenas de ms.) Se não, pula este tick.
         if unsafe { fence.GetCompletedValue() } < shared.fence_value {
-            // #region agent log
-            {
-                use std::io::Write;
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let completed = unsafe { fence.GetCompletedValue() };
-                let line = format!(
-                    r#"{{"sessionId":"831551","hypothesisId":"N","location":"renderer.rs:prepare","message":"fence not ready","data":{{"tex_handle":{},"completed":{completed},"needed":{}}},"timestamp":{ts}}}"#,
-                    shared.texture_handle, shared.fence_value
-                );
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("debug-831551.log")
-                {
-                    let _ = writeln!(f, "{line}");
-                }
-            }
-            // #endregion
             return None;
         }
 
@@ -999,25 +978,6 @@ impl VideoRenderer {
         self.out_pool.clear();
         self.out_dims = None;
         self.pool_idx = 0;
-        // #region agent log
-        {
-            use std::io::Write;
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let line = format!(
-                r#"{{"sessionId":"831551","hypothesisId":"M","location":"renderer.rs:reset_shared_cache","message":"out_pool cleared","data":{{}},"timestamp":{ts}}}"#
-            );
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("debug-831551.log")
-            {
-                let _ = writeln!(f, "{line}");
-            }
-        }
-        // #endregion
     }
 
     /// Converte um `VideoFrame` para uma textura `Rgba8Unorm` na GPU.
@@ -1088,7 +1048,6 @@ impl VideoRenderer {
         };
 
         self.ensure_output_pool(w, h);
-        let out_idx = self.pool_idx;
         let tex = self.out_pool[self.pool_idx].clone();
         self.pool_idx = (self.pool_idx + 1) % self.out_pool.len();
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1126,34 +1085,6 @@ impl VideoRenderer {
             }
         }
         self.queue.submit([encoder.finish()]);
-
-        // #region agent log
-        {
-            use std::io::Write;
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let (handle, pts) = match frame {
-                VideoFrame::Hw(f) => match &f.surface {
-                    #[cfg(windows)]
-                    HwSurface::Shared(s) => (s.texture_handle, f.pts),
-                    _ => (0, f.pts),
-                },
-                VideoFrame::Sw(f) => (0, f.pts),
-            };
-            let line = format!(
-                r#"{{"sessionId":"831551","hypothesisId":"M","location":"renderer.rs:render_to_texture","message":"frame rendered","data":{{"out_idx":{out_idx},"tex_handle":{handle},"pts":{pts:?}}},"timestamp":{ts}}}"#
-            );
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("debug-831551.log")
-            {
-                let _ = writeln!(f, "{line}");
-            }
-        }
-        // #endregion
 
         Some(tex)
     }

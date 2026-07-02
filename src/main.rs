@@ -1359,9 +1359,12 @@ fn main() -> anyhow::Result<()> {
                                     "cmd-handler: canal decode_cmd cheio; SetDeinterlace descartado"
                                 );
                             } else {
-                                if !table_events_tx_cmd.try_send(ui_slint::TableEvent::Reset) {
+                                // ResetVideo (não Reset): só a fila de vídeo precisa
+                                // ser descartada; PAT/PMT/SDT e o menu de contexto
+                                // não devem ser afetados pela troca de perfil.
+                                if !table_events_tx_cmd.try_send(ui_slint::TableEvent::ResetVideo) {
                                     tracing::warn!(
-                                        "cmd-handler: canal table-events cheio; Reset UI descartado"
+                                        "cmd-handler: canal table-events cheio; ResetVideo UI descartado"
                                     );
                                 }
                                 tracing::info!(

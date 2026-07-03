@@ -10,6 +10,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
+use slint::Color;
+
 use ts::metrics::{MetricsSnapshot, PcrJitterRecord};
 use ts::tables::{Bat, Cat, EitEvent, Nit, Pat, Pmt, Sdt, Tdt, Tot};
 use ts::MediaInfoCodecSnapshot;
@@ -293,6 +295,27 @@ pub struct TablesSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// PidRecord — registro persistente da tabela de PIDs (padrão "fantasma")
+// ---------------------------------------------------------------------------
+
+/// Última classificação conhecida de um PID, mantida mesmo quando o PID some
+/// da janela deslizante de bitrate (1 s) do aggregator.
+///
+/// Sem isso, um PID de baixa cadência (EIT, dados esparsos, faixa secundária)
+/// aparece e desaparece da lista a cada segundo — padrão comum em analisadores
+/// de TS é nunca remover um PID já visto, só marcá-lo "fantasma" (`ghost`)
+/// enquanto ausente do snapshot mais recente, e reverter assim que reaparecer.
+#[derive(Debug, Clone)]
+pub struct PidRecord {
+    pub kind: String,
+    pub kind_color: Color,
+    pub label: String,
+    pub cc_errors: u64,
+    /// `true` quando o PID não apareceu no snapshot mais recente.
+    pub ghost: bool,
+}
+
+// ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
@@ -320,6 +343,10 @@ pub struct AppState {
     pub pcr_history: HashMap<Pid, VecDeque<PcrJitterRecord>>,
     /// Histórico de offset de sincronismo A/V dos últimos 60 s (em ms).
     pub av_sync_history: VecDeque<(Instant, i32)>,
+    /// Registro persistente de todos os PIDs já vistos no stream atual — ver
+    /// `PidRecord`. Nunca perde entradas por ausência momentânea; só a limpa
+    /// num reset completo do stream.
+    pub pid_registry: HashMap<Pid, PidRecord>,
 }
 
 impl AppState {
@@ -335,6 +362,7 @@ impl AppState {
         self.bitrate_history.clear();
         self.pcr_history.clear();
         self.av_sync_history.clear();
+        self.pid_registry.clear();
         self.audio.reset_stream_runtime(AudioOperationalState::Idle);
     }
 

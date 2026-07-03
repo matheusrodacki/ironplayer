@@ -8,16 +8,17 @@ slint::include_modules!();
 
 mod context_menu;
 mod state;
+mod tree;
 mod video;
 
 pub use state::{
     AppCommand, AppState, AspectRatioMode, AudioErrorSnapshot, AudioOperationalState,
     AudioStatusSnapshot, AudioTrackInfo, ConnectionState, DeinterlaceProfileChoice,
-    HwAccelChoice, TableEvent, TablesSnapshot,
+    HwAccelChoice, PidRecord, TableEvent, TablesSnapshot,
 };
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -28,7 +29,7 @@ use slint::wgpu_29::{wgpu, WGPUConfiguration};
 
 use av::video_queue::PopResult;
 use av::{Clock, MasterClock, VideoFrame, VideoQueue};
-use ts::metrics::{AudioCodec, MetricsSnapshot, PidEntry, PidType, VideoCodec};
+use ts::metrics::{MetricsSnapshot, PidEntry, PidType, VideoCodec};
 use ts::{Pid, StreamKind};
 
 // ---------------------------------------------------------------------------
@@ -72,6 +73,22 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
     let window = AppWindow::new()?;
     window.set_url(SharedString::from(handles.initial_url.as_str()));
 
+    // Modelos persistentes das listas roláveis (PIDs, Serviços, árvore PSI/SI,
+    // Media Info). Trocar `ModelRc` inteira a cada refresh (~4 Hz) força o
+    // ListView a recriar todos os itens — a altura do viewport recalcula
+    // momentaneamente e o clamp de scroll zera a posição, mesmo com o usuário
+    // no meio da lista. Mantendo a MESMA instância de `VecModel` e só
+    // atualizando o conteúdo via `set_vec`, a identidade do modelo não muda e
+    // a posição de rolagem (propriedade do próprio ScrollView) é preservada.
+    let pid_rows_model: Rc<VecModel<PidRow>> = Rc::new(VecModel::from(Vec::<PidRow>::new()));
+    window.set_pid_rows(ModelRc::from(pid_rows_model.clone()));
+    let services_model: Rc<VecModel<ServiceRow>> = Rc::new(VecModel::from(Vec::<ServiceRow>::new()));
+    window.set_services(ModelRc::from(services_model.clone()));
+    let psi_tree_model: Rc<VecModel<TreeRow>> = Rc::new(VecModel::from(Vec::<TreeRow>::new()));
+    window.set_psi_tree(ModelRc::from(psi_tree_model.clone()));
+    let media_rows_model: Rc<VecModel<MediaRow>> = Rc::new(VecModel::from(Vec::<MediaRow>::new()));
+    window.set_media_rows(ModelRc::from(media_rows_model.clone()));
+
     let selected_pid: Rc<RefCell<Option<Pid>>> = Rc::new(RefCell::new(None));
 
     // ── Callbacks → comandos ao backend ───────────────────────────────────
@@ -97,6 +114,48 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
             let pid = pid as Pid;
             *selected.borrow_mut() = Some(pid);
             let _ = cmd_tx.try_send(AppCommand::SelectPid { pid });
+        });
+    }
+
+    // ── Estado local de UI: ordenação/filtro de PIDs e árvore PSI/SI ──────
+    // `force_refresh` faz o próximo tick reaplicar os modelos imediatamente
+    // (sem esperar o ciclo de 4 Hz), para resposta instantânea ao clique.
+    let pid_sort: Rc<Cell<(i32, bool)>> = Rc::new(Cell::new((0, false)));
+    let pid_filter: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let tree_toggled: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+    let force_refresh: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    {
+        let sort = pid_sort.clone();
+        let force = force_refresh.clone();
+        window.on_set_pid_sort(move |col| {
+            let (cur, desc) = sort.get();
+            if cur == col {
+                sort.set((cur, !desc));
+            } else {
+                // PID começa ascendente; KBPS/CC descendentes (maiores primeiro).
+                sort.set((col, col != 0));
+            }
+            force.set(true);
+        });
+    }
+    {
+        let filter = pid_filter.clone();
+        let force = force_refresh.clone();
+        window.on_pid_filter_changed(move |text| {
+            *filter.borrow_mut() = text.to_string();
+            force.set(true);
+        });
+    }
+    {
+        let toggled = tree_toggled.clone();
+        let force = force_refresh.clone();
+        window.on_toggle_node(move |key| {
+            let mut set = toggled.borrow_mut();
+            let key = key.to_string();
+            if !set.remove(&key) {
+                set.insert(key);
+            }
+            force.set(true);
         });
     }
     {
@@ -264,6 +323,14 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         aspect_ratio,
         hwaccel_choice,
         deinterlace_choice,
+        pid_sort,
+        pid_filter,
+        tree_toggled,
+        force_refresh,
+        pid_rows_model,
+        services_model,
+        psi_tree_model,
+        media_rows_model,
         video_dims: None,
         tick: 0,
         video: video_state,
@@ -464,6 +531,20 @@ struct Poller {
     hwaccel_choice: Rc<RefCell<HwAccelChoice>>,
     /// Perfil de deinterlace escolhido no menu de contexto.
     deinterlace_choice: Rc<RefCell<DeinterlaceProfileChoice>>,
+    /// Ordenação da tabela de PIDs `(coluna, descendente)` — 0 PID · 1 KBPS · 2 CC.
+    pid_sort: Rc<Cell<(i32, bool)>>,
+    /// Filtro textual da tabela de PIDs (case-insensitive).
+    pid_filter: Rc<RefCell<String>>,
+    /// Nós da árvore PSI/SI com estado de expansão invertido (padrão: colapsado).
+    tree_toggled: Rc<RefCell<HashSet<String>>>,
+    /// Reaplica os modelos no próximo tick (interações de UI não esperam 4 Hz).
+    force_refresh: Rc<Cell<bool>>,
+    /// Modelos persistentes das listas roláveis — ver comentário em `run()`
+    /// sobre por que a identidade do modelo precisa ser preservada entre updates.
+    pid_rows_model: Rc<VecModel<PidRow>>,
+    services_model: Rc<VecModel<ServiceRow>>,
+    psi_tree_model: Rc<VecModel<TreeRow>>,
+    media_rows_model: Rc<VecModel<MediaRow>>,
     /// Dimensões do último frame `(width, height)` corrigidas por SAR.
     video_dims: Option<(u32, u32)>,
     tick: u64,
@@ -516,8 +597,10 @@ impl Poller {
             self.update_video_dims_raw(w, h, sar_num, sar_den);
         }
 
-        // Métricas/tabelas a ~4 Hz (snapshots chegam a 1 Hz).
-        let refresh_meta = self.tick % 15 == 0;
+        // Métricas/tabelas a ~4 Hz (snapshots chegam a 1 Hz); interações de UI
+        // (ordenação, filtro, expandir nó) forçam a reaplicação imediata.
+        let forced = self.force_refresh.replace(false);
+        let refresh_meta = forced || self.tick % 15 == 0;
         self.poll_table_events(win);
         self.poll_snapshot();
 
@@ -588,13 +671,11 @@ impl Poller {
 
     fn poll_snapshot(&mut self) {
         let snapshot = self.snapshot_rx.borrow();
-        let now = Instant::now();
         update_metric_histories_if_new_snapshot(
             &mut self.state,
             &snapshot,
             &mut self.last_snapshot_ts,
             &mut self.seen_jitter,
-            now,
         );
         let pipeline = self.state.metrics.pipeline.clone();
         self.state.metrics = snapshot;
@@ -620,38 +701,38 @@ impl Poller {
             self.state.media_info = m.clone();
         }
         self.state.selected_pid = *self.selected_pid.borrow();
+        sync_pid_registry(&mut self.state);
     }
 
     /// Atualiza propriedades caras (modelos) — chamado a ~4 Hz.
     fn apply_to_window(&self, win: &AppWindow) {
         let st = &self.state;
 
-        // PID rows
-        let rows: Vec<PidRow> = st
-            .metrics
-            .pid_table
-            .iter()
-            .map(|e| pid_row(e, st))
-            .collect();
-        win.set_pid_count(rows.len() as i32);
-        win.set_pid_rows(ModelRc::new(VecModel::from(rows)));
+        // PID rows — registro persistente (com fantasmas) + filtro + ordenação.
+        let filter = self.pid_filter.borrow();
+        let (sort_col, sort_desc) = self.pid_sort.get();
+        let rows = build_pid_rows(st, &filter, sort_col, sort_desc);
+        win.set_pid_count(st.pid_registry.len() as i32);
+        win.set_pid_sort_col(sort_col);
+        win.set_pid_sort_desc(sort_desc);
+        self.pid_rows_model.set_vec(rows);
         win.set_pid_total(SharedString::from(format!(
             "{:.1} Mbps",
             st.metrics.total_bitrate_kbps / 1000.0
         )));
 
         // Serviços (SDT)
-        win.set_services(ModelRc::new(VecModel::from(build_services(st))));
+        self.services_model.set_vec(build_services(st));
 
-        // Media info
-        let (video_info, audio_info, res, caption) = build_media_info(st);
-        win.set_video_info(ModelRc::new(VecModel::from(video_info)));
-        win.set_audio_info(ModelRc::new(VecModel::from(audio_info)));
+        // Media info — resolução/caption do vídeo + relatório completo da aba.
+        let (res, caption) = video_res_caption(st);
         win.set_video_res(SharedString::from(res));
         win.set_video_caption(SharedString::from(caption));
+        self.media_rows_model.set_vec(build_media_rows(st));
 
-        // PSI/SI grade
-        win.set_psi_rows(ModelRc::new(VecModel::from(build_psi_rows(st))));
+        // Árvore PSI/SI
+        self.psi_tree_model
+            .set_vec(tree::build_psi_tree(st, &self.tree_toggled.borrow()));
 
         // Gráficos
         let (b_val, b_sub, b_area, b_line) = build_bitrate_chart(st);
@@ -952,21 +1033,98 @@ fn pid_label(e: &PidEntry, st: &AppState) -> String {
     String::new()
 }
 
-fn pid_row(e: &PidEntry, st: &AppState) -> PidRow {
-    let (kind, color) = classify_pid(e, st);
-    PidRow {
-        pid_dec: SharedString::from(format!("{}", e.pid)),
-        pid_hex: SharedString::from(format!("0x{:04X}", e.pid)),
-        kind: SharedString::from(kind),
-        kind_color: color,
-        label: SharedString::from(pid_label(e, st)),
-        kbps: SharedString::from(format!("{:.1}", e.bitrate_kbps)),
-        cc: SharedString::from(format!("{}", e.cc_errors)),
-        pkts: SharedString::from(format!("{}", e.packet_count)),
-        has_errors: e.cc_errors > 0,
-        selected: st.selected_pid == Some(e.pid),
-        pid: e.pid as i32,
+/// Atualiza `AppState.pid_registry` a partir do snapshot ao vivo mais recente.
+///
+/// PIDs presentes no `pid_table` atual são upsertados como "vivos"; PIDs que
+/// já estavam no registro mas sumiram da janela deslizante de bitrate (1 s do
+/// aggregator) viram "fantasma" — a entrada permanece na lista (kind/label/CC
+/// congelados no último valor conhecido), sem o flicker de aparecer/sumir a
+/// cada segundo. Volta a "vivo" assim que o PID reaparecer.
+fn sync_pid_registry(state: &mut AppState) {
+    let live: Vec<(Pid, String, Color, String, u64)> = state
+        .metrics
+        .pid_table
+        .iter()
+        .map(|e| {
+            let (kind, color) = classify_pid(e, state);
+            let label = pid_label(e, state);
+            (e.pid, kind, color, label, e.cc_errors)
+        })
+        .collect();
+    let live_pids: HashSet<Pid> = live.iter().map(|(pid, ..)| *pid).collect();
+
+    for (pid, kind, kind_color, label, cc_errors) in live {
+        state.pid_registry.insert(
+            pid,
+            PidRecord {
+                kind,
+                kind_color,
+                label,
+                cc_errors,
+                ghost: false,
+            },
+        );
     }
+    for (pid, rec) in state.pid_registry.iter_mut() {
+        if !live_pids.contains(pid) {
+            rec.ghost = true;
+        }
+    }
+}
+
+/// Constrói as linhas da tabela de PIDs a partir do registro persistente
+/// (vivos + fantasmas), aplicando filtro textual e ordenação por coluna.
+fn build_pid_rows(st: &AppState, filter: &str, sort_col: i32, sort_desc: bool) -> Vec<PidRow> {
+    let live_bitrate: HashMap<Pid, f64> = st
+        .metrics
+        .pid_table
+        .iter()
+        .map(|e| (e.pid, e.bitrate_kbps))
+        .collect();
+
+    let mut rows: Vec<(Pid, &PidRecord, f64)> = st
+        .pid_registry
+        .iter()
+        .map(|(pid, rec)| (*pid, rec, live_bitrate.get(pid).copied().unwrap_or(0.0)))
+        .collect();
+
+    let needle = filter.trim().to_lowercase();
+    if !needle.is_empty() {
+        rows.retain(|(pid, rec, _)| {
+            pid.to_string().contains(&needle)
+                || format!("0x{pid:04x}").contains(&needle)
+                || rec.kind.to_lowercase().contains(&needle)
+                || rec.label.to_lowercase().contains(&needle)
+        });
+    }
+    match sort_col {
+        1 => rows.sort_by(|a, b| a.2.total_cmp(&b.2)),
+        2 => rows.sort_by_key(|(_, rec, _)| rec.cc_errors),
+        _ => rows.sort_by_key(|(pid, ..)| *pid),
+    }
+    if sort_desc {
+        rows.reverse();
+    }
+
+    rows.into_iter()
+        .map(|(pid, rec, bitrate_kbps)| PidRow {
+            pid_dec: SharedString::from(format!("{pid}")),
+            pid_hex: SharedString::from(format!("0x{pid:04X}")),
+            kind: SharedString::from(rec.kind.clone()),
+            kind_color: rec.kind_color,
+            label: SharedString::from(rec.label.clone()),
+            kbps: SharedString::from(if rec.ghost {
+                "—".to_string()
+            } else {
+                format!("{bitrate_kbps:.1}")
+            }),
+            cc: SharedString::from(format!("{}", rec.cc_errors)),
+            has_errors: rec.cc_errors > 0,
+            selected: st.selected_pid == Some(pid),
+            ghost: rec.ghost,
+            pid: pid as i32,
+        })
+        .collect()
 }
 
 /// Lista de serviços a partir do SDT.
@@ -1014,18 +1172,8 @@ fn video_codec_label(c: &VideoCodec) -> String {
     }
 }
 
-fn audio_codec_label(c: &AudioCodec) -> String {
-    match c {
-        AudioCodec::Aac => "AAC".into(),
-        AudioCodec::Ac3 => "AC-3".into(),
-        AudioCodec::Eac3 => "E-AC-3".into(),
-        AudioCodec::MpegAudio => "MPEG Audio".into(),
-        AudioCodec::Unknown(t) => format!("Áudio (0x{t:02X})"),
-    }
-}
-
-/// Constrói os blocos de Media Info (vídeo, áudio), resolução e caption do vídeo.
-fn build_media_info(st: &AppState) -> (Vec<InfoRow>, Vec<InfoRow>, String, String) {
+/// Resolução (`W × H`) e caption do overlay de vídeo (codec · res · fps · Mbps).
+fn video_res_caption(st: &AppState) -> (String, String) {
     // PID de vídeo principal, com fallbacks:
     // 1) maior bitrate entre PidType::Video;
     // 2) PID cujo probe Media Info reporta kind=Video;
@@ -1056,135 +1204,83 @@ fn build_media_info(st: &AppState) -> (Vec<InfoRow>, Vec<InfoRow>, String, Strin
                 .max_by(|a, b| a.bitrate_kbps.total_cmp(&b.bitrate_kbps))
         });
 
-    let mut video = Vec::new();
-    let mut res = "—".to_string();
-    let mut caption = "sem sinal".to_string();
-    if let Some(e) = video_pid {
-        let ci = st.media_info.get(e.pid);
-        // Codec: tipo da PMT, ou formato do probe (HEVC/AVC), ou genérico.
-        let codec = match &e.pid_type {
-            PidType::Video { codec } => video_codec_label(codec),
-            _ => ci
-                .and_then(|c| c.format.clone())
-                .map(|f| match f.as_str() {
-                    "HEVC" => "H.265 / HEVC".to_string(),
-                    "AVC" => "H.264 / AVC".to_string(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_else(|| "Vídeo".into()),
-        };
-        video.push(info("Codec", codec.clone(), true));
-        if let Some(ci) = ci {
-            if let Some(p) = &ci.format_profile {
-                video.push(info("Perfil / Nível", p.clone(), false));
-            }
-            if let (Some(w), Some(h)) = (ci.width, ci.height) {
-                res = format!("{w} × {h}");
-                video.push(info("Resolução", res.clone(), false));
-            }
-            if let Some(fr) = &ci.frame_rate {
-                video.push(info("Frame rate", fr.clone(), false));
-            }
-            if let Some(a) = &ci.display_aspect_ratio {
-                video.push(info("Aspecto", a.clone(), false));
-            }
+    let Some(e) = video_pid else {
+        return ("—".into(), "sem sinal".into());
+    };
+    let ci = st.media_info.get(e.pid);
+    // Codec: tipo da PMT, ou formato do probe (HEVC/AVC), ou genérico.
+    let codec = match &e.pid_type {
+        PidType::Video { codec } => video_codec_label(codec),
+        _ => ci
+            .and_then(|c| c.format.clone())
+            .map(|f| match f.as_str() {
+                "HEVC" => "H.265 / HEVC".to_string(),
+                "AVC" => "H.264 / AVC".to_string(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| "Vídeo".into()),
+    };
+    let res = ci
+        .and_then(|c| c.width.zip(c.height))
+        .map(|(w, h)| format!("{w} × {h}"))
+        .unwrap_or_else(|| "—".to_string());
+    let fps = ci.and_then(|c| c.frame_rate.clone()).unwrap_or_default();
+    let mbps = format!("{:.1} Mbps", e.bitrate_kbps / 1000.0);
+    let parts: Vec<String> = [
+        codec,
+        if res != "—" { res.clone() } else { String::new() },
+        fps,
+        mbps,
+    ]
+    .into_iter()
+    .filter(|s| !s.trim().is_empty())
+    .collect();
+    (res, parts.join(" · "))
+}
+
+/// Aba Media Info — relatório completo estilo MediaInfo (General / Video /
+/// Audio #n), achatado em linhas com flag de cabeçalho de seção.
+fn build_media_rows(st: &AppState) -> Vec<MediaRow> {
+    // O ctx de tabelas mantém NIT/TOT acumulados (enriquecidos em state.rs);
+    // PAT/PMT/SDT vêm do snapshot ao vivo.
+    let mut ctx = st.media_info_tables_ctx.clone();
+    ctx.pat = st.tables.pat.clone();
+    ctx.pmts = st.tables.pmts.clone();
+    ctx.sdt = st.tables.sdt.clone();
+
+    let source_name = match &st.connection {
+        ConnectionState::Connected { url, .. } => Some(url.as_str()),
+        ConnectionState::Connecting { url } => Some(url.as_str()),
+        ConnectionState::Error { url, .. } => Some(url.as_str()),
+        ConnectionState::Idle => None,
+    };
+    let input = ts::MediaInfoBuildInput {
+        source_name,
+        metrics: &st.metrics,
+        tables: &ctx,
+        codec: &st.media_info,
+    };
+    let report = ts::build_media_info_report(&input);
+
+    let mut rows = Vec::new();
+    for section in report.sections {
+        if section.fields.is_empty() {
+            continue;
         }
-        video.push(info(
-            "Bitrate",
-            format!("{:.1} Mbps", e.bitrate_kbps / 1000.0),
-            false,
-        ));
-        video.push(info("PID", format!("{} (0x{:04X})", e.pid, e.pid), false));
-
-        let fps = ci.and_then(|c| c.frame_rate.clone()).unwrap_or_default();
-        let mbps = format!("{:.1} Mbps", e.bitrate_kbps / 1000.0);
-        let parts: Vec<String> = [
-            codec.clone(),
-            if res != "—" { res.clone() } else { String::new() },
-            fps,
-            mbps,
-        ]
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .collect();
-        caption = parts.join(" · ");
-    }
-
-    // Áudio: trilha ativa, ou primeiro PID de áudio.
-    let audio_pid = st
-        .audio
-        .active_track
-        .as_ref()
-        .map(|t| t.pid)
-        .or_else(|| {
-            st.metrics
-                .pid_table
-                .iter()
-                .find(|e| matches!(e.pid_type, PidType::Audio { .. }))
-                .map(|e| e.pid)
+        rows.push(MediaRow {
+            key: SharedString::from(section.title.to_uppercase()),
+            value: SharedString::default(),
+            header: true,
         });
-
-    let mut audio = Vec::new();
-    if let Some(pid) = audio_pid {
-        let entry = st.metrics.pid_table.iter().find(|e| e.pid == pid);
-        let codec = match entry.map(|e| &e.pid_type) {
-            Some(PidType::Audio { codec }) => audio_codec_label(codec),
-            _ => st
-                .audio
-                .active_track
-                .as_ref()
-                .map(|t| t.codec_label.clone())
-                .unwrap_or_else(|| "—".into()),
-        };
-        audio.push(info("Codec", codec, true));
-        if let Some(sr) = st.audio.sample_rate_hz {
-            audio.push(info("Amostragem", format!("{:.1} kHz", sr as f64 / 1000.0), false));
+        for f in section.fields {
+            rows.push(MediaRow {
+                key: SharedString::from(f.key),
+                value: SharedString::from(f.value),
+                header: false,
+            });
         }
-        if let Some(ch) = st.audio.channels.or(st.audio.source_channels) {
-            audio.push(info("Canais", format!("{ch} ch"), false));
-        }
-        if let Some(br) = st.audio.encoded_bitrate_kbps.or(st.audio.stream_bitrate_kbps) {
-            audio.push(info("Bitrate", format!("{br:.1} kbps"), false));
-        }
-        if let Some(lang) = st.audio.active_track.as_ref().and_then(|t| t.language.clone()) {
-            audio.push(info("Idioma", lang, false));
-        }
-        audio.push(info("PID", format!("{pid} (0x{pid:04X})"), false));
     }
-
-    (video, audio, res, caption)
-}
-
-/// Card PSI/SI a partir de presença na `TablesSnapshot`.
-fn psi_card(name: &str, detail: &str, present: bool) -> PsiCard {
-    PsiCard {
-        name: SharedString::from(name),
-        detail: SharedString::from(detail),
-        present,
-    }
-}
-
-fn build_psi_rows(st: &AppState) -> Vec<PsiRow> {
-    let t = &st.tables;
-    let cards = vec![
-        psi_card("PAT", "MPEG · programas", t.pat.is_some()),
-        psi_card("PMT", "MPEG · serviços", !t.pmts.is_empty()),
-        psi_card("SDT", "DVB · atual", t.sdt.is_some()),
-        psi_card("NIT", "DVB · rede", t.nit.is_some()),
-        psi_card("EIT", "DVB · p/f", !t.eit_pf.is_empty()),
-        psi_card("TDT / TOT", "DVB · UTC", t.tdt.is_some() || t.tot.is_some()),
-        psi_card("BAT", "DVB · bouquet", t.bat.is_some()),
-        psi_card("CAT", "MPEG · CA", t.cat.is_some()),
-    ];
-
-    cards
-        .chunks(2)
-        .map(|chunk| PsiRow {
-            a: chunk[0].clone(),
-            b: chunk.get(1).cloned().unwrap_or_else(|| psi_card("", "", false)),
-            has_b: chunk.len() > 1,
-        })
-        .collect()
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,7 +1321,10 @@ fn build_bitrate_chart(st: &AppState) -> (String, String, String, String) {
     if hist.len() < 2 {
         return (value, String::new(), String::new(), String::new());
     }
-    let now = Instant::now();
+    // Idade relativa ao snapshot MAIS NOVO do histórico (não a Instant::now()):
+    // os timestamps vêm do aggregator e podem estar defasados do relógio da UI;
+    // ancorar no mais novo garante que a série sempre alcança a borda direita.
+    let newest = hist.back().map(|(t, _)| *t).unwrap_or_else(Instant::now);
     let max = hist
         .iter()
         .map(|(_, v)| *v)
@@ -1235,7 +1334,7 @@ fn build_bitrate_chart(st: &AppState) -> (String, String, String, String) {
     let points: Vec<(f32, f32)> = hist
         .iter()
         .map(|(t, v)| {
-            let age = now.duration_since(*t).as_secs_f64().min(60.0);
+            let age = newest.duration_since(*t).as_secs_f64().min(60.0);
             let x = (1.0 - age / 60.0) * 100.0;
             // 8% de headroom no topo.
             let y = 100.0 - (v / max * 92.0);
@@ -1262,7 +1361,11 @@ fn build_jitter_chart(st: &AppState) -> (String, String, String) {
     if hist.is_empty() {
         return ("±0".into(), String::new(), String::new());
     }
-    let now = Instant::now();
+    // Mesma âncora do gráfico de bitrate: idade relativa ao registro mais novo.
+    let newest = hist
+        .back()
+        .map(|r| r.timestamp)
+        .unwrap_or_else(Instant::now);
     // Escala ±500 µs em torno do centro (y=50).
     const SCALE_US: f64 = 500.0;
     let mut peak = 0.0_f64;
@@ -1276,7 +1379,7 @@ fn build_jitter_chart(st: &AppState) -> (String, String, String) {
                 peak = abs;
             }
             last_abs = abs;
-            let age = now.duration_since(r.timestamp).as_secs_f64().min(60.0);
+            let age = newest.duration_since(r.timestamp).as_secs_f64().min(60.0);
             let x = (1.0 - age / 60.0) * 100.0;
             let norm = (jitter_us / SCALE_US).clamp(-1.0, 1.0);
             let y = 50.0 - norm * 48.0;
@@ -1454,14 +1557,17 @@ fn update_metric_histories_if_new_snapshot(
     snapshot: &MetricsSnapshot,
     last_snapshot_timestamp: &mut Option<Instant>,
     seen_jitter: &mut usize,
-    now: Instant,
 ) {
     if last_snapshot_timestamp.is_some_and(|t| t == snapshot.timestamp) {
         return;
     }
     *last_snapshot_timestamp = Some(snapshot.timestamp);
 
-    let cutoff = now - Duration::from_secs(60);
+    // Janela de 60 s relativa ao timestamp do snapshot (mesmo domínio dos
+    // registros) — usar Instant::now() encolheria a janela quando o aggregator
+    // publica com atraso.
+    let cutoff = snapshot.timestamp.checked_sub(Duration::from_secs(60));
+    let expired = |t: &Instant| cutoff.is_some_and(|c| *t < c);
 
     state
         .bitrate_history
@@ -1469,7 +1575,7 @@ fn update_metric_histories_if_new_snapshot(
     while state
         .bitrate_history
         .front()
-        .is_some_and(|(t, _)| *t < cutoff)
+        .is_some_and(|(t, _)| expired(t))
     {
         state.bitrate_history.pop_front();
     }
@@ -1489,7 +1595,7 @@ fn update_metric_histories_if_new_snapshot(
     *seen_jitter = jitter_events.len();
 
     for history in state.pcr_history.values_mut() {
-        while history.front().is_some_and(|r| r.timestamp < cutoff) {
+        while history.front().is_some_and(|r| expired(&r.timestamp)) {
             history.pop_front();
         }
     }

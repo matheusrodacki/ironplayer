@@ -1,6 +1,6 @@
 # Spec: Probe — Camada 1: IP / UDP / RTP / FEC
 
-- **Spec-IDs:** SPEC-PROBE-IP-001 … SPEC-PROBE-IP-041
+- **Spec-IDs:** SPEC-PROBE-IP-001 … SPEC-PROBE-IP-046
 - **Crates:** `crates/net` (reformulado) · `crates/probe` · `crates/ui-slint`
 - **Fase:** v0.4 — Probe, camada 1
 - **Depende de:** [spec-13-probe-mode](../spec-13-probe-mode/spec.md) (sessão, motor de checks, persistência)
@@ -95,6 +95,26 @@ Consequências que a spec assume:
 
 ## 5. Requisitos funcionais
 
+### 5.0 Encapsulamento: os três casos convivem
+
+A investigação envolve **UDP puro**, **RTP sem FEC** e **RTP com FEC** — inclusive
+simultaneamente, em feeds diferentes do mesmo mosaico
+([spec-13 SPEC-PROBE-018a](../spec-13-probe-mode/spec.md#41-mosaico-de-feeds)). Toda a
+camada IP é escrita em torno disso: o encapsulamento é **detectado**, não pressuposto, e
+o que não se aplica fica `n/a`.
+
+| ID                | Requisito                                                                                                                | Critério de aceite                                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| SPEC-PROBE-IP-042 | Detecção de encapsulamento por feed nos primeiros `detect_secs` (default 3 s): `Udp`, `Rtp`, `RtpFec`                     | 1º byte `0x47` em ≥ 95 % dos datagramas ⇒ `Udp`; V=2 + PT esperado ⇒ `Rtp`; + tráfego em `base+2/+4` ⇒ `RtpFec` |
+| SPEC-PROBE-IP-043 | Em `Udp`, **todos** os checks de §5.2, §5.3 e §5.5 ficam `n/a` — nunca verdes, nunca em alarme                            | Feed UDP puro roda 12 h sem um único evento de RTP/FEC                                                |
+| SPEC-PROBE-IP-044 | Em `Udp`, a perda só é observável via CC do TS; a UI diz isso explicitamente na ajuda do painel                            | Texto: "sem RTP não há como distinguir perda de rede de erro de origem"                               |
+| SPEC-PROBE-IP-045 | Encapsulamento declarado no TOML e observado divergem ⇒ evento `encapsulation_mismatch` (Warning); vale o **observado**     | Feed declarado `rtp` que chega como UDP puro ⇒ 1 evento, análise continua                             |
+| SPEC-PROBE-IP-046 | Mudança de encapsulamento em runtime reinicia o estado RTP/FEC daquele feed sem derrubar a sessão                          | Troca no meio da sessão ⇒ evento + contadores reiniciados, `metrics.csv` sem buraco                   |
+
+Todo o estado desta spec (`RtpSeqState`, histogramas, matriz FEC, calibração de ruído) é
+**por feed**, nunca global — ver `FeedPipeline` em
+[spec-13 §5.2](../spec-13-probe-mode/spec.md#52-feedpipeline--a-mudança-estrutural-desta-spec).
+
 ### 5.1 Aquisição
 
 | ID                | Requisito                                                                                              | Critério de aceite                                                                 |
@@ -186,7 +206,15 @@ marcada `n/a` quando a variação de bitrate na janela excede `vbr_tolerance_pct
 
 | ID                | Requisito                                                                                                    | Critério de aceite                                                     |
 | ----------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
-| SPEC-PROBE-IP-030 | Descoberta: join opcional em `porta+2` (coluna) e `porta+4` (linha) conforme `fec = auto \| off \| ports:a,b` | `auto` detecta presença sem gerar erro quando não há FEC               |
+Convenção confirmada com a operação: **FEC em `base+2` e `base+4`** — para um feed em
+50000, as portas de FEC são **50002 (coluna)** e **50004 (linha)**. É a convenção do
+ST 2022-1, então `auto` deriva as portas do próprio feed e não precisa de configuração
+explícita no caso normal.
+
+| ID                | Requisito                                                                                                    | Critério de aceite                                                     |
+| ----------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| SPEC-PROBE-IP-030 | Descoberta: join em `base+2` (coluna) e `base+4` (linha) conforme `fec = auto \| off \| ports:a,b`            | `auto` em feed sem FEC ⇒ `fec_present = false`, sem evento de erro; join extra é liberado após `detect_secs` |
+| SPEC-PROBE-IP-030a| Os joins de FEC são independentes do join principal: falha em `base+2/+4` não derruba a recepção do feed      | Grupo FEC inexistente ⇒ log + `fec_present = false`; TS continua sendo analisado |
 | SPEC-PROBE-IP-031 | Parse do header FEC de 16 bytes (RFC 2733) após o header RTP                                                 | Campos `SNBase`, `length recovery`, `PT recovery`, `TS recovery`, `D`, `type`, `index`, `offset`, `NA` extraídos |
 | SPEC-PROBE-IP-032 | Derivação de L e D: coluna (`D=0`) ⇒ `L = offset`, `D = NA`; linha (`D=1`) ⇒ `offset = 1`, `L = NA`           | Matriz exibida como `L×D` no painel                                    |
 | SPEC-PROBE-IP-033 | Check `FEC L range` (default 1..=20) e `FEC D range` (default 4..=20)                                        | Valor fora da faixa ⇒ evento com observado e faixa do perfil           |
@@ -224,7 +252,7 @@ Colunas anexadas à linha do `metrics.csv` definido em
 [spec-13 §6.1](../spec-13-probe-mode/spec.md#61-metricscsv--colunas-mínimas-da-camada-base):
 
 ```
-ip_datagrams, ip_bytes, ip_mbps, ts_per_datagram,
+encapsulation, ip_datagrams, ip_bytes, ip_mbps, ts_per_datagram,
 rtp_received, rtp_missing_delta, rtp_dup_delta, rtp_reorder_delta, rtp_too_old_delta,
 rtp_loss_ratio, ssrc,
 iat_min_us, iat_avg_us, iat_max_us, iat_sd_us, iat_p99_us, iat_expected_us,
@@ -234,7 +262,12 @@ source_ip, source_count
 ```
 
 Campos não observáveis ou não aplicáveis são gravados como vazio (`,,`), **nunca** como `0`
-— zero significa "medido e deu zero".
+— zero significa "medido e deu zero". Num feed `Udp` puro, portanto, toda a faixa
+`rtp_*`/`fec_*` sai vazia, e é isso que distingue "não medido" de "medido e sem perda"
+quando a planilha for aberta 12 h depois.
+
+O arquivo é **por feed** ([spec-13 §6](../spec-13-probe-mode/spec.md#6-formato-dos-dados-em-disco)),
+então não há coluna `feed_id` — o slot está no caminho e no `session.toml`.
 
 ---
 
@@ -262,7 +295,12 @@ Fixtures geradas por teste, injetando datagramas num socket de loopback (padrão
 | FEC coluna com offset=8, NA=5                               | `L = 8`, `D = 5`, `L×D = 40` ⇒ sem alarme                            |
 | FEC com offset=20, NA=8                                     | evento `fec_lxd_gt_100`                                              |
 | Feed sem FEC com `fec = auto`                               | `fec_present = false`, nenhum alarme                                 |
+| FEC em 50002/50004 para feed em 50000                       | `fec_present = true`, L e D lidos das duas portas                    |
+| Join de FEC falha (grupo inexistente)                       | `fec_present = false`; recepção principal intacta                    |
 | 1 pacote RTP perdido + CC errors em 100 ms                  | CC errors marcados `caused_by = rtp_missing`                         |
+| **Datagramas começando com `0x47` (UDP puro)**              | `encapsulation = Udp`; todos os checks RTP/FEC ficam `n/a`           |
+| **UDP puro declarado como `rtp` no TOML**                   | evento `encapsulation_mismatch`; vale o observado                    |
+| **Dois feeds simultâneos: um `RtpFec`, um `Udp`**           | estados independentes; nenhum contador cruza entre slots             |
 
 Nomes seguem a convenção do projeto: `spec_probe_ip_020_reorder_within_window`, etc.
 
@@ -307,7 +345,8 @@ expected       = 7
 severity       = "warning"
 
 [probe.checks.fec]
-mode           = "auto"   # auto | off | ports:2,4
+mode           = "auto"   # auto | off | ports:a,b
+port_offsets   = [2, 4]   # confirmado: 50002 (coluna) / 50004 (linha) p/ feed em 50000
 l_range        = [1, 20]
 d_range        = [4, 20]
 max_lxd        = 100
@@ -315,6 +354,7 @@ severity       = "warning"
 
 reorder_window_ms = 200
 calib_secs        = 30
+detect_secs       = 3     # SPEC-PROBE-IP-042
 vbr_tolerance_pct = 5
 ```
 
@@ -326,20 +366,34 @@ ajuste dos limiares na segunda rodada.
 
 ## 9. Faseamento
 
-| Fase | Entrega                                                                                       | Justificativa                                            |
-| ---- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| 1    | `recv_from`, parse RTP completo, máquina de sequência por SSRC, inter-arrival/PDV, correlação IP→TS | É o diagnóstico que falta hoje e não depende de nada externo |
-| 2    | FEC 2022-1: descoberta, parse, L/D, overhead                                                  | Alto valor, mas exige joins extras e validação normativa  |
-| 3    | Backend pcap (DF bit, MTU, TTL) e estimativa de recuperação por FEC                            | Só se a investigação exigir camada IP abaixo do UDP       |
+| Fase | Entrega                                                                                            | Justificativa                                                     |
+| ---- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| 1    | Detecção de encapsulamento, `recv_from`, parse RTP completo, máquina de sequência por SSRC, inter-arrival/PDV, correlação IP→TS | É o diagnóstico que falta hoje e cobre os três tipos de feed |
+| 2    | FEC 2022-1: descoberta em `base+2`/`base+4`, parse, L/D, overhead                                  | **Escopo confirmado** — há feeds com FEC desde a primeira sessão   |
+| 3    | Estimativa de recuperabilidade pela matriz FEC observada                                            | Muda a leitura do resultado: perda recuperável ≠ perda visível     |
+| 4    | Backend pcap (DF bit, MTU, TTL)                                                                     | Só se a investigação exigir camada IP abaixo do UDP                |
 
 ---
 
-## 10. Questões em aberto
+## 10. Questões
+
+### 10.1 Fechadas (operação, 06/08/2026)
+
+| # | Questão                                    | Decisão                                                                                          |
+| - | ------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| 1 | RTP ou UDP puro?                           | **Os três casos**: UDP puro, RTP sem FEC e RTP com FEC ⇒ encapsulamento é detectado (SPEC-PROBE-IP-042) |
+| 2 | Há FEC? Em quais portas?                   | **Sim, em `base+2` e `base+4`** (50002/50004) ⇒ a fase 2 do faseamento entra no escopo             |
+
+Consequência prática: a fase 2 (FEC) deixa de ser opcional. Feeds com FEC vão existir desde
+a primeira sessão, e um feed com FEC cuja perda **seria recuperável** conta uma história
+diferente de um sem FEC com a mesma perda — o que empurra a estimativa de recuperabilidade
+(fase 3) para "próxima coisa a fazer depois do básico", não para "talvez nunca".
+
+### 10.2 Ainda em aberto
 
 | # | Questão                                                                                                     | Efeito se a resposta mudar                              |
 | - | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| 1 | Os feeds investigados usam RTP ou UDP puro? Em UDP puro, toda a §5.2/5.3 fica `n/a` e sobra só CC do TS       | Define se a camada IP entrega diagnóstico ou não        |
-| 2 | Há FEC configurada nos feeds da casa? Em quais portas?                                                       | Decide se a fase 2 vale a pena                          |
 | 3 | O perfil de encapsulamento é ST 2022-2 declarado, ou apenas "RTP com 7 TS"?                                  | Define quais checks de bits proibidos ficam ativos      |
 | 4 | Vale reordenar pacotes antes do demux (mascara o problema, melhora o thumbnail) ou manter só contagem?        | v1 assume só contagem                                   |
 | 5 | O notebook fica na mesma VLAN/porta espelhada do ponto sob investigação, ou atrás de switch com IGMP snooping?| Perda medida pode ser do caminho até o notebook, não do feed |
+| 6 | O PT dinâmico da FEC é 96 fixo na casa, ou varia por origem?                                                 | Define se `invalid_payload_type` pode ser Error ou fica Warning |

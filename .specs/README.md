@@ -52,10 +52,10 @@
     ├── spec-12-deinterlace_mode/   ← Perfis Performance/Quality/Desligado
     │
     ├── spec-13-probe-mode/
-    │   └── spec.md         ← SPEC-PROBE-001–016: modo Probe (seletor triplo, sessão, histórico)
+    │   └── spec.md         ← SPEC-PROBE-001–020: modo Probe (seletor triplo, mosaico 2 feeds, sessão)
     │
     └── spec-14-probe-ip/
-        └── spec.md         ← SPEC-PROBE-IP-001–041: camada IP/UDP/RTP/FEC
+        └── spec.md         ← SPEC-PROBE-IP-001–046: camada IP/UDP/RTP/FEC
 ```
 
 ---

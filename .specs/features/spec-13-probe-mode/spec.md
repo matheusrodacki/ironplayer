@@ -18,8 +18,13 @@ Falta transformar isso em **um instrumento que fica ligado sozinho por 12 h em u
 plugado no ponto de rede sob investigação, monitorando 1 ou 2 canais, e que ao final
 responda uma pergunta objetiva: o stream nesse ponto está bom ou não?**
 
-**Objetivo do modo Probe:** monitoração contínua, não assistida, de 1–2 feeds, com histórico
-persistido, gráficos e linha do tempo de saúde, sem reprodução A/V contínua.
+**Objetivo do modo Probe:** monitoração contínua, não assistida, de **até 2 feeds
+simultâneos na mesma janela** (mosaico), com histórico persistido, gráficos e linha do
+tempo de saúde, sem reprodução A/V contínua.
+
+Os feeds sob investigação usam três encapsulamentos diferentes, e os três precisam
+funcionar no mesmo mosaico: **UDP puro**, **RTP sem FEC** e **RTP com FEC** (portas
+`base+2` e `base+4` — p.ex. 50002/50004 para um feed em 50000).
 
 **Não-objetivo:** chegar ao nível da probe de referência. Esta spec cobre
 deliberadamente um subconjunto (IP + TS) e descarta análise perceptual de vídeo/áudio, T-STD, HDR, loudness, logo, EPG,
@@ -42,6 +47,7 @@ SCTE-35, ABR e QoE score.
 ### 2.1 Dentro do escopo
 
 - Seletor triplo de modo: **Cinema · Broadcast · Probe**.
+- Mosaico de até 2 feeds simultâneos, cada um com pipeline e sessão independentes.
 - Pipeline reduzido no modo Probe: rede + TS + checks, sem decode contínuo e sem áudio.
 - Snapshot de vídeo periódico (thumbnail) com descarte do anterior.
 - Motor de checks com perfil versionado, debounce/histerese e severidade.
@@ -110,10 +116,11 @@ botão": é criar o conceito de modo (Rust + Slint + persistência) e ligar os t
 | ID              | Requisito                                                                                                       | Critério de aceite                                                                                                       |
 | --------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | SPEC-PROBE-001  | Seletor triplo Cinema/Broadcast/Probe na barra superior, com `AppMode` em Rust e callback `set-mode(int)`         | Clique alterna o modo; modo ativo destacado; valor persiste em `[ui] mode` do `ironstream.toml` e é restaurado no start   |
-| SPEC-PROBE-002  | Em modo Probe o pipeline A/V não é instanciado: sem `FfmpegDecoder` contínuo, sem `AudioOutput`, sem `VideoQueue` | Nenhum device de áudio aberto (verificável no Gerenciador de Som); CPU do processo < 15 % em 15 Mbps num Core i5 de notebook |
-| SPEC-PROBE-003  | Snapshot de vídeo a cada `snapshot_interval_secs` (default 5 s), decodificado em SW, escalado para ≤ 320×180      | Somente 1 imagem viva em memória; a anterior é liberada ao publicar a nova; nenhum frame extra é decodificado entre ticks |
+| SPEC-PROBE-002  | Em modo Probe o pipeline A/V não é instanciado: sem `FfmpegDecoder` contínuo, sem `AudioOutput`, sem `VideoQueue` | Nenhum device de áudio aberto (verificável no Gerenciador de Som); CPU do processo < 25 % com **dois** feeds de 15 Mbps num Core i5 de notebook |
+| SPEC-PROBE-003  | Snapshot de vídeo a cada `snapshot_interval_secs` (default 5 s), decodificado em SW, escalado para ≤ 320×180      | Somente 1 imagem viva por feed; a anterior é liberada ao publicar a nova; nenhum frame extra é decodificado entre ticks   |
 | SPEC-PROBE-003a | O snapshot arma o decoder no máximo `arm_window_secs` (default 2,5 s) antes do tick e desarma após 1 frame        | Sem IRAP na janela → `snapshot_state = "sem keyframe"`; não gera alarme por si só                                        |
-| SPEC-PROBE-004  | Sessão de monitoração com `session_id`, início/fim, feed, host, interface, versão do app e versão do perfil       | Iniciar Probe cria a pasta da sessão; parar/fechar grava o resumo; sessão sobrevive a reconexões do feed                  |
+| SPEC-PROBE-003b | Com 2 feeds, os ticks de snapshot são escalonados (offset = `interval / n_feeds`)                                | Dois decodes SW nunca coincidem no mesmo instante; verificável por log de timestamps                                     |
+| SPEC-PROBE-004  | Sessão de monitoração **por feed**, com `session_id`, `run_id`, `feed_slot`, início/fim, feed, host, interface, versões | Iniciar Probe cria uma pasta de sessão por feed sob o mesmo `run_id`; parar/fechar grava o resumo de cada uma            |
 | SPEC-PROBE-005  | Série temporal amostrada a 1 Hz + rollup de 60 s (min/avg/max/count) mantido em memória                           | 12 h de sessão ⇒ 720 buckets de 60 s em RAM; consumo do rollup < 2 MB                                                    |
 | SPEC-PROBE-006  | Persistência append-only em disco: `metrics.csv` (1 Hz) e `events.jsonl`                                         | Matar o processo com `taskkill /f` perde no máximo `flush_interval_secs` (default 5 s) de amostras; arquivo permanece legível |
 | SPEC-PROBE-007  | Motor de checks com perfil versionado: limiar, janela, duração mínima, histerese e severidade externos ao binário | Alterar limiar no TOML muda o resultado sem recompilar; o evento carrega `profile_version`                                |
@@ -127,7 +134,21 @@ botão": é criar o conceito de modo (Rust + Slint + persistência) e ligar os t
 | SPEC-PROBE-015  | Seção `[probe]` no `ironstream.toml`, com `profile_version` e defaults gerados na ausência do arquivo             | Arquivo ausente ⇒ seção escrita com defaults documentados                                                                |
 | SPEC-PROBE-016  | Retenção: sessões antigas removidas por idade (`retention_days`, default 14) ou por tamanho total (`max_disk_mb`) | Rotação nunca apaga a sessão em curso; remoção é logada                                                                  |
 
-### 4.1 Requisitos de degradação (RNF operacional)
+### 4.1 Mosaico de feeds
+
+| ID              | Requisito                                                                                                                        | Critério de aceite                                                                                                     |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| SPEC-PROBE-017  | Até `MAX_FEEDS` (= 2 nesta versão) pipelines **independentes**: socket, demux, métricas, motor de checks e sessão próprios        | Feed 1 caindo não interrompe nem zera contadores do feed 0; verificável derrubando um dos dois                          |
+| SPEC-PROBE-017a | `MAX_FEEDS` é uma constante única; nada no código assume "exatamente 2" (índices, nomes de thread e de canal derivam do slot)     | Elevar a constante para 4 compila e roda sem outras alterações estruturais                                              |
+| SPEC-PROBE-018  | Cada feed vira um **tile** no mosaico com: thumbnail, nome, badges de encapsulamento, indicadores de estado, disponibilidade %    | Layout do tile conforme §8.1; tiles em grade que reflui com a largura da janela                                          |
+| SPEC-PROBE-018a | Os três encapsulamentos (UDP puro · RTP · RTP+FEC) convivem no mesmo mosaico, cada tile mostrando o seu                           | Badge `UDP` / `RTP` / `RTP+FEC` correto por tile; checks inaplicáveis do tile ficam `n/a`, não verdes                    |
+| SPEC-PROBE-019  | Clicar num tile abre o **detalhe** daquele feed (timeline, gráficos, event log) sem parar a coleta do outro                       | Alternar entre detalhes não gera buraco no `metrics.csv` de nenhum dos dois                                              |
+| SPEC-PROBE-020  | O relatório de sessão cobre o `run_id` inteiro: resumo lado a lado dos 2 feeds + seções individuais                               | Um HTML com as duas timelines alinhadas no mesmo eixo de tempo                                                           |
+
+Escalonar para 4+ feeds é explicitamente **não-objetivo agora** — mas SPEC-PROBE-017a
+existe para que subir o limite depois seja mudar uma constante, não refatorar o wiring.
+
+### 4.2 Requisitos de degradação (RNF operacional)
 
 | ID              | Requisito                                                                                       | Critério de aceite                                                        |
 | --------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
@@ -156,7 +177,39 @@ e `net`.
 > `crates/av/examples/vp_probe.rs`. Os tipos novos usam o prefixo `Probe*`
 > (`ProbeEngine`, `ProbeSession`, `ProbeEvent`) para evitar ambiguidade em `use`.
 
-### 5.2 Fluxo de dados
+### 5.2 `FeedPipeline` — a mudança estrutural desta spec
+
+Hoje [`src/channels.rs`](../../../src/channels.rs) cria **um** conjunto global de canais e
+[`src/main.rs`](../../../src/main.rs) monta **um** pipeline. Suportar 2 feeds exige extrair
+esse conjunto para uma unidade replicável:
+
+```rust
+/// SPEC-PROBE-017 — tudo que hoje é global vira campo de slot.
+pub const MAX_FEEDS: usize = 2;
+
+pub struct FeedPipeline {
+    pub slot: usize,              // 0..MAX_FEEDS
+    pub url: StreamUrl,
+    pub channels: AppChannels,    // já existe — passa a ser por feed
+    pub snapshot_rx: SnapshotReceiver,
+    pub ip_metrics_rx: IpMetricsReceiver,
+    pub session: ProbeSession,
+    pub guard: PipelineGuard,     // já existe — encerramento em cascata por feed
+}
+```
+
+Regras:
+
+- Nomes de thread e de canal recebem sufixo de slot (`net-recv-0`, `ts_raw-1`) — o
+  `BoundedSender` já loga por nome; sem o sufixo, dois feeds saturando ficam
+  indistinguíveis no log.
+- `PipelineGuard` (que já implementa o encerramento em cascata) passa a ser **por feed**:
+  parar o feed 1 não pode fechar o `net_raw` do feed 0.
+- Em modo Cinema/Broadcast só o slot 0 é instanciado — nenhuma regressão no player.
+- Cada feed faz seu próprio `join` multicast. Dois feeds no **mesmo** grupo/porta são
+  rejeitados na validação de configuração (seria duplicar tráfego sem ganho).
+
+### 5.3 Fluxo de dados (por feed)
 
 ```mermaid
 flowchart LR
@@ -182,28 +235,37 @@ Eventos discretos que **não** cabem em contador (mudança de PAT/PMT, mudança 
 mudança de IP de origem, mudança de codec) chegam por um canal bounded dedicado
 `probe_events` (cap. 1024, política: descarta o mais novo + incrementa `dropped_events`).
 
-### 5.3 Threads
+### 5.4 Threads
 
-| Thread             | Papel                                                                 | Prioridade |
-| ------------------ | --------------------------------------------------------------------- | ---------- |
-| `net-recv`         | existente — `recv_from` + timestamp de chegada                        | acima do normal |
-| `probe-engine`     | tick 1 Hz: amostra, avalia checks, atualiza séries, enfileira escrita | normal     |
-| `probe-writer`     | drena a fila de escrita, `BufWriter` + flush a cada 5 s               | abaixo do normal |
-| `probe-snapshot`   | arma/desarma decoder SW para o thumbnail                              | abaixo do normal |
+| Thread              | Instâncias   | Papel                                                                 | Prioridade      |
+| ------------------- | ------------ | --------------------------------------------------------------------- | --------------- |
+| `net-recv-{slot}`   | 1 por feed   | existente — `recv_from` + timestamp de chegada                        | acima do normal |
+| `net-fec-{slot}`    | 0–2 por feed | recepção das portas FEC `base+2` / `base+4`, só quando há FEC          | normal          |
+| `probe-engine-{slot}`| 1 por feed  | tick 1 Hz: amostra, avalia checks, atualiza séries, enfileira escrita | normal          |
+| `probe-writer`      | **1 global** | drena a fila de todos os feeds, `BufWriter` por arquivo, flush a 5 s   | abaixo do normal |
+| `probe-snapshot`    | **1 global** | percorre os feeds em round-robin armando o decoder SW                 | abaixo do normal |
+
+Writer e snapshot são **globais de propósito**: um writer por feed dobraria o I/O
+concorrente num disco de notebook, e um decoder por feed derrubaria a garantia de
+SPEC-PROBE-003b (decodes escalonados). Com `MAX_FEEDS = 2` e ticks de 5 s, um decoder
+round-robin sobra folga.
 
 O `probe-engine` **nunca** faz I/O de disco no próprio tick — só enfileira. Escrita lenta
 (disco de notebook, antivírus) não pode atrasar a amostragem.
 
-### 5.4 Troca de modo em runtime
+### 5.5 Troca de modo em runtime
 
-Trocar de/para Probe reconfigura o pipeline A/V, não a recepção:
+Trocar de/para Probe reconfigura o pipeline A/V do slot 0 e liga/desliga os slots extras —
+a recepção do slot 0 nunca é reiniciada:
 
-1. **→ Probe:** emite `TableEvent::ResetVideo` (nunca `Reset` — ver L-010 no
-   [STATE.md](../../project/STATE.md)), encerra decoder/áudio, mantém socket + demux, inicia sessão.
-2. **Probe →:** instancia decoder/áudio, encerra a sessão (fecha arquivos e grava resumo).
+1. **→ Probe:** emite `TableEvent::ResetVideo` no slot 0 (nunca `Reset` — ver L-010 no
+   [STATE.md](../../project/STATE.md)), encerra decoder/áudio, mantém socket + demux;
+   instancia os demais slots de `[[probe.feeds]]`; abre o run e uma sessão por feed.
+2. **Probe →:** encerra os slots ≥ 1, instancia decoder/áudio no slot 0, fecha o run
+   (fecha arquivos e grava o resumo de cada sessão).
 
-A sessão **não** sobrevive à troca de modo nem à troca de feed — cada uma abre uma nova
-sessão. Sobrevive a reconexão do mesmo feed (SPEC-PROBE-011).
+O run **não** sobrevive à troca de modo nem à troca de feed — cada uma abre um run novo.
+Sobrevive a reconexão dos mesmos feeds (SPEC-PROBE-011).
 
 ---
 
@@ -212,14 +274,25 @@ sessão. Sobrevive a reconexão do mesmo feed (SPEC-PROBE-011).
 Raiz: `<pasta do executável>/probe-sessions/` (mesma pasta do `ironstream.toml`, mantém a
 portabilidade "copiar a pasta para o notebook").
 
+Uma pasta por **run** (a sessão de monitoração como um todo) e uma subpasta por **feed** —
+é o que permite o relatório comparativo do SPEC-PROBE-020 sem correlacionar arquivos soltos:
+
 ```
 probe-sessions/
-└── 2026-08-07T09-15-32_239.15.0.183-50000/
-    ├── session.toml      metadados: feed, host, iface, versões, início/fim, resumo
-    ├── metrics.csv       1 linha/s
-    ├── events.jsonl      1 linha/evento (abertura, atualização, fechamento)
-    └── report.html       gerado sob demanda (SPEC-PROBE-014)
+└── 2026-08-07T09-15-32_run/
+    ├── run.toml              run_id, início/fim, host, versão do app, perfil, lista de feeds
+    ├── report.html           relatório do run inteiro, 2 feeds lado a lado (SPEC-PROBE-014/020)
+    ├── feed-0_239.15.0.183-50000/
+    │   ├── session.toml      feed, slot, encapsulamento detectado, iface, SO_RCVBUF efetivo,
+    │   │                     noise_floor_us, csv_schema_version, resumo final
+    │   ├── metrics.csv       1 linha/s
+    │   └── events.jsonl      1 linha/evento (abertura, atualização, fechamento)
+    └── feed-1_239.15.0.190-50000/
+        └── …
 ```
+
+O nome da pasta do feed usa `grupo-porta` — legível e único dentro do run (SPEC-PROBE-017
+proíbe dois feeds no mesmo grupo/porta).
 
 ### 6.1 `metrics.csv` — colunas mínimas da camada base
 
@@ -290,11 +363,47 @@ pacote. Sem isso, 12 h de sessão num stream ruim geram um log inútil.
 
 ## 8. UI do modo Probe
 
-Layout quando `mode == Probe` (mesma janela, painéis trocados):
+Duas telas: **mosaico** (visão do run) e **detalhe** (visão de um feed). O mosaico é a tela
+inicial do modo Probe; o detalhe abre ao clicar num tile e volta com `Esc`.
+
+### 8.1 Mosaico e anatomia do tile
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│ [Cinema][Broadcast][ PROBE ]   udp://@239.15.0.183:50000  ● 03:34:21   │
+│ [Cinema][Broadcast][ PROBE ]        run 03:34:21   ⏺ gravando  [parar]│
+├───────────────────────────┬───────────────────────────┬───────────────┤
+│ ┌───────────────────────┐ │ ┌───────────────────────┐ │               │
+│ │ RTP+FEC   HD   SCR    │ │ │ UDP       HD          │ │   (slot livre │
+│ │ ┌───────────────────┐ │ │ │ ┌───────────────────┐ │ │    até        │
+│ │ │   thumbnail 5 s   │ │ │ │ │   thumbnail 5 s   │ │ │    MAX_FEEDS) │
+│ │ │      320×180      │ │ │ │ │      320×180      │ │ │               │
+│ │ └───────────────────┘ │ │ │ └───────────────────┘ │ │               │
+│ │  IP   RTP   TS   V  A │ │ │  IP    —    TS   V  A │ │               │
+│ │  ▇▇▇▇▇▇▇▇▇▇▇▇▇  99,4 %│ │ │  ▇▇▇▇▇▇▇▇▇▇▇▇▇ 100 %  │ │               │
+│ │  0084_CANAL_A         │ │ │  0116_CANAL_B         │ │               │
+│ └───────────────────────┘ │ └───────────────────────┘ │               │
+└───────────────────────────┴───────────────────────────┴───────────────┘
+```
+
+| Elemento do tile        | Fonte                                                                                   |
+| ----------------------- | ---------------------------------------------------------------------------------------- |
+| Badges de encapsulamento| `UDP` · `RTP` · `RTP+FEC`, detectado em runtime (SPEC-PROBE-018a)                          |
+| Badges de conteúdo      | `HD`/`SD` (resolução do vídeo), `SCR` (scrambling_control ≠ 0) — apenas presença           |
+| Thumbnail               | SPEC-PROBE-003, um por feed, escalonado                                                    |
+| Indicadores redondos    | `IP` `RTP` `TS` `V` `A` — verde/amarelo/vermelho/cinza(n/a) pelo pior check da camada      |
+| Barra + %               | disponibilidade da janela corrente (default últimos 60 min), não "qualidade" subjetiva     |
+| Nome                    | `[[probe.feeds]] name`, ou `grupo:porta` se não houver nome                                |
+
+**Sem VU meter de áudio.** O mosaico de referência mostra nível de áudio por canal; isso
+exige decodificar áudio continuamente, que é exatamente o que o modo Probe não faz. O
+indicador `A` reflete **presença e bitrate do PID de áudio**, não nível — e a spec diz isso
+na ajuda contextual para não induzir o operador ao erro.
+
+### 8.2 Detalhe do feed
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│ ← mosaico   0084_CANAL_A   udp://@239.15.0.183:50000  RTP+FEC ● 03:34 │
 ├────────────────┬──────────────────────────────────────────────────────┤
 │ thumbnail 5 s  │ LINHA DO TEMPO DE SAÚDE (144 células · 5 min)        │
 │ 320×180        │ ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   │
@@ -324,6 +433,7 @@ Layout quando `mode == Probe` (mesma janela, painéis trocados):
 ```toml
 [probe]
 profile_version         = 1
+max_feeds               = 2      # SPEC-PROBE-017 — limite desta versão
 snapshot_interval_secs  = 5      # SPEC-PROBE-003
 snapshot_arm_secs       = 2.5
 snapshot_max_width      = 320
@@ -338,10 +448,22 @@ prevent_sleep           = true   # SPEC-PROBE-012
 retention_days          = 14     # SPEC-PROBE-016
 max_disk_mb             = 4096
 enabled_in_broadcast    = false
+
+# Um bloco por feed do mosaico, na ordem dos slots (máx. `max_feeds`).
+[[probe.feeds]]
+name = "0084_CANAL_A"
+url  = "rtp://@239.15.0.183:50000"
+fec  = "auto"          # auto detecta em base+2 / base+4 → 50002 / 50004
+
+[[probe.feeds]]
+name = "0116_CANAL_B"
+url  = "udp://@239.15.0.190:50000"
+fec  = "off"           # UDP puro: checks de RTP/FEC ficam n/a
 ```
 
 Limiares por check ficam em `[probe.checks.<id>]` — definidos por camada nas specs
-correspondentes.
+correspondentes. `[[probe.feeds]]` é aditivo: um arquivo sem a seção mantém o
+comportamento atual de feed único vindo da barra de URL.
 
 ---
 
@@ -370,24 +492,33 @@ correspondentes.
    correta e a sessão retoma sozinha.
 5. A linha do tempo mostra as janelas com erro nas posições corretas quando comparada ao
    `events.jsonl`.
-6. O relatório HTML abre sem rede e traz resumo, timeline e top-10 eventos.
+6. O relatório HTML abre sem rede e traz resumo, timeline e top-10 eventos dos 2 feeds.
 7. Com `mode = Broadcast`, os testes de regressão existentes passam sem alteração.
-8. `cargo test -p probe` verde e `cargo clippy --workspace -- -D warnings` limpo.
+8. Dois feeds simultâneos — um RTP+FEC e um UDP puro — rodam 12 h no mosaico; derrubar um
+   não afeta contadores, sessão nem arquivos do outro.
+9. Elevar `MAX_FEEDS` de 2 para 4 compila sem alterar wiring (SPEC-PROBE-017a).
+10. `cargo test -p probe` verde e `cargo clippy --workspace -- -D warnings` limpo.
 
 ---
 
 ## 12. Sequência de implementação sugerida
 
-| Ordem | Entrega                                                                      | Depende de |
-| ----- | ---------------------------------------------------------------------------- | ---------- |
-| 1     | `AppMode` + seletor triplo + persistência + gating do pipeline A/V            | —          |
-| 2     | Crate `probe`: sessão, séries, writer CSV/JSONL, motor de checks com fixtures | 1          |
-| 3     | Camada IP ([spec-14](../spec-14-probe-ip/spec.md))                            | 2          |
-| 4     | Painéis Probe: timeline, gráficos, event log, saúde da probe                  | 2          |
-| 5     | Snapshot de vídeo 5 s                                                        | 1          |
-| 6     | Reconexão automática, anti-suspensão, retenção                               | 2          |
-| 7     | Relatório HTML                                                               | 2, 4       |
-| 8     | Camada TS (spec-15): promoção de CC/CRC/PAT/PMT/PCR a checks                  | 2          |
+| Ordem | Entrega                                                                          | Depende de |
+| ----- | -------------------------------------------------------------------------------- | ---------- |
+| 1     | `AppMode` + seletor triplo + persistência + gating do pipeline A/V                | —          |
+| 2     | **`FeedPipeline`: extrair o wiring de `main.rs`/`channels.rs` para N slots**      | 1          |
+| 3     | Crate `probe`: sessão, séries, writer CSV/JSONL, motor de checks com fixtures     | 2          |
+| 4     | Camada IP ([spec-14](../spec-14-probe-ip/spec.md)), incluindo detecção de encapsulamento | 3   |
+| 5     | Mosaico + tiles + navegação mosaico↔detalhe                                       | 3          |
+| 6     | Painéis de detalhe: timeline, gráficos, event log, saúde da probe                 | 3          |
+| 7     | Snapshot de vídeo 5 s com round-robin entre feeds                                 | 2          |
+| 8     | Reconexão automática, anti-suspensão, retenção                                    | 3          |
+| 9     | Relatório HTML do run (2 feeds lado a lado)                                       | 3, 6       |
+| 10    | Camada TS (spec-15): promoção de CC/CRC/PAT/PMT/PCR a checks                      | 3          |
+
+O item 2 é o mais arriscado da lista e por isso vem cedo: é refatoração de código que hoje
+funciona (player), sem entregar funcionalidade nova. Fazer depois significaria refazer o
+crate `probe` inteiro para multi-feed.
 
 Ordem deliberada: a camada IP vem antes da TS porque é onde está o diagnóstico que a
 probe de referência entrega e o IronPlayer ainda não (RTP, FEC, jitter), e porque os checks TS já têm
@@ -395,12 +526,22 @@ os contadores prontos — são os mais baratos de empacotar depois.
 
 ---
 
-## 13. Decisões em aberto (a confirmar com a operação)
+## 13. Decisões
 
-| # | Questão                                                                                                  | Default assumido nesta spec       |
-| - | -------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| 1 | Monitorar 2 feeds simultâneos exige 2 pipelines completos — v1 entrega 1 feed por instância do app?       | 1 feed; 2º feed = 2ª instância    |
-| 2 | Granularidade da timeline: 5 min (144 células/12 h) ou 1 min (720)?                                       | 5 min                             |
-| 3 | Salvar thumbnail como evidência quando abre evento crítico?                                              | não (respeita "descarta o anterior") |
-| 4 | Relatório precisa comparar duas sessões (ponto A × ponto B) já na v1?                                    | não — v1 exporta sessão isolada   |
-| 5 | Limiares default: derivar dos números observados na referência (perda 5,6e-5, IAT 702 µs ± 0,34 µs) ou zero-tolerância? | ver [spec-14 §8](../spec-14-probe-ip/spec.md#8-limiares-default-propostos) |
+### 13.1 Fechadas (operação, 06/08/2026)
+
+| # | Questão                                          | Decisão                                                                                  |
+| - | ------------------------------------------------ | ----------------------------------------------------------------------------------------- |
+| 1 | Quantos feeds e como                             | **2 feeds no mosaico da mesma janela**, pipelines independentes; limite 2 por ora (SPEC-PROBE-017) |
+| 2 | Quais encapsulamentos                            | **UDP puro, RTP sem FEC e RTP com FEC** — os três coexistem no mosaico (SPEC-PROBE-018a)   |
+| 3 | Portas de FEC                                    | **`base+2` e `base+4`** (50002/50004 para base 50000) — confirma a convenção ST 2022-1     |
+| 4 | Relatório comparando dois pontos                 | sim, por `run_id`, com os 2 feeds lado a lado (SPEC-PROBE-020)                              |
+
+### 13.2 Ainda em aberto
+
+| # | Questão                                                                                                  | Default assumido nesta spec          |
+| - | -------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| 5 | Granularidade da timeline: 5 min (144 células/12 h) ou 1 min (720)?                                       | 5 min                                |
+| 6 | Salvar thumbnail como evidência quando abre evento crítico?                                              | não (respeita "descarta o anterior") |
+| 7 | Os 2 feeds do mosaico são o **mesmo canal em 2 pontos** (comparação A×B) ou **2 canais no mesmo ponto**? | ambos suportados; o relatório apenas alinha o eixo de tempo, não assume equivalência |
+| 8 | Limiares default: derivar dos números observados na referência (perda 5,6e-5, IAT 702 µs ± 0,34 µs) ou zero-tolerância? | ver [spec-14 §8](../spec-14-probe-ip/spec.md#8-limiares-default-propostos) |

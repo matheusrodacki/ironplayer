@@ -41,9 +41,21 @@
     │   ├── spec.md         ← Requisitos SPEC-UI-001–006 + tasks
     │   └── design.md       ← TDD: AppState, PidPanel, TablesPanel, MetricsPanel
     │
-    └── spec-07-av/
-        ├── spec.md         ← Requisitos SPEC-AV-001/002/003/004 + tasks
-        └── design.md       ← TDD: PesAssembler, FfmpegDecoder, VideoRenderer, AudioOutput
+    ├── spec-07-av/
+    │   ├── spec.md         ← Requisitos SPEC-AV-001/002/003/004 + tasks
+    │   └── design.md       ← TDD: PesAssembler, FfmpegDecoder, VideoRenderer, AudioOutput
+    │
+    ├── spec-08-av-sync/            ← TDD sprint 01: clock master, VideoQueue
+    ├── spec-09-gpu-decode/         ← TDD sprint 02: D3D11VA, zero-copy
+    ├── spec-10-mediainfo/          ← SPEC-MI-*: probe de elementary streams
+    ├── spec-11-slint/              ← Migração egui → Slint, perf 1080i, zero-copy
+    ├── spec-12-deinterlace_mode/   ← Perfis Performance/Quality/Desligado
+    │
+    ├── spec-13-probe-mode/
+    │   └── spec.md         ← SPEC-PROBE-001–016: modo Probe (seletor triplo, sessão, histórico)
+    │
+    └── spec-14-probe-ip/
+        └── spec.md         ← SPEC-PROBE-IP-001–041: camada IP/UDP/RTP/FEC
 ```
 
 ---
@@ -60,6 +72,8 @@
 | 6     | `spec-06-ui` (PidPanel)    | `spec-04-ts-metrics`, `spec-05-wiring` | Alpha v0.1             |
 | 7     | `spec-07-av`               | `spec-01-ts-core`                      | Alpha v0.2             |
 | 8     | `spec-06-ui` (completo)    | `spec-07-av`, `spec-03-ts-tables`      | Alpha v0.2 + Beta v0.3 |
+| 9     | `spec-13-probe-mode`       | `spec-04-ts-metrics`, `spec-11-slint`  | v0.4 Probe             |
+| 10    | `spec-14-probe-ip`         | `spec-13-probe-mode`, `spec-02-net`    | v0.4 Probe             |
 
 ---
 

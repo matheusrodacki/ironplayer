@@ -31,3 +31,6 @@ progress.txt
 debug-*.log
 
 /ffmpeg/
+
+
+.notVersioned

@@ -1,6 +1,6 @@
 # Spec: Modo Probe — monitoração contínua sem player
 
-- **Spec-IDs:** SPEC-PROBE-001 … SPEC-PROBE-016
+- **Spec-IDs:** SPEC-PROBE-001 … SPEC-PROBE-026
 - **Crates:** `crates/probe` (novo) · `crates/ui-slint` · `crates/net` · `crates/ts` · `src/main.rs`
 - **Fase:** v0.4 — Probe (camada 1: IP → [spec-14-probe-ip](../spec-14-probe-ip/spec.md); camada 2: TS → spec-15, futura)
 - **Origem:** `.notVersioned/Requisitos_Probe_MPEGTS_v0.4.docx` (recorte) + capturas de tela de uma probe comercial de referência (06/08/2026)
@@ -147,6 +147,35 @@ botão": é criar o conceito de modo (Rust + Slint + persistência) e ligar os t
 
 Escalonar para 4+ feeds é explicitamente **não-objetivo agora** — mas SPEC-PROBE-017a
 existe para que subir o limite depois seja mudar uma constante, não refatorar o wiring.
+
+### 4.1a Serviços do multiplex e navegação em quatro níveis
+
+A primeira versão media o **multiplex inteiro**: um feed, um conjunto de contadores, uma
+faixa de saúde. Num MPTS isso responde "o transporte está bom?", mas não "**qual serviço**
+está ruim?" — que é a pergunta que o operador faz olhando o mosaico. Os requisitos abaixo
+fecham essa lacuna, e são a razão de o modo Probe ter quatro níveis em vez de dois.
+
+| ID              | Requisito                                                                                                                              | Critério de aceite                                                                                                                    |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| SPEC-PROBE-021  | Inventário de serviços por feed a partir de PAT/PMT/SDT: `service_id`, nome, provedor, PMT PID, PCR PID, CA e os elementary streams com tipo, codec e idioma | Serviço que sai da PAT sai do inventário no tick seguinte; PID pertence a **um** serviço só (o primeiro que o lista)                    |
+| SPEC-PROBE-021a | Toda ocorrência com PID conhecido carrega também o `service_id` dono dele; CRC e PCR passam a ser atribuídos por PID, não só como total | Um CC error no PID de um serviço abre alarme naquele serviço e **não** no vizinho do mesmo multiplex                                    |
+| SPEC-PROBE-021b | Evento crítico sem PID nem serviço (feed indisponível, sync loss) atinge todos os serviços                                              | Cabo removido ⇒ toda linha de serviço fica crítica junto com a de transporte, nunca verde                                              |
+| SPEC-PROBE-022  | Nível 1 (feed) com abas **Resumo** (visão MPTS) e **Serviços** (mosaico de serviços do multiplex)                                       | A aba Serviços mostra um tile por serviço com thumbnail, badges, indicadores `TS/V/A`, disponibilidade e nome; contagem na própria aba  |
+| SPEC-PROBE-022a | Indicadores do tile de serviço refletem só os eventos daquele serviço; camada ausente fica `n/a`                                        | Serviço só de áudio mostra `V` cinza, nunca verde (mesma regra do SPEC-PROBE-018a)                                                     |
+| SPEC-PROBE-023  | Grade de saúde por cluster de tempo: uma **linha por escopo** (transporte, IP/RTP, cada serviço, cada PID) sobre um eixo de tempo único | 12 h ⇒ 144 colunas de 5 min; escopo que nasceu depois tem célula cinza antes de existir, nunca verde                                    |
+| SPEC-PROBE-023a | A grade cresce com a sessão e satura em 12 h (144 colunas), com piso de 24 colunas; o seletor de janela governa os gráficos, não ela    | Sessão de 3 min ⇒ 24 colunas (contexto, não 143 cinzas); de 3 h ⇒ 36; de 24 h ⇒ as 12 h finais. Trocar a janela não muda a grade        |
+| SPEC-PROBE-023b | Toda linha do tempo de escopo tem teto de células em memória                                                                            | Sessão de 24 h num MPTS de 10 serviços mantém RSS estável (RNF-PRB-001)                                                                |
+| SPEC-PROBE-024  | Thumbnail é **por serviço**: o round-robin percorre `(feed, serviço com vídeo)`; o tile do feed mostra o do serviço primário            | Num MPTS de N serviços cada um é atualizado a cada `N × stagger`; o custo de CPU por captura não muda (SPEC-PROBE-002)                 |
+| SPEC-PROBE-025  | Clicar numa célula da grade abre a lista consolidada dos problemas daquela janela, filtrada pelo escopo da linha                        | A lista traz nível, hora, descrição por extenso, ocorrências agregadas, serviço e PID; `Fechar` volta sem perder a seleção da célula   |
+| SPEC-PROBE-025a | A descrição do alerta se explica sozinha, com a referência normativa quando existe                                                      | Um `cc_error` vira "TR 101 290 P1.4 Continuity Counter Error: N descontinuidades no PID X", não o `check_id` cru                        |
+| SPEC-PROBE-026  | A barra de endereço (protocolo, URL, Conectar, Desconectar) fica **oculta** em modo Probe                                               | Os feeds vêm de `[[probe.feeds]]`; nenhum controle de conexão manual aparece na barra superior quando `mode = probe`                    |
+
+**Por que o thumbnail por serviço dilui a cadência.** O decoder de snapshot é único e
+sequencial (§5.4). Manter a cadência de 5 s por serviço num MPTS de 8 serviços exigiria
+oito armações de 2,5 s dentro de cada janela de 5 s — o decoder ficaria ocupado
+praticamente o tempo todo, e o orçamento de CPU do SPEC-PROBE-002 (< 25 % com dois feeds)
+iria embora. A troca deliberada é: **custo por captura constante, cadência por serviço
+proporcional ao número de serviços**.
 
 ### 4.2 Requisitos de degradação (RNF operacional)
 
@@ -363,8 +392,18 @@ pacote. Sem isso, 12 h de sessão num stream ruim geram um log inútil.
 
 ## 8. UI do modo Probe
 
-Duas telas: **mosaico** (visão do run) e **detalhe** (visão de um feed). O mosaico é a tela
-inicial do modo Probe; o detalhe abre ao clicar num tile e volta com `Esc`.
+Quatro níveis. O mosaico de feeds é a tela inicial; cada clique desce um nível e a trilha
+de navegação no topo sobe de volta.
+
+| Nível | Tela                                   | O que responde                                  |
+| ----- | -------------------------------------- | ----------------------------------------------- |
+| 0     | mosaico de **feeds**                   | qual ponto de rede está com problema             |
+| 1     | feed · abas **Resumo** e **Serviços**  | o transporte está bom? qual serviço está ruim?   |
+| 2     | **serviço**                            | o que neste canal está ruim, e em qual PID       |
+| 3     | **alertas da janela** (overlay)        | o que exatamente aconteceu naquele intervalo     |
+
+Não há barra de endereço em modo Probe (SPEC-PROBE-026): os feeds vêm de
+`[[probe.feeds]]`, e um campo de URL que não conecta nada seria um controle morto na tela.
 
 ### 8.1 Mosaico e anatomia do tile
 
@@ -399,25 +438,61 @@ exige decodificar áudio continuamente, que é exatamente o que o modo Probe nã
 indicador `A` reflete **presença e bitrate do PID de áudio**, não nível — e a spec diz isso
 na ajuda contextual para não induzir o operador ao erro.
 
-### 8.2 Detalhe do feed
+### 8.2 Nível 1 — feed (abas Resumo e Serviços)
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│ ← mosaico   0084_CANAL_A   udp://@239.15.0.183:50000  RTP+FEC ● 03:34 │
+│ ← voltar  Feeds › 0084_CANAL_A  udp://@239.15.0.183:50000 RTP+FEC ●   │
+│ [ Resumo ][ Serviços (8) ]                                            │
 ├────────────────┬──────────────────────────────────────────────────────┤
-│ thumbnail 5 s  │ LINHA DO TEMPO DE SAÚDE (144 células · 5 min)        │
-│ 320×180        │ ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   │
-│                ├──────────────────────────────────────────────────────┤
-│ RESUMO         │ Bitrate ─────────────  PDV / inter-arrival ────────  │
-│ uptime         │ Perda RTP/s ─────────  CC errors/s ────────────────  │
-│ disponibilidade├──────────────────────────────────────────────────────┤
-│ pior evento    │ EVENT LOG  [filtro: severidade · check · período]    │
-│ saúde da probe │ 13:55:07 Error rtp_missing 130 pkts  origin=network  │
+│ thumbnail 5 s  │ GRADE DE SAÚDE (144 colunas · 5 min)                 │
+│ 320×180        │ TRANSPORTE ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   │
+│                │ IP / RTP   ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   │
+│ RESUMO         │ 0055_BIS   ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   │
+│ uptime         ├──────────────────────────────────────────────────────┤
+│ disponibilidade│ Bitrate ─────────────  CC errors/s ────────────────  │
+│ serviços       ├──────────────────────────────────────────────────────┤
+│ pior evento    │ EVENT LOG  [filtro: severidade]                     │
+│ saúde da probe │ 13:55:07 Error cc_error ×130  pid 6100 · svc 55     │
 └────────────────┴──────────────────────────────────────────────────────┘
 ```
 
-- A faixa da timeline é o artefato-chave: depois de 12 h, é ela que responde "o stream
-  está bom?" antes de qualquer gráfico.
+A aba **Serviços** substitui a área central por um segundo mosaico, um tile por serviço do
+multiplex (SPEC-PROBE-022), com a mesma anatomia do tile de feed menos os indicadores de
+rede — um serviço não tem camada IP própria, o datagrama é do feed inteiro.
+
+### 8.3 Nível 2 — serviço, e a grade de saúde
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│ ← voltar  Feeds › 0084_CANAL_A › 0055_BIS_PRIMARY        ● 99,4 %     │
+├────────────────┬──────────────────────────────────────────────────────┤
+│ thumbnail      │      11:30   12:00   12:30   13:00   13:30   14:00   │
+│ TS  V  A       │ 0055_BIS   ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   │
+│                │ H.264 (6100)▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   │
+│ RESUMO         │ AC-3·por(6102)▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   │
+│ service id     │ MP2·eng(6108)▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇   │
+│ share do mux   ├──────────────────────────────────────────────────────┤
+│ PIDS DO SERVIÇO│ EVENT LOG (só deste serviço)                        │
+└────────────────┴──────────────────────────────────────────────────────┘
+```
+
+- A grade é o artefato-chave: depois de 12 h, é ela que responde "o stream está bom?"
+  antes de qualquer gráfico — e agora diz **onde**, não só *se*.
+- Todas as linhas compartilham um eixo de tempo único, derivado do relógio e não do índice
+  do vetor: um serviço que só apareceu na PAT depois de uma hora tem menos células, e
+  alinhar por índice deslocaria a coluna inteira. O que não existe fica cinza — "sem dado",
+  distinto de verde (SPEC-PROBE-009).
+- Clicar numa célula abre o nível 3 (SPEC-PROBE-025).
+
+### 8.4 Nível 3 — alertas da janela
+
+Overlay com a lista consolidada dos problemas daquela célula, filtrada pelo escopo da
+linha clicada: `#`, nível, hora, descrição por extenso, ocorrências agregadas, serviço e
+PID. Ordenada por severidade e, dentro dela, pelo mais recente.
+
+### 8.5 Notas de implementação da UI
+
 - Gráficos reusam `line_path`/`area_path` de
   [`crates/ui-slint/src/lib.rs:1290`](../../../crates/ui-slint/src/lib.rs) com `Path` do
   Slint — nenhum widget de chart novo.
@@ -425,6 +500,12 @@ na ajuda contextual para não induzir o operador ao erro.
   crua. Ver L-007 no [STATE.md](../../project/STATE.md) — o femtovg já é o gargalo de
   render; 43 200 pontos por gráfico travariam a janela.
 - Repintura dos painéis Probe: ≤ 1 Hz, com `cache-rendering-hint: true`.
+- **Uma `TouchArea` para a grade inteira**, com linha/coluna derivadas da posição do
+  clique. Com 12 linhas × 144 colunas seriam ~1700 `TouchArea` com estado de hover próprio,
+  pelo mesmo motivo do L-007.
+- As células da grade chegam num modelo **plano** com `row`/`col` e posicionamento
+  absoluto, não num array aninhado por linha: array dentro de struct complica o mapeamento
+  no Rust e o posicionamento absoluto já é o padrão do mosaico e dos gráficos.
 
 ---
 
@@ -498,6 +579,13 @@ comportamento atual de feed único vindo da barra de URL.
    não afeta contadores, sessão nem arquivos do outro.
 9. Elevar `MAX_FEEDS` de 2 para 4 compila sem alterar wiring (SPEC-PROBE-017a).
 10. `cargo test -p probe` verde e `cargo clippy --workspace -- -D warnings` limpo.
+11. Num MPTS real, a aba Serviços lista todos os serviços da PAT, com nome da SDT.
+12. Um CC error injetado no PID de um serviço acende aquele serviço e o PID correspondente
+    na grade, e deixa os vizinhos verdes (SPEC-PROBE-021a).
+13. Clicar numa célula com erro abre a lista de alertas daquela janela, e a soma das
+    ocorrências bate com o `events.jsonl` no mesmo intervalo (SPEC-PROBE-025).
+14. Em `mode = probe` a barra superior não mostra protocolo, URL, Conectar nem
+    Desconectar (SPEC-PROBE-026).
 
 ---
 
@@ -509,7 +597,9 @@ comportamento atual de feed único vindo da barra de URL.
 | 2     | **`FeedPipeline`: extrair o wiring de `main.rs`/`channels.rs` para N slots**      | 1          |
 | 3     | Crate `probe`: sessão, séries, writer CSV/JSONL, motor de checks com fixtures     | 2          |
 | 4     | Camada IP ([spec-14](../spec-14-probe-ip/spec.md)), incluindo detecção de encapsulamento | 3   |
-| 5     | Mosaico + tiles + navegação mosaico↔detalhe                                       | 3          |
+| 5     | Mosaico + tiles + navegação em quatro níveis                                      | 3          |
+| 5a    | Inventário de serviços + atribuição de erro por serviço/PID (SPEC-PROBE-021)      | 3          |
+| 5b    | Grade de saúde por escopo + alertas da janela (SPEC-PROBE-023/025)                | 5a         |
 | 6     | Painéis de detalhe: timeline, gráficos, event log, saúde da probe                 | 3          |
 | 7     | Snapshot de vídeo 5 s com round-robin entre feeds                                 | 2          |
 | 8     | Reconexão automática, anti-suspensão, retenção                                    | 3          |
@@ -537,11 +627,19 @@ os contadores prontos — são os mais baratos de empacotar depois.
 | 3 | Portas de FEC                                    | **`base+2` e `base+4`** (50002/50004 para base 50000) — confirma a convenção ST 2022-1     |
 | 4 | Relatório comparando dois pontos                 | sim, por `run_id`, com os 2 feeds lado a lado (SPEC-PROBE-020)                              |
 
+### 13.1a Fechadas (operação, 07/08/2026)
+
+| #  | Questão                                                        | Decisão                                                                                       |
+| -- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| 5  | Granularidade da timeline                                      | **5 min** (144 células/12 h), agrupando os erros da janela (SPEC-PROBE-023)                     |
+| 9  | Como escolher o serviço num MPTS                               | **Nível intermediário**: mosaico de feeds → feed (Resumo \| Serviços) → serviço (SPEC-PROBE-022) |
+| 10 | Barra de endereço em modo Probe                                | **Oculta** — os feeds vêm do TOML (SPEC-PROBE-026)                                              |
+| 11 | O que abre ao clicar numa célula                               | Lista consolidada dos problemas daquela janela, no escopo da linha (SPEC-PROBE-025)             |
+
 ### 13.2 Ainda em aberto
 
 | # | Questão                                                                                                  | Default assumido nesta spec          |
 | - | -------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| 5 | Granularidade da timeline: 5 min (144 células/12 h) ou 1 min (720)?                                       | 5 min                                |
 | 6 | Salvar thumbnail como evidência quando abre evento crítico?                                              | não (respeita "descarta o anterior") |
 | 7 | Os 2 feeds do mosaico são o **mesmo canal em 2 pontos** (comparação A×B) ou **2 canais no mesmo ponto**? | ambos suportados; o relatório apenas alinha o eixo de tempo, não assume equivalência |
 | 8 | Limiares default: derivar dos números observados na referência (perda 5,6e-5, IAT 702 µs ± 0,34 µs) ou zero-tolerância? | ver [spec-14 §8](../spec-14-probe-ip/spec.md#8-limiares-default-propostos) |

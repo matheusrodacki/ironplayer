@@ -39,9 +39,15 @@ local_drops_delta,sched_jitter_ms,worst_severity";
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RawCounters {
     pub cc_errors_by_pid: HashMap<Pid, u64>,
+    /// CRC inválidos por PID de tabela — `ErrorSnapshot` guarda por
+    /// `(pid, table_id)`; aqui as tabelas do mesmo PID são somadas, porque o
+    /// escopo da grade é o PID (SPEC-PROBE-023).
+    pub crc_by_pid: HashMap<Pid, u64>,
     pub crc_errors: u64,
     pub sync_losses: u64,
+    pub pcr_jitter_by_pid: HashMap<Pid, u64>,
     pub pcr_jitter_events: u64,
+    pub pcr_disc_by_pid: HashMap<Pid, u64>,
     pub pcr_discontinuities: u64,
     pub rtp_out_of_order: u64,
     pub udp_overflows: u64,
@@ -52,12 +58,34 @@ impl RawCounters {
     ///
     /// §5.3
     pub fn from_metrics(m: &MetricsSnapshot) -> Self {
+        let mut crc_by_pid: HashMap<Pid, u64> = HashMap::new();
+        for ((pid, _table_id), count) in &m.errors.crc_errors {
+            *crc_by_pid.entry(*pid).or_insert(0) += *count;
+        }
+
+        // Os logs de PCR são vetores de eventos, não contadores: contar por PID
+        // aqui é o que permite atribuir jitter/descontinuidade à linha do PID na
+        // grade.  Ambos são limitados por `max_error_log_entries` no crate `ts`,
+        // então saturam numa sessão longa — a mesma limitação que o total já
+        // tinha, agora só visível por PID.
+        let mut pcr_jitter_by_pid: HashMap<Pid, u64> = HashMap::new();
+        for record in &m.errors.pcr_jitter_events {
+            *pcr_jitter_by_pid.entry(record.pid).or_insert(0) += 1;
+        }
+        let mut pcr_disc_by_pid: HashMap<Pid, u64> = HashMap::new();
+        for record in &m.errors.pcr_discontinuities {
+            *pcr_disc_by_pid.entry(record.pid).or_insert(0) += 1;
+        }
+
         Self {
             cc_errors_by_pid: m.errors.cc_errors.clone(),
-            crc_errors: m.errors.crc_errors.values().sum(),
+            crc_errors: crc_by_pid.values().sum(),
+            crc_by_pid,
             sync_losses: m.errors.sync_losses,
-            pcr_jitter_events: m.errors.pcr_jitter_events.len() as u64,
-            pcr_discontinuities: m.errors.pcr_discontinuities.len() as u64,
+            pcr_jitter_events: pcr_jitter_by_pid.values().sum(),
+            pcr_jitter_by_pid,
+            pcr_discontinuities: pcr_disc_by_pid.values().sum(),
+            pcr_disc_by_pid,
             rtp_out_of_order: m.errors.rtp_out_of_order,
             udp_overflows: m.errors.udp_overflows,
         }
@@ -70,9 +98,15 @@ pub struct CounterDeltas {
     /// CC errors novos por PID — vira contexto do evento (SPEC-PROBE-008).
     pub cc_by_pid: HashMap<Pid, u64>,
     pub cc_total: u64,
+    /// CRC inválidos novos por PID de tabela (SPEC-PROBE-021).
+    pub crc_by_pid: HashMap<Pid, u64>,
     pub crc: u64,
     pub sync_loss: u64,
+    /// Jitter de PCR novo por PID (SPEC-PROBE-021).
+    pub pcr_jitter_by_pid: HashMap<Pid, u64>,
     pub pcr_jitter: u64,
+    /// Descontinuidade de PCR nova por PID (SPEC-PROBE-021).
+    pub pcr_disc_by_pid: HashMap<Pid, u64>,
     pub pcr_disc: u64,
     pub rtp_out_of_order: u64,
     pub udp_overflows: u64,
@@ -120,26 +154,21 @@ impl CounterBaseline {
             return CounterDeltas::default();
         }
 
-        let mut cc_by_pid = HashMap::new();
-        for (pid, total) in &now.cc_errors_by_pid {
-            let before = self.prev.cc_errors_by_pid.get(pid).copied().unwrap_or(0);
-            let d = total.saturating_sub(before);
-            if d > 0 {
-                cc_by_pid.insert(*pid, d);
-            }
-        }
+        let cc_by_pid = delta_by_pid(&now.cc_errors_by_pid, &self.prev.cc_errors_by_pid);
+        let crc_by_pid = delta_by_pid(&now.crc_by_pid, &self.prev.crc_by_pid);
+        let pcr_jitter_by_pid = delta_by_pid(&now.pcr_jitter_by_pid, &self.prev.pcr_jitter_by_pid);
+        let pcr_disc_by_pid = delta_by_pid(&now.pcr_disc_by_pid, &self.prev.pcr_disc_by_pid);
 
         let deltas = CounterDeltas {
             cc_total: cc_by_pid.values().sum(),
             cc_by_pid,
-            crc: now.crc_errors.saturating_sub(self.prev.crc_errors),
+            crc: crc_by_pid.values().sum(),
+            crc_by_pid,
             sync_loss: now.sync_losses.saturating_sub(self.prev.sync_losses),
-            pcr_jitter: now
-                .pcr_jitter_events
-                .saturating_sub(self.prev.pcr_jitter_events),
-            pcr_disc: now
-                .pcr_discontinuities
-                .saturating_sub(self.prev.pcr_discontinuities),
+            pcr_jitter: pcr_jitter_by_pid.values().sum(),
+            pcr_jitter_by_pid,
+            pcr_disc: pcr_disc_by_pid.values().sum(),
+            pcr_disc_by_pid,
             rtp_out_of_order: now
                 .rtp_out_of_order
                 .saturating_sub(self.prev.rtp_out_of_order),
@@ -149,6 +178,26 @@ impl CounterBaseline {
         self.prev = now;
         deltas
     }
+}
+
+/// Delta positivo por PID entre dois mapas de cumulativos.
+///
+/// PIDs sem novidade saem do mapa: o motor de checks trata chave ausente como
+/// "sem violação" (é assim que um evento fecha quando o PID some do multiplex),
+/// e uma entrada com zero significaria a mesma coisa gastando uma alocação.
+///
+/// RNF-PRB-003 — contador que regride (reset, reconexão) vira zero, não
+/// underflow.
+fn delta_by_pid(now: &HashMap<Pid, u64>, prev: &HashMap<Pid, u64>) -> HashMap<Pid, u64> {
+    let mut out = HashMap::new();
+    for (pid, total) in now {
+        let before = prev.get(pid).copied().unwrap_or(0);
+        let d = total.saturating_sub(before);
+        if d > 0 {
+            out.insert(*pid, d);
+        }
+    }
+    out
 }
 
 /// Bitrate agregado dos PIDs de vídeo e de áudio do multiplex.
@@ -271,10 +320,18 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    /// Cumulativos de bancada. O CRC entra atribuído a um PID de tabela porque
+    /// é assim que ele chega do `ErrorSnapshot` — o total é derivado.
     fn counters(cc: &[(Pid, u64)], crc: u64, sync: u64) -> RawCounters {
+        let crc_by_pid: HashMap<Pid, u64> = if crc > 0 {
+            HashMap::from([(0x0000, crc)])
+        } else {
+            HashMap::new()
+        };
         RawCounters {
             cc_errors_by_pid: cc.iter().copied().collect(),
-            crc_errors: crc,
+            crc_errors: crc_by_pid.values().sum(),
+            crc_by_pid,
             sync_losses: sync,
             ..Default::default()
         }
@@ -317,6 +374,62 @@ mod tests {
         assert_eq!(d.cc_total, 0);
         assert_eq!(d.crc, 0);
         assert_eq!(d.sync_loss, 0);
+    }
+
+    /// SPEC-PROBE-021 — CRC e PCR chegam atribuídos ao PID onde ocorreram, e
+    /// não só como total do multiplex: sem isso a linha do PID na grade de
+    /// saúde ficaria sempre verde num serviço que está de fato quebrado.
+    #[test]
+    fn spec_probe_021_crc_and_pcr_are_attributed_per_pid() {
+        use ts::metrics::{PcrDiscontinuityRecord, PcrJitterRecord};
+
+        let jitter = |pid: Pid| PcrJitterRecord {
+            pid,
+            timestamp: std::time::Instant::now(),
+            expected_us: 0,
+            measured_us: 0,
+        };
+        let disc = |pid: Pid| PcrDiscontinuityRecord {
+            pid,
+            timestamp: std::time::Instant::now(),
+        };
+
+        let mut m = MetricsSnapshot {
+            pid_table: vec![],
+            total_bitrate_kbps: 0.0,
+            null_ratio: 0.0,
+            errors: Default::default(),
+            tdt_offset_secs: None,
+            timestamp: std::time::Instant::now(),
+            av_sync_offset_ms: 0,
+            late_frames_dropped: 0,
+            early_frames_held: 0,
+            pts_discontinuities: 0,
+            video_queue_depth: 0,
+            pipeline: Default::default(),
+        };
+        // Duas tabelas no mesmo PID somam na mesma linha da grade.
+        m.errors.crc_errors = HashMap::from([((0x0011, 0x42), 2), ((0x0011, 0x46), 1)]);
+        m.errors.pcr_jitter_events = vec![jitter(0x0200), jitter(0x0200), jitter(0x0300)];
+        m.errors.pcr_discontinuities = vec![disc(0x0200)];
+
+        let mut base = CounterBaseline::new();
+        base.delta(RawCounters::from_metrics(&m));
+
+        m.errors.crc_errors.insert((0x0011, 0x42), 5);
+        m.errors.pcr_jitter_events.push(jitter(0x0300));
+        let d = base.delta(RawCounters::from_metrics(&m));
+
+        assert_eq!(d.crc_by_pid.get(&0x0011), Some(&3));
+        assert_eq!(d.crc, 3, "o total continua sendo a soma dos PIDs");
+        assert_eq!(d.pcr_jitter_by_pid.get(&0x0300), Some(&1));
+        assert_eq!(
+            d.pcr_jitter_by_pid.get(&0x0200),
+            None,
+            "PID sem novidade sai do mapa"
+        );
+        assert_eq!(d.pcr_jitter, 1);
+        assert_eq!(d.pcr_disc, 0);
     }
 
     /// SPEC-PROBE-011 — `reset()` faz o próximo tick virar o novo ponto zero.

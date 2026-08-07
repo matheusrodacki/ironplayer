@@ -17,7 +17,7 @@
 //! `FeedPipeline`: em modo Probe ele não existe (SPEC-PROBE-002), e em
 //! Cinema/Broadcast só o slot 0 o instancia, em `main.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -28,7 +28,9 @@ use net::{
     NetEvent, ReceiverConfig, RtpStripper, StopHandle as NetStopHandle, StopToken as NetStopToken,
     StreamUrl, UdpReceiver,
 };
-use probe::{Encapsulation, FecMode, ProbeConfig};
+use probe::{
+    Encapsulation, FecMode, ProbeConfig, ServiceInfo, ServiceStream, ServiceVisual, StreamKind,
+};
 use ts::aggregator::{
     AggregatorNetEvent, MetricsAggregator, SnapshotReceiver, StopHandle as MetricsStopHandle,
     StopToken as MetricsStopToken,
@@ -164,11 +166,18 @@ pub struct FeedShared {
     audio_pids: RwLock<Vec<Pid>>,
     /// Nome do serviço vindo da SDT, quando houver.
     service_name: RwLock<Option<String>>,
-    /// Codec do PID de vídeo primário, para armar o decoder de snapshot.
-    video_codec: RwLock<Option<av::MediaCodec>>,
-    /// Altura do vídeo observada no último snapshot (badge `HD`/`SD`).
-    video_height: AtomicU32,
-    /// Último resultado do tick de snapshot (SPEC-PROBE-003a).
+    /// Inventário de serviços montado a partir de PAT/PMT/SDT.
+    ///
+    /// `Arc` porque o `probe-engine` lê isto a 1 Hz e a thread de snapshot a
+    /// cada tick de round-robin: clonar o `Vec` inteiro em cada leitura seria
+    /// desperdício, e segurar o `RwLock` durante o tick bloquearia a PSI.
+    ///
+    /// SPEC-PROBE-021
+    services: RwLock<Arc<Vec<ServiceInfo>>>,
+    /// Último resultado do thumbnail, por serviço (SPEC-PROBE-024).
+    visuals: RwLock<BTreeMap<u16, ServiceVisual>>,
+    /// Último resultado do tick de snapshot do feed, quando não há serviço
+    /// algum para atribuir (PSI ainda não chegou) — SPEC-PROBE-003a.
     snapshot_state: AtomicU32,
     /// Thumbnail suspenso pelo 1º estágio de degradação (SPEC-PROBE-013a).
     snapshot_suspended: AtomicBool,
@@ -220,8 +229,8 @@ impl FeedShared {
             video_pids: RwLock::new(Vec::new()),
             audio_pids: RwLock::new(Vec::new()),
             service_name: RwLock::new(None),
-            video_codec: RwLock::new(None),
-            video_height: AtomicU32::new(0),
+            services: RwLock::new(Arc::new(Vec::new())),
+            visuals: RwLock::new(BTreeMap::new()),
             snapshot_state: AtomicU32::new(0),
             snapshot_suspended: AtomicBool::new(false),
         }
@@ -295,25 +304,40 @@ impl FeedShared {
         self.service_name.read().ok().and_then(|g| g.clone())
     }
 
-    /// Codec do PID de vídeo primário (SPEC-PROBE-003).
-    pub fn video_codec(&self) -> Option<av::MediaCodec> {
-        self.video_codec.read().ok().and_then(|g| *g)
-    }
-
-    /// Altura do vídeo, quando já houve um snapshot decodificado.
+    /// Inventário de serviços conhecido agora.
     ///
-    /// SPEC-PROBE-018 — badge `HD`/`SD`. Vem do frame do thumbnail porque o
-    /// modo Probe não roda o `StreamProbe` de Media Info (SPEC-PROBE-002).
-    pub fn video_height(&self) -> Option<u32> {
-        match self.video_height.load(Ordering::Relaxed) {
-            0 => None,
-            h => Some(h),
-        }
+    /// SPEC-PROBE-021
+    pub fn services(&self) -> Arc<Vec<ServiceInfo>> {
+        self.services
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| Arc::new(Vec::new()))
     }
 
-    /// Registra a altura observada num frame de snapshot.
-    pub fn set_video_height(&self, height: u32) {
-        self.video_height.store(height, Ordering::Relaxed);
+    /// Resultado do último thumbnail de cada serviço.
+    ///
+    /// SPEC-PROBE-024
+    pub fn visuals(&self) -> BTreeMap<u16, ServiceVisual> {
+        self.visuals.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Publica o resultado do thumbnail de um serviço.
+    ///
+    /// A altura vem do frame decodificado porque o modo Probe não roda o
+    /// `StreamProbe` de Media Info (SPEC-PROBE-002); é ela que decide o badge
+    /// `HD`/`SD` do tile.
+    ///
+    /// SPEC-PROBE-024
+    pub fn set_visual(&self, service_id: u16, visual: ServiceVisual) {
+        if let Ok(mut guard) = self.visuals.write() {
+            // A altura só é conhecida quando um frame decodifica; um tick
+            // "sem keyframe" não pode apagar o badge que já estava certo.
+            let entry = guard.entry(service_id).or_default();
+            entry.state = visual.state;
+            if visual.video_height.is_some() {
+                entry.video_height = visual.video_height;
+            }
+        }
     }
 
     /// Estado do último tick de snapshot (SPEC-PROBE-003a).
@@ -833,18 +857,35 @@ where
 // FeedTables — PSI mínima do modo Probe
 // ---------------------------------------------------------------------------
 
-/// Consumidor de PSI reduzido ao que o tile precisa.
+/// Descrição de um serviço vinda da SDT, antes de casar com a PMT.
+///
+/// A SDT costuma chegar antes das PMTs: guardar o nome à parte evita descartá-lo
+/// e ficar com o mosaico cheio de "Serviço 1097" até a próxima repetição.
+#[derive(Debug, Clone, Default)]
+struct SdtEntry {
+    name: Option<String>,
+    provider: Option<String>,
+    scrambled: bool,
+}
+
+/// Consumidor de PSI reduzido ao que as telas de Probe precisam.
 ///
 /// O `TableDispatcher` completo (auto-play, roteamento de decode, menu de
-/// contexto) não faz sentido num feed sem player: aqui só interessa saber
-/// quais PIDs são de vídeo e de áudio, para os indicadores `V`/`A` e para o
-/// bitrate por tipo (§8.1).
+/// contexto) não faz sentido num feed sem player.  O que interessa aqui é o
+/// **inventário**: quais serviços o multiplex carrega, quais PIDs são de cada
+/// um e o que cada PID é — é isso que separa "o transporte está ruim" de
+/// "**este** serviço está ruim" (SPEC-PROBE-021).
 #[derive(Default)]
 struct FeedTables {
     pmt_pids: HashSet<Pid>,
-    /// PIDs por serviço, para não perder trilhas ao reprocessar uma PMT.
-    video: HashMap<u16, Vec<Pid>>,
-    audio: HashMap<u16, Vec<Pid>>,
+    /// `service_id` → PID da PMT, na ordem da PAT.
+    programs: Vec<(u16, Pid)>,
+    /// Streams por serviço, vindos da PMT.
+    streams: HashMap<u16, Vec<ServiceStream>>,
+    /// PCR PID por serviço.
+    pcr_pid: HashMap<u16, Pid>,
+    /// Descrições da SDT, guardadas mesmo antes da PMT correspondente.
+    sdt: HashMap<u16, SdtEntry>,
     /// Rotas já enviadas ao demuxer — a PMT se repete a cada ~100 ms e
     /// reenviar tudo a cada repetição saturaria o canal de controle à toa.
     routed: HashSet<Pid>,
@@ -881,6 +922,18 @@ impl FeedTables {
                 if let Ok(pat) = ts::tables::Pat::from_section_body(body) {
                     // `program_number == 0` aponta para a NIT, não para uma PMT.
                     self.pmt_pids = pat.pmt_pids().collect();
+                    self.programs = pat
+                        .programs
+                        .iter()
+                        .filter(|p| p.program_number != 0)
+                        .map(|p| (p.program_number, p.pid))
+                        .collect();
+                    // Serviço que saiu da PAT sai do inventário: a grade de
+                    // saúde derruba o escopo dele no tick seguinte.
+                    let live: HashSet<u16> = self.programs.iter().map(|(id, _)| *id).collect();
+                    self.streams.retain(|id, _| live.contains(id));
+                    self.pcr_pid.retain(|id, _| live.contains(id));
+
                     for program in &pat.programs {
                         let route = if program.program_number == 0 {
                             DemuxRoute::Nit(program.pid)
@@ -889,32 +942,28 @@ impl FeedTables {
                         };
                         self.route(route_tx, route);
                     }
+                    self.publish(shared);
                 }
             }
             // PMT
             0x02 if self.pmt_pids.contains(&section.pid) => {
                 if let Ok(pmt) = ts::tables::Pmt::from_section_body(body) {
-                    let mut video = Vec::new();
-                    let mut audio = Vec::new();
+                    let mut streams = Vec::with_capacity(pmt.streams.len());
                     for stream in &pmt.streams {
                         // Todo PID listado numa PMT é elementar, seja ele
                         // vídeo, áudio, legenda ou dado: o que importa aqui é
                         // tirá-lo do caminho de seções.
                         self.route(route_tx, DemuxRoute::Elementary(stream.elementary_pid));
-
-                        if is_video_stream_type(stream.stream_type) {
-                            if video.is_empty() {
-                                if let Ok(mut guard) = shared.video_codec.write() {
-                                    *guard = av::MediaCodec::from_stream_type(stream.stream_type);
-                                }
-                            }
-                            video.push(stream.elementary_pid);
-                        } else if stream.is_audio() {
-                            audio.push(stream.elementary_pid);
-                        }
+                        streams.push(ServiceStream {
+                            pid: stream.elementary_pid,
+                            stream_type: stream.stream_type,
+                            kind: classify_stream(stream),
+                            codec: stream.label().to_string(),
+                            language: language_of(stream),
+                        });
                     }
-                    self.video.insert(pmt.program_number, video);
-                    self.audio.insert(pmt.program_number, audio);
+                    self.pcr_pid.insert(pmt.program_number, pmt.pcr_pid);
+                    self.streams.insert(pmt.program_number, streams);
                     self.publish(shared);
                 }
             }
@@ -927,31 +976,115 @@ impl FeedTables {
                 let mut with_crc = section.data.to_vec();
                 with_crc.extend_from_slice(&[0, 0, 0, 0]);
                 if let Ok(sdt) = ts::tables::Sdt::parse(&with_crc) {
-                    if let Some(name) = sdt.services.iter().find_map(|s| s.service_name.clone()) {
-                        if let Ok(mut guard) = shared.service_name.write() {
-                            *guard = Some(name);
-                        }
+                    if !sdt.actual {
+                        return;
                     }
+                    for svc in &sdt.services {
+                        self.sdt.insert(
+                            svc.service_id,
+                            SdtEntry {
+                                name: svc.service_name.clone(),
+                                provider: svc.provider_name.clone(),
+                                scrambled: svc.free_ca_mode,
+                            },
+                        );
+                    }
+                    self.publish(shared);
                 }
             }
             _ => {}
         }
     }
 
+    /// Recompõe o inventário e os agregados derivados dele.
     fn publish(&self, shared: &FeedShared) {
-        let flatten = |m: &HashMap<u16, Vec<Pid>>| {
-            let mut v: Vec<Pid> = m.values().flatten().copied().collect();
+        let services: Vec<ServiceInfo> = self
+            .programs
+            .iter()
+            .map(|(service_id, pmt_pid)| {
+                let sdt = self.sdt.get(service_id).cloned().unwrap_or_default();
+                ServiceInfo {
+                    service_id: *service_id,
+                    name: sdt.name,
+                    provider: sdt.provider,
+                    pmt_pid: *pmt_pid,
+                    pcr_pid: self.pcr_pid.get(service_id).copied().unwrap_or(0),
+                    scrambled: sdt.scrambled,
+                    streams: self.streams.get(service_id).cloned().unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        // Os PIDs achatados continuam alimentando os indicadores `V`/`A` e a
+        // presença do feed inteiro (SPEC-PROBE-018) — a visão por serviço é
+        // adicional, não substituta.
+        let collect_kind = |kind: StreamKind| {
+            let mut v: Vec<Pid> = services
+                .iter()
+                .flat_map(|s| s.pids_of(kind))
+                .collect();
             v.sort_unstable();
             v.dedup();
             v
         };
         if let Ok(mut guard) = shared.video_pids.write() {
-            *guard = flatten(&self.video);
+            *guard = collect_kind(StreamKind::Video);
         }
         if let Ok(mut guard) = shared.audio_pids.write() {
-            *guard = flatten(&self.audio);
+            *guard = collect_kind(StreamKind::Audio);
+        }
+        if let Ok(mut guard) = shared.service_name.write() {
+            *guard = services
+                .iter()
+                .find(|s| s.primary_video_pid().is_some())
+                .or_else(|| services.first())
+                .and_then(|s| s.name.clone());
+        }
+        if let Ok(mut guard) = shared.services.write() {
+            *guard = Arc::new(services);
         }
     }
+}
+
+/// Classifica um stream da PMT no papel que a grade de saúde usa.
+///
+/// A ordem importa: `is_audio()` do crate `ts` já resolve o 0x06 ambíguo
+/// (AC-3/E-AC-3/AAC via descriptor), então legenda e teletexto só são testados
+/// depois — senão um AC-3 com `subtitling_descriptor` viraria legenda.
+fn classify_stream(stream: &ts::tables::PmtStream) -> StreamKind {
+    if is_video_stream_type(stream.stream_type) {
+        StreamKind::Video
+    } else if stream.is_audio() {
+        StreamKind::Audio
+    } else if stream
+        .descriptors
+        .iter()
+        .any(|d| matches!(d.tag, 0x56 | 0x59))
+    {
+        // 0x56 teletext_descriptor · 0x59 subtitling_descriptor
+        StreamKind::Subtitle
+    } else {
+        StreamKind::Data
+    }
+}
+
+/// Idioma ISO-639 de um stream, quando sinalizado.
+///
+/// Aceita `iso_639_language_descriptor` (0x0A), `subtitling` (0x59) e
+/// `teletext` (0x56) — os três começam o payload com os 3 bytes do código.
+fn language_of(stream: &ts::tables::PmtStream) -> Option<String> {
+    stream
+        .descriptors
+        .iter()
+        .filter(|d| matches!(d.tag, 0x0A | 0x56 | 0x59))
+        .find_map(|d| {
+            let code = d.data.get(..3)?;
+            // Dado externo: só aceita ASCII imprimível, nunca `from_utf8`
+            // otimista sobre bytes de rede (RNF-PRB-003).
+            code.iter()
+                .all(|b| b.is_ascii_alphabetic())
+                .then(|| String::from_utf8_lossy(code).to_lowercase())
+        })
 }
 
 #[cfg(test)]
@@ -1153,6 +1286,191 @@ fec  = "off"
         // controle tem 256 vagas e saturaria em segundos.
         tables.apply(&section(0x0100, 0x02, &pmt_body), &shared, &tx);
         assert_eq!(rx.try_iter().count(), 0, "registro é idempotente");
+    }
+
+    /// SPEC-PROBE-021 · SPEC-PROBE-022 — a PSI monta o **inventário** de
+    /// serviços, não só uma lista achatada de PIDs: é o que permite o mosaico
+    /// de serviços e a atribuição de erro por canal num MPTS.
+    #[test]
+    fn spec_probe_021_psi_builds_the_service_inventory() {
+        let (tx, rx) = bounded::<DemuxRoute>(64);
+        let shared = FeedShared::new();
+        let mut tables = FeedTables::default();
+
+        // PAT: NIT no 0x0010, programa 1 → PMT 0x0100, programa 2 → PMT 0x0101.
+        let pat_body = [
+            0x00, 0x01, //
+            0x01, 0x00, 0x00, //
+            0x00, 0x00, 0xE0, 0x10, // NIT
+            0x00, 0x01, 0xE1, 0x00, // programa 1
+            0x00, 0x02, 0xE1, 0x01, // programa 2
+        ];
+        tables.apply(&section(0x0000, 0x00, &pat_body), &shared, &tx);
+        assert!(
+            shared.services().len() == 2,
+            "os dois programas da PAT já entram no inventário, mesmo sem PMT"
+        );
+
+        // PMT do programa 1: vídeo H.264, áudio AC-3 em português e legenda.
+        let pmt1 = [
+            0x00, 0x01, //
+            0x01, 0x00, 0x00, //
+            0xE2, 0x00, // PCR_PID = 0x0200
+            0xF0, 0x00, // program_info_length = 0
+            0x1B, 0xE2, 0x00, 0xF0, 0x00, // vídeo 0x0200
+            // áudio 0x0201 com iso_639_language_descriptor "por"
+            0x81, 0xE2, 0x01, 0xF0, 0x06, 0x0A, 0x04, b'p', b'o', b'r', 0x00,
+            // legenda 0x0202 com subtitling_descriptor "eng"
+            0x06, 0xE2, 0x02, 0xF0, 0x0A, 0x59, 0x08, b'e', b'n', b'g', 0x10, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        tables.apply(&section(0x0100, 0x02, &pmt1), &shared, &tx);
+
+        // PMT do programa 2: só áudio (rádio).
+        let pmt2 = [
+            0x00, 0x02, //
+            0x01, 0x00, 0x00, //
+            0xE3, 0x00, // PCR_PID = 0x0300
+            0xF0, 0x00, //
+            0x03, 0xE3, 0x00, 0xF0, 0x00, // MPEG-1 áudio 0x0300
+        ];
+        tables.apply(&section(0x0101, 0x02, &pmt2), &shared, &tx);
+
+        // SDT actual da fixture do crate `ts`: nomeia o serviço 1. O
+        // `SectionAssembler` entrega a seção **sem** os 4 bytes de CRC, que é
+        // como `FeedTables` a recebe no ar.
+        let sdt = include_bytes!("../crates/ts/tests/fixtures/sdt_actual.bin");
+        tables.apply(
+            &CompleteSection {
+                pid: 0x0011,
+                table_id: 0x42,
+                data: bytes::Bytes::copy_from_slice(&sdt[..sdt.len() - 4]),
+            },
+            &shared,
+            &tx,
+        );
+
+        let services = shared.services();
+        assert_eq!(services.len(), 2, "ordem e cardinalidade vêm da PAT");
+
+        let a = &services[0];
+        assert_eq!(a.service_id, 1);
+        assert_eq!(a.pmt_pid, 0x0100);
+        assert_eq!(a.pcr_pid, 0x0200);
+        assert_eq!(
+            a.name.as_deref(),
+            Some("Channel 1"),
+            "o nome vem da SDT, não da PMT"
+        );
+        assert_eq!(a.provider.as_deref(), Some("IronTV"));
+        assert_eq!(a.streams.len(), 3);
+        assert_eq!(a.streams[0].kind, StreamKind::Video);
+        assert_eq!(a.streams[1].kind, StreamKind::Audio);
+        assert_eq!(
+            a.streams[1].language.as_deref(),
+            Some("por"),
+            "idioma sai do iso_639_language_descriptor"
+        );
+        // 0x06 com subtitling_descriptor é legenda, não áudio nem dado solto.
+        assert_eq!(a.streams[2].kind, StreamKind::Subtitle);
+        assert_eq!(a.streams[2].language.as_deref(), Some("eng"));
+        assert_eq!(a.primary_video_pid(), Some(0x0200));
+        assert_eq!(a.primary_video_stream_type(), Some(0x1B));
+
+        let b = &services[1];
+        assert_eq!(b.service_id, 2);
+        assert_eq!(
+            b.name, None,
+            "serviço fora da SDT fica sem nome e cai no rótulo por id"
+        );
+        assert_eq!(b.display_name(), "Serviço 2");
+        assert_eq!(b.primary_video_pid(), None, "rádio não tem vídeo");
+
+        // A visão achatada continua alimentando os indicadores do feed (§8.1).
+        assert_eq!(shared.video_pids(), vec![0x0200]);
+        assert_eq!(shared.audio_pids(), vec![0x0201, 0x0300]);
+        assert_eq!(shared.service_name().as_deref(), Some("Channel 1"));
+
+        // Todo PID elementar saiu do caminho de seções (regressão do CRC
+        // fantasma), inclusive os do segundo programa.
+        let routed: Vec<Pid> = rx
+            .try_iter()
+            .filter_map(|r| match r {
+                DemuxRoute::Elementary(pid) => Some(pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(routed, vec![0x0200, 0x0201, 0x0202, 0x0300]);
+    }
+
+    /// SPEC-PROBE-021 — programa que sai da PAT sai do inventário: o mosaico
+    /// de serviços não pode mostrar canal que o multiplex não carrega mais.
+    #[test]
+    fn spec_probe_021_service_removed_from_pat_leaves_the_inventory() {
+        let (tx, _rx) = bounded::<DemuxRoute>(64);
+        let shared = FeedShared::new();
+        let mut tables = FeedTables::default();
+
+        let pat_two = [
+            0x00, 0x01, 0x01, 0x00, 0x00, //
+            0x00, 0x01, 0xE1, 0x00, //
+            0x00, 0x02, 0xE1, 0x01,
+        ];
+        tables.apply(&section(0x0000, 0x00, &pat_two), &shared, &tx);
+        let pmt2 = [
+            0x00, 0x02, 0x01, 0x00, 0x00, 0xE3, 0x00, 0xF0, 0x00, //
+            0x03, 0xE3, 0x00, 0xF0, 0x00,
+        ];
+        tables.apply(&section(0x0101, 0x02, &pmt2), &shared, &tx);
+        assert_eq!(shared.services().len(), 2);
+        assert_eq!(shared.audio_pids(), vec![0x0300]);
+
+        // Nova PAT sem o programa 2.
+        let pat_one = [
+            0x00, 0x01, 0x02, 0x00, 0x00, //
+            0x00, 0x01, 0xE1, 0x00,
+        ];
+        tables.apply(&section(0x0000, 0x00, &pat_one), &shared, &tx);
+
+        let services = shared.services();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].service_id, 1);
+        assert!(
+            shared.audio_pids().is_empty(),
+            "os PIDs do programa removido também saem da visão achatada"
+        );
+    }
+
+    /// SPEC-PROBE-024 — o resultado do thumbnail é por serviço, e um tick sem
+    /// keyframe não apaga o badge `HD` que já estava correto.
+    #[test]
+    fn spec_probe_024_visual_keeps_known_height_across_a_missed_tick() {
+        let shared = FeedShared::new();
+        assert!(shared.visuals().is_empty());
+
+        shared.set_visual(
+            55,
+            ServiceVisual {
+                video_height: Some(1080),
+                state: probe::SnapshotState::Ok,
+            },
+        );
+        shared.set_visual(
+            55,
+            ServiceVisual {
+                video_height: None,
+                state: probe::SnapshotState::NoKeyframe,
+            },
+        );
+
+        let v = shared.visuals();
+        let entry = v.get(&55).expect("serviço 55");
+        assert_eq!(entry.video_height, Some(1080));
+        assert_eq!(entry.state, probe::SnapshotState::NoKeyframe);
+        assert!(
+            !v.contains_key(&56),
+            "serviço sem captura não inventa dado"
+        );
     }
 
     /// SPEC-PROBE-018 — o badge `SCR` sai de `transport_scrambling_control`.

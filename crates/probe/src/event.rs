@@ -76,6 +76,17 @@ impl EventContext {
         self
     }
 
+    /// Atribui a ocorrência a um serviço do multiplex.
+    ///
+    /// É o que permite a grade do §8.3 e o mosaico de serviços separarem "o
+    /// transporte está ruim" de "**este** serviço está ruim".
+    ///
+    /// SPEC-PROBE-021
+    pub fn with_service(mut self, service_id: u16) -> Self {
+        self.service_id = Some(service_id);
+        self
+    }
+
     /// Chave estável usada na deduplicação de eventos.
     ///
     /// **Não inclui `origin`**: a origem pode ser reclassificada de `network`

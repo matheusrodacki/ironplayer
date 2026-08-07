@@ -25,9 +25,16 @@ import "fonts/JetBrainsMono-ExtraBold.ttf";
 import { Theme } from "theme.slint";
 export { Theme }
 
-// ─── Modo Probe (SPEC-PROBE-018/019) ────────────────────────────────────────
-import { ProbeMosaic, ProbeDetail, ProbeTile, ProbeTimelineCell, ProbeEventRow, ProbeChart, ProbeInfoRow } from "probe.slint";
-export { ProbeTile, ProbeTimelineCell, ProbeEventRow, ProbeChart, ProbeInfoRow }
+// ─── Modo Probe (SPEC-PROBE-018/019/021/022/023/025) ────────────────────────
+import {
+    ProbeMosaic, ProbeFeedView, ProbeServiceView, ProbeAlerts,
+    ProbeTile, ProbeServiceTile, ProbeGridRow, ProbeGridCell, ProbeGridTick,
+    ProbeEventRow, ProbeAlertRow, ProbeChart, ProbeInfoRow
+} from "probe.slint";
+export {
+    ProbeTile, ProbeServiceTile, ProbeGridRow, ProbeGridCell, ProbeGridTick,
+    ProbeEventRow, ProbeAlertRow, ProbeChart, ProbeInfoRow
+}
 
 // ─── Structs de dados (espelhados em Rust) ──────────────────────────────────
 export struct PidRow {
@@ -547,25 +554,40 @@ export component AppWindow inherits Window {
     // inicial vem de `[ui] mode` do ironstream.toml.
     in-out property <int> app-mode: 1;
 
-    // ── Estado do modo Probe (SPEC-PROBE-018/019) ──────────────────────────
+    // ── Estado do modo Probe (SPEC-PROBE-018/019/021/022/023) ──────────────
     in property <[ProbeTile]> probe-tiles: [];
     in property <int> probe-max-feeds: 2;
     in property <string> probe-run-clock: "00:00:00";
     in property <string> probe-run-id: "";
     in property <bool> probe-recording: false;
     in property <string> probe-status: "";
-    /// Slot aberto no detalhe; -1 = mosaico (§8).
-    in-out property <int> probe-detail-slot: -1;
+    /// Nível aberto: 0 feeds · 1 feed · 2 serviço (§8).
+    in-out property <int> probe-level: 0;
+    /// Aba do nível 1: 0 Resumo · 1 Serviços (SPEC-PROBE-022).
+    in-out property <int> probe-feed-tab: 0;
     in property <ProbeTile> probe-detail-tile;
-    in property <[ProbeTimelineCell]> probe-timeline: [];
+    in property <ProbeServiceTile> probe-service-tile;
+    in property <[ProbeServiceTile]> probe-services: [];
+    // Grade de saúde por cluster de tempo (SPEC-PROBE-023).
+    in property <[ProbeGridRow]> probe-grid-rows: [];
+    in property <[ProbeGridCell]> probe-grid-cells: [];
+    in property <[ProbeGridTick]> probe-grid-ticks: [];
+    in property <int> probe-grid-cols: 0;
+    in-out property <int> probe-grid-selected-row: -1;
+    in-out property <int> probe-grid-selected-col: -1;
+    in property <string> probe-grid-caption: "";
     in property <[ProbeChart]> probe-charts: [];
     in property <[ProbeEventRow]> probe-events: [];
     in property <[ProbeInfoRow]> probe-summary: [];
     in property <[ProbeInfoRow]> probe-health: [];
-    in property <string> probe-timeline-caption: "";
-    in-out property <int> probe-timeline-selected: -1;
+    in property <[ProbeInfoRow]> probe-streams: [];
     in-out property <int> probe-window-index: 1;
     in property <string> probe-severity-filter: "todas";
+    // Nível 3: alertas consolidados da célula selecionada (SPEC-PROBE-025).
+    in-out property <bool> probe-alerts-open: false;
+    in property <[ProbeAlertRow]> probe-alerts: [];
+    in property <string> probe-alerts-title: "";
+    in property <string> probe-alerts-subtitle: "";
 
     // ── Callbacks (tratados em Rust) ───────────────────────────────────────
     callback connect(string);
@@ -592,10 +614,18 @@ export component AppWindow inherits Window {
     callback probe-stop-run();
     /// Gera o relatório HTML do run (SPEC-PROBE-014).
     callback probe-export-report();
-    /// Abre o detalhe de um feed (SPEC-PROBE-019).
-    callback probe-open-detail(int);
-    /// Clique numa célula da linha do tempo (SPEC-PROBE-009).
-    callback probe-select-cell(int);
+    /// Abre o nível 1 de um feed (SPEC-PROBE-019).
+    callback probe-open-feed(int);
+    /// Abre o nível 2 de um serviço (SPEC-PROBE-022).
+    callback probe-open-service(int);
+    /// Sobe um nível; `probe-back(true)` volta direto para os feeds.
+    callback probe-back(bool);
+    /// Troca a aba do nível 1 (0 Resumo · 1 Serviços).
+    callback probe-set-feed-tab(int);
+    /// Clique numa célula da grade de saúde: linha, coluna (SPEC-PROBE-023).
+    callback probe-grid-cell-clicked(int, int);
+    /// Fecha a lista de alertas da janela (SPEC-PROBE-025).
+    callback probe-close-alerts();
     /// Troca a janela dos gráficos (SPEC-PROBE-010).
     callback probe-select-window(int);
     /// Alterna o filtro de severidade do event log (§8.2).
@@ -877,8 +907,17 @@ export component AppWindow inherits Window {
                     width: 6px;
                 }
 
+                // ── Barra de endereço ──────────────────────────────────────
+                // Oculta no modo Probe: ali os feeds vêm de `[[probe.feeds]]`
+                // no ironstream.toml, e um campo de URL que não conecta nada
+                // seria um controle morto na tela (SPEC-PROBE-026).
+                if root.app-mode == 2: Rectangle {
+                    horizontal-stretch: 1;
+                    background: transparent;
+                }
+
                 // Protocolo
-                Rectangle {
+                if root.app-mode != 2: Rectangle {
                     width: 104px;
                     background: Theme.panel-alt;
                     border-radius: Theme.radius;
@@ -911,7 +950,7 @@ export component AppWindow inherits Window {
                 }
 
                 // URL
-                Rectangle {
+                if root.app-mode != 2: Rectangle {
                     horizontal-stretch: 1;
                     background: Theme.panel-alt;
                     border-radius: Theme.radius;
@@ -943,7 +982,7 @@ export component AppWindow inherits Window {
                 }
 
                 // Conectar
-                Rectangle {
+                if root.app-mode != 2: Rectangle {
                     width: 116px;
                     background: root.connected ? Theme.panel-alt : (ta-conn.has-hover ? Theme.accent.brighter(0.15) : Theme.accent);
                     border-radius: Theme.radius;
@@ -962,7 +1001,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 // Desconectar
-                Rectangle {
+                if root.app-mode != 2: Rectangle {
                     width: 124px;
                     background: ta-disc.has-hover && root.connected ? Theme.panel-alt.brighter(0.3) : Theme.panel-alt;
                     border-radius: Theme.radius;
@@ -1677,8 +1716,9 @@ export component AppWindow inherits Window {
         }
 
         // ══ MODO PROBE ═══════════════════════════════════════════════════
-        // Mosaico é a tela inicial; o detalhe abre ao clicar num tile (§8).
-        if root.app-mode == 2 && root.probe-detail-slot < 0: ProbeMosaic {
+        // Quatro níveis (§8): feeds → feed (Resumo | Serviços) → serviço →
+        // alertas da janela.  O nível 3 é um overlay, montado no fim da janela.
+        if root.app-mode == 2 && root.probe-level == 0: ProbeMosaic {
             vertical-stretch: 1;
             tiles: root.probe-tiles;
             max-feeds: root.probe-max-feeds;
@@ -1686,26 +1726,54 @@ export component AppWindow inherits Window {
             run-id: root.probe-run-id;
             recording: root.probe-recording;
             status: root.probe-status;
-            open-detail(slot) => { root.probe-open-detail(slot); }
+            open-feed(slot) => { root.probe-open-feed(slot); }
             start-run => { root.probe-start-run(); }
             stop-run => { root.probe-stop-run(); }
             export-report => { root.probe-export-report(); }
         }
-        if root.app-mode == 2 && root.probe-detail-slot >= 0: ProbeDetail {
+        if root.app-mode == 2 && root.probe-level == 1: ProbeFeedView {
             vertical-stretch: 1;
             tile: root.probe-detail-tile;
-            timeline: root.probe-timeline;
+            tab: root.probe-feed-tab;
+            services: root.probe-services;
+            grid-rows: root.probe-grid-rows;
+            grid-cells: root.probe-grid-cells;
+            grid-ticks: root.probe-grid-ticks;
+            grid-cols: root.probe-grid-cols;
+            grid-selected-row: root.probe-grid-selected-row;
+            grid-selected-col: root.probe-grid-selected-col;
+            grid-caption: root.probe-grid-caption;
             charts: root.probe-charts;
             events: root.probe-events;
             summary: root.probe-summary;
             health: root.probe-health;
-            timeline-caption: root.probe-timeline-caption;
-            timeline-selected: root.probe-timeline-selected;
             window-index: root.probe-window-index;
             severity-filter: root.probe-severity-filter;
-            back => { root.probe-open-detail(-1); }
-            select-cell(i) => { root.probe-select-cell(i); }
+            back => { root.probe-back(true); }
+            set-tab(i) => { root.probe-set-feed-tab(i); }
+            open-service(id) => { root.probe-open-service(id); }
+            grid-cell-clicked(r, c) => { root.probe-grid-cell-clicked(r, c); }
             select-window(i) => { root.probe-select-window(i); }
+            cycle-severity => { root.probe-cycle-severity(); }
+        }
+        if root.app-mode == 2 && root.probe-level == 2: ProbeServiceView {
+            vertical-stretch: 1;
+            feed: root.probe-detail-tile;
+            service: root.probe-service-tile;
+            grid-rows: root.probe-grid-rows;
+            grid-cells: root.probe-grid-cells;
+            grid-ticks: root.probe-grid-ticks;
+            grid-cols: root.probe-grid-cols;
+            grid-selected-row: root.probe-grid-selected-row;
+            grid-selected-col: root.probe-grid-selected-col;
+            grid-caption: root.probe-grid-caption;
+            events: root.probe-events;
+            summary: root.probe-summary;
+            streams: root.probe-streams;
+            severity-filter: root.probe-severity-filter;
+            back-to-feeds => { root.probe-back(true); }
+            back-to-feed => { root.probe-back(false); }
+            grid-cell-clicked(r, c) => { root.probe-grid-cell-clicked(r, c); }
             cycle-severity => { root.probe-cycle-severity(); }
         }
 
@@ -1789,5 +1857,22 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // ══ MODO PROBE · NÍVEL 3 ═════════════════════════════════════════════
+    // Lista consolidada dos problemas de uma célula da grade.  Fica fora do
+    // `VerticalLayout` do corpo, como último filho da janela, para cobrir
+    // barra superior e status bar — é um modal, não mais um painel.
+    //
+    // SPEC-PROBE-025
+    if root.app-mode == 2 && root.probe-alerts-open: ProbeAlerts {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        rows: root.probe-alerts;
+        title: root.probe-alerts-title;
+        subtitle: root.probe-alerts-subtitle;
+        close => { root.probe-close-alerts(); }
     }
 }

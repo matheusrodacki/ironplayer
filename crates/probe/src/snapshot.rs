@@ -11,8 +11,14 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
-use crate::event::{EventPhase, ProbeEvent};
+use crate::check::{
+    CHECK_AUDIO_MISSING, CHECK_CC_ERROR, CHECK_CRC_ERROR, CHECK_DEGRADED, CHECK_FEED_UNAVAILABLE,
+    CHECK_LOCAL_DROPS, CHECK_PCR_DISCONTINUITY, CHECK_PCR_ERROR, CHECK_RTP_OUT_OF_ORDER,
+    CHECK_SCHED_JITTER, CHECK_TS_SYNC_LOSS, CHECK_VIDEO_MISSING,
+};
+use crate::event::{EventContext, EventOrigin, EventPhase, ProbeEvent};
 use crate::series::{MetricId, SeriesPoints, TimelineBucket};
+use crate::service::StreamKind;
 use crate::session::Encapsulation;
 use crate::severity::{Layer, LayerHealth, Severity};
 
@@ -136,6 +142,12 @@ pub struct EventRow {
     pub unit: String,
     /// Contexto legível ("pid 6100 · origin=local").
     pub context: String,
+    /// PID a que a ocorrência foi atribuída, quando há um.
+    pub pid: Option<u16>,
+    /// Serviço a que a ocorrência foi atribuída, quando há um.
+    pub service_id: Option<u16>,
+    /// `true` quando a ocorrência foi atribuída à própria probe.
+    pub local: bool,
 }
 
 impl EventRow {
@@ -151,7 +163,82 @@ impl EventRow {
             measured: ev.measured,
             unit: ev.unit.clone(),
             context: ev.context.describe(),
+            pid: ev.context.pid,
+            service_id: ev.context.service_id,
+            local: ev.context.origin == EventOrigin::Local,
         }
+    }
+
+    /// Descrição do problema em uma frase, para a lista consolidada de alertas.
+    ///
+    /// O event log compacto mostra `check_id` cru, que só é legível para quem
+    /// conhece o perfil.  A lista de alertas de uma janela é o artefato que o
+    /// operador manda para o fornecedor do sinal — ali o texto precisa se
+    /// explicar sozinho, com a referência normativa quando ela existe.
+    ///
+    /// SPEC-PROBE-025
+    pub fn describe(&self) -> String {
+        let n = self.count;
+        let pid = self
+            .pid
+            .map(|p| format!(" no PID {p}"))
+            .unwrap_or_default();
+        let mut text = match self.check_id.as_str() {
+            CHECK_CC_ERROR => format!(
+                "TR 101 290 P1.4 Continuity Counter Error: {n} descontinuidade(s) de \
+                 continuity_counter{pid}."
+            ),
+            CHECK_CRC_ERROR => format!(
+                "TR 101 290 P2.2 CRC Error: {n} seção(ões) PSI/SI com CRC-32 inválido{pid}."
+            ),
+            CHECK_PCR_ERROR => format!(
+                "TR 101 290 P2.3 PCR Accuracy: {n} evento(s) de jitter de PCR acima do \
+                 limiar do perfil{pid}."
+            ),
+            CHECK_PCR_DISCONTINUITY => format!(
+                "TR 101 290 P1.5 PCR Discontinuity: {n} salto(s) de PCR sem \
+                 discontinuity_indicator{pid}."
+            ),
+            CHECK_TS_SYNC_LOSS => format!(
+                "TR 101 290 P1.1 TS sync loss: {n} perda(s) de sincronismo do transport stream."
+            ),
+            CHECK_FEED_UNAVAILABLE => {
+                "Feed indisponível: nenhum datagrama recebido na janela de detecção.".to_string()
+            }
+            CHECK_RTP_OUT_OF_ORDER => format!(
+                "RTP: {n} pacote(s) fora de ordem ou faltando na sequência."
+            ),
+            CHECK_VIDEO_MISSING => format!(
+                "Vídeo ausente: bitrate do PID de vídeo abaixo do limiar ({:.1} kbps){pid}.",
+                self.measured
+            ),
+            CHECK_AUDIO_MISSING => format!(
+                "Áudio ausente: bitrate do PID de áudio abaixo do limiar ({:.1} kbps){pid}.",
+                self.measured
+            ),
+            CHECK_LOCAL_DROPS => format!(
+                "Descarte local da probe: {n} amostra(s) perdida(s) por canal cheio ou \
+                 buffer de socket — não é perda de rede."
+            ),
+            CHECK_SCHED_JITTER => format!(
+                "Jitter de agendamento da probe: tick atrasado {:.1} ms — a medição do \
+                 segundo pode estar comprimida.",
+                self.measured
+            ),
+            CHECK_DEGRADED => {
+                "Probe degradada sob sobrecarga: recursos secundários suspensos para \
+                 preservar recepção e contagem de erros."
+                    .to_string()
+            }
+            other => format!(
+                "{other}: {n} ocorrência(s), medido {:.3} {}{pid}.",
+                self.measured, self.unit
+            ),
+        };
+        if self.local && self.check_id != CHECK_LOCAL_DROPS {
+            text.push_str(" Ocorreu no mesmo segundo de um descarte local — atribuído à probe.");
+        }
+        text
     }
 }
 
@@ -166,6 +253,125 @@ pub struct UnavailableStats {
     pub total_secs: u64,
     /// Tentativas de reconexão feitas desde a última queda.
     pub reconnect_attempts: u32,
+}
+
+/// Um elementary stream de um serviço, publicado para a UI.
+///
+/// Vira uma linha da grade de saúde do §8.3 e uma linha da tabela de PIDs do
+/// detalhe do serviço.
+///
+/// SPEC-PROBE-023
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamSnapshot {
+    pub pid: u16,
+    pub kind: StreamKind,
+    /// Rótulo do codec vindo da PMT.
+    pub codec: String,
+    pub language: Option<String>,
+    pub bitrate_kbps: f64,
+    /// CC errors acumulados neste PID na sessão.
+    pub cc_errors: u64,
+    pub worst_severity: Option<Severity>,
+    pub open_events: usize,
+    /// Linha do tempo de saúde **deste PID**.
+    pub timeline: Vec<TimelineBucket>,
+}
+
+impl StreamSnapshot {
+    /// Rótulo da linha na grade: `H.264 Video · por (6100)`.
+    ///
+    /// SPEC-PROBE-023
+    pub fn describe(&self) -> String {
+        let mut label = if self.codec.trim().is_empty() {
+            self.kind.label().to_string()
+        } else {
+            self.codec.clone()
+        };
+        if let Some(lang) = &self.language {
+            label.push_str(" · ");
+            label.push_str(lang);
+        }
+        format!("{label} ({})", self.pid)
+    }
+}
+
+/// Estado de um serviço do multiplex, publicado para a UI.
+///
+/// SPEC-PROBE-021 · SPEC-PROBE-022
+#[derive(Debug, Clone, Default)]
+pub struct ServiceSnapshot {
+    pub service_id: u16,
+    pub name: String,
+    pub provider: Option<String>,
+    pub pmt_pid: u16,
+    pub pcr_pid: u16,
+    /// `free_CA_mode` da SDT — badge `SCR` do tile de serviço.
+    pub scrambled: bool,
+    /// Soma dos bitrates dos PIDs do serviço, em kbps.
+    pub bitrate_kbps: f64,
+    pub video_kbps: f64,
+    /// Presença de áudio, em kbps — **não** é nível de áudio (§8.1).
+    pub audio_kbps: f64,
+    pub video_height: Option<u32>,
+    pub layer_health: BTreeMap<Layer, LayerHealth>,
+    pub worst_severity: Option<Severity>,
+    pub open_events: usize,
+    /// Disponibilidade da janela corrente do feed (a conectividade é do feed,
+    /// não do serviço: um serviço não "cai" sozinho enquanto o datagrama chega).
+    pub availability_window: Option<f64>,
+    /// Linha do tempo de saúde do serviço inteiro.
+    pub timeline: Vec<TimelineBucket>,
+    pub streams: Vec<StreamSnapshot>,
+    pub snapshot_state: SnapshotState,
+}
+
+impl ServiceSnapshot {
+    /// Nome exibido, nunca vazio.
+    ///
+    /// SPEC-PROBE-022
+    pub fn display_name(&self) -> String {
+        if self.name.trim().is_empty() {
+            format!("Serviço {}", self.service_id)
+        } else {
+            self.name.clone()
+        }
+    }
+
+    /// Badge `HD` / `SD`, quando a altura é conhecida.
+    ///
+    /// SPEC-PROBE-022
+    pub fn resolution_badge(&self) -> Option<&'static str> {
+        self.video_height
+            .map(|h| if h >= 720 { "HD" } else { "SD" })
+    }
+
+    /// `true` se a ocorrência pertence a este serviço.
+    ///
+    /// Aceita tanto o evento carimbado com `service_id` quanto o carimbado só
+    /// com um PID que é deste serviço — nem todo check consegue resolver o
+    /// serviço no momento em que mede.
+    ///
+    /// SPEC-PROBE-021
+    pub fn owns(&self, ctx: &EventContext) -> bool {
+        crate::service::service_owns(
+            self.service_id,
+            self.pmt_pid,
+            self.streams.iter().map(|s| s.pid),
+            ctx,
+        )
+    }
+
+    /// `true` se a linha do event log pertence a este serviço.
+    ///
+    /// SPEC-PROBE-021
+    pub fn owns_event(&self, row: &EventRow) -> bool {
+        self.owns(&EventContext {
+            pid: row.pid,
+            service_id: row.service_id,
+            ssrc: None,
+            origin: EventOrigin::Network,
+        })
+    }
 }
 
 /// Estado de um feed publicado para a UI.
@@ -197,6 +403,23 @@ pub struct FeedSnapshot {
     pub worst_severity: Option<Severity>,
     pub open_events: usize,
     pub timeline: Vec<TimelineBucket>,
+    /// Largura das células de **todas** as linhas do tempo deste feed, em
+    /// segundos (default 300 = clusters de 5 min).
+    ///
+    /// A grade monta um eixo de tempo único e projeta cada escopo nele; sem a
+    /// largura, colunas de escopos que nasceram em instantes diferentes não
+    /// teriam como se alinhar.
+    ///
+    /// SPEC-PROBE-023
+    pub timeline_bucket_secs: u64,
+    /// Linha do tempo da camada IP/RTP — linha `IP` da grade (§8.3).
+    pub ip_timeline: Vec<TimelineBucket>,
+    /// Linha do tempo da camada TS — linha `TRANSPORTE` da grade (§8.3).
+    pub ts_timeline: Vec<TimelineBucket>,
+    /// Serviços do multiplex, na ordem da PAT.
+    ///
+    /// SPEC-PROBE-021
+    pub services: Vec<ServiceSnapshot>,
     pub series: BTreeMap<MetricId, SeriesPoints>,
     pub events: Vec<EventRow>,
     pub health: ProbeHealth,
@@ -235,6 +458,29 @@ impl FeedSnapshot {
             .iter()
             .filter(|e| e.ts_utc >= from && e.ts_utc < to)
             .collect()
+    }
+
+    /// Serviço de um `service_id`, se existir.
+    ///
+    /// SPEC-PROBE-021
+    pub fn service(&self, service_id: u16) -> Option<&ServiceSnapshot> {
+        self.services
+            .iter()
+            .find(|s| s.service_id == service_id)
+    }
+
+    /// Serviço que o thumbnail do tile do feed representa.
+    ///
+    /// O primeiro com vídeo; sem nenhum, o primeiro da PAT.  O tile do feed
+    /// mostra **um** quadro, e num MPTS ele precisa dizer qual — daí o mosaico
+    /// de serviços do nível 1 (SPEC-PROBE-022).
+    ///
+    /// SPEC-PROBE-024
+    pub fn primary_service(&self) -> Option<&ServiceSnapshot> {
+        self.services
+            .iter()
+            .find(|s| s.video_kbps > 0.0)
+            .or_else(|| self.services.first())
     }
 }
 
@@ -327,6 +573,9 @@ mod tests {
             measured: 1.0,
             unit: "errors".into(),
             context: String::new(),
+            pid: None,
+            service_id: None,
+            local: false,
         };
         let f = FeedSnapshot {
             events: vec![row(0), row(299), row(300), row(900)],
@@ -355,5 +604,136 @@ mod tests {
     fn spec_probe_003a_snapshot_state_labels() {
         assert_eq!(SnapshotState::NoKeyframe.label(), "sem keyframe");
         assert_eq!(SnapshotState::Ok.label(), "ok");
+    }
+
+    fn event(check_id: &str, pid: Option<u16>) -> EventRow {
+        EventRow {
+            event_id: "e".into(),
+            ts_utc: DateTime::from_timestamp(0, 0).expect("ts"),
+            severity: Severity::Error,
+            check_id: check_id.into(),
+            phase: EventPhase::Open,
+            count: 130,
+            measured: 130.0,
+            unit: "errors".into(),
+            context: String::new(),
+            pid,
+            service_id: None,
+            local: false,
+        }
+    }
+
+    /// SPEC-PROBE-025 — a lista de alertas explica o problema por extenso, com
+    /// a contagem agregada e o PID; é o texto que sai da probe para quem opera
+    /// o sinal, não o `check_id` cru do perfil.
+    #[test]
+    fn spec_probe_025_alert_description_is_self_explanatory() {
+        let cc = event(CHECK_CC_ERROR, Some(6100));
+        let text = cc.describe();
+        assert!(text.contains("Continuity Counter"), "{text}");
+        assert!(text.contains("130"), "{text}");
+        assert!(text.contains("PID 6100"), "{text}");
+
+        // Sem PID atribuído, a frase não inventa um.
+        let sync = event(CHECK_TS_SYNC_LOSS, None);
+        assert!(!sync.describe().contains("PID"), "{}", sync.describe());
+
+        // Check desconhecido (camadas futuras) ainda produz linha utilizável.
+        let unknown = event("rtp_fec_uncorrected", Some(1));
+        assert!(unknown.describe().starts_with("rtp_fec_uncorrected:"));
+    }
+
+    /// SPEC-PROBE-013 — a lista de alertas diz quando a culpa é da própria
+    /// probe: acusar a rede por um gargalo local é o pior erro possível aqui.
+    #[test]
+    fn spec_probe_025_local_origin_is_stated_in_the_description() {
+        let mut cc = event(CHECK_CC_ERROR, Some(6100));
+        cc.local = true;
+        assert!(cc.describe().contains("atribuído à probe"));
+
+        // O próprio check de descarte local não repete a ressalva.
+        let mut drops = event(CHECK_LOCAL_DROPS, None);
+        drops.local = true;
+        let text = drops.describe();
+        assert!(text.contains("não é perda de rede"));
+        assert!(!text.contains("atribuído à probe"), "{text}");
+    }
+
+    /// SPEC-PROBE-021 — um evento pertence ao serviço quando carrega o
+    /// `service_id` **ou** um PID que é dele; PID de outro serviço do mesmo
+    /// multiplex não conta.
+    #[test]
+    fn spec_probe_021_service_owns_events_by_id_or_pid() {
+        let svc = ServiceSnapshot {
+            service_id: 55,
+            pmt_pid: 0x1388,
+            streams: vec![
+                StreamSnapshot {
+                    pid: 6100,
+                    ..Default::default()
+                },
+                StreamSnapshot {
+                    pid: 6102,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(svc.owns(&EventContext::pid(6100)));
+        assert!(svc.owns(&EventContext::pid(0x1388)), "a PMT é do serviço");
+        assert!(svc.owns(&EventContext::network().with_service(55)));
+        assert!(!svc.owns(&EventContext::pid(401)));
+        assert!(
+            !svc.owns(&EventContext::network()),
+            "evento do multiplex não é de nenhum serviço em particular"
+        );
+    }
+
+    /// SPEC-PROBE-024 — o tile do feed mostra o serviço com vídeo; sem nenhum,
+    /// o primeiro da PAT. Nunca fica sem serviço quando há algum.
+    #[test]
+    fn spec_probe_024_primary_service_prefers_the_one_with_video() {
+        let svc = |id: u16, video: f64| ServiceSnapshot {
+            service_id: id,
+            video_kbps: video,
+            ..Default::default()
+        };
+
+        let feed = FeedSnapshot {
+            services: vec![svc(1, 0.0), svc(2, 14_000.0)],
+            ..Default::default()
+        };
+        assert_eq!(feed.primary_service().map(|s| s.service_id), Some(2));
+        assert_eq!(feed.service(1).map(|s| s.service_id), Some(1));
+        assert!(feed.service(9).is_none());
+
+        // Rádio (só áudio): cai no primeiro da PAT em vez de sumir.
+        let radio = FeedSnapshot {
+            services: vec![svc(7, 0.0)],
+            ..Default::default()
+        };
+        assert_eq!(radio.primary_service().map(|s| s.service_id), Some(7));
+        assert!(FeedSnapshot::default().primary_service().is_none());
+    }
+
+    /// SPEC-PROBE-023 — a linha da grade identifica o PID pelo codec e idioma.
+    #[test]
+    fn spec_probe_023_stream_row_label() {
+        let s = StreamSnapshot {
+            pid: 6106,
+            kind: StreamKind::Audio,
+            codec: "MPEG-2 Audio".into(),
+            language: Some("por".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.describe(), "MPEG-2 Audio · por (6106)");
+
+        let bare = StreamSnapshot {
+            pid: 8191,
+            kind: StreamKind::Data,
+            ..Default::default()
+        };
+        assert_eq!(bare.describe(), "dados (8191)");
     }
 }

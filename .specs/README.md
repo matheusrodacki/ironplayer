@@ -52,7 +52,8 @@
     ├── spec-12-deinterlace_mode/   ← Perfis Performance/Quality/Desligado
     │
     ├── spec-13-probe-mode/
-    │   └── spec.md         ← SPEC-PROBE-001–020: modo Probe (seletor triplo, mosaico 2 feeds, sessão)
+    │   └── spec.md         ← SPEC-PROBE-001–026: modo Probe (seletor triplo, mosaico 2 feeds, sessão,
+    │                          navegação em 4 níveis, serviços do MPTS, grade de saúde 5 min)
     │                          IMPLEMENTADA em `crates/probe`, `src/feed.rs`, `src/probe_run.rs`,
     │                          `crates/ui-slint/ui/probe.slint`
     │

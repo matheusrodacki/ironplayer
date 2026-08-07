@@ -145,15 +145,19 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
     {
         let cmd_tx = handles.cmd_tx.clone();
         let weak = window.as_weak();
+        let view = probe_view.clone();
+        let force = force_refresh_probe.clone();
         window.on_set_mode(move |index| {
             let mode = AppMode::from_index(index);
+            // Trocar de modo sempre volta ao mosaico de feeds: manter um nível
+            // aberto ao sair e voltar de Probe deixaria a UI apontando para um
+            // slot ou serviço que pode nem existir no run novo.
+            view.borrow_mut().reset();
             if let Some(win) = weak.upgrade() {
                 win.set_app_mode(mode.index());
-                // Trocar de modo sempre volta ao mosaico: manter um detalhe
-                // aberto ao sair e voltar de Probe deixaria a UI apontando
-                // para um slot que pode nem existir no run novo.
-                win.set_probe_detail_slot(-1);
+                win.set_probe_level(0);
             }
+            force.set(true);
             let _ = cmd_tx.try_send(AppCommand::SetMode { mode });
         });
     }
@@ -172,16 +176,48 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
     {
         let view = probe_view.clone();
         let force = force_refresh_probe.clone();
-        window.on_probe_open_detail(move |slot| {
-            view.borrow_mut().open_detail(slot);
+        window.on_probe_open_feed(move |slot| {
+            view.borrow_mut().open_feed(slot);
             force.set(true);
         });
     }
     {
         let view = probe_view.clone();
         let force = force_refresh_probe.clone();
-        window.on_probe_select_cell(move |index| {
-            view.borrow_mut().select_cell(index);
+        window.on_probe_open_service(move |service_id| {
+            view.borrow_mut().open_service(service_id);
+            force.set(true);
+        });
+    }
+    {
+        let view = probe_view.clone();
+        let force = force_refresh_probe.clone();
+        window.on_probe_back(move |to_feeds| {
+            view.borrow_mut().back(to_feeds);
+            force.set(true);
+        });
+    }
+    {
+        let view = probe_view.clone();
+        let force = force_refresh_probe.clone();
+        window.on_probe_set_feed_tab(move |tab| {
+            view.borrow_mut().set_feed_tab(tab);
+            force.set(true);
+        });
+    }
+    {
+        let view = probe_view.clone();
+        let force = force_refresh_probe.clone();
+        window.on_probe_grid_cell_clicked(move |row, col| {
+            view.borrow_mut().select_grid_cell(row, col);
+            force.set(true);
+        });
+    }
+    {
+        let view = probe_view.clone();
+        let force = force_refresh_probe.clone();
+        window.on_probe_close_alerts(move || {
+            view.borrow_mut().close_alerts();
             force.set(true);
         });
     }

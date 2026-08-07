@@ -500,8 +500,9 @@ pub enum AppCommand {
 ///
 /// SPEC-PROBE-003 — "somente 1 imagem viva por feed; a anterior é liberada ao
 /// publicar a nova".  O mapa compartilhado guarda exatamente uma entrada por
-/// slot, e `generation` permite à UI reconverter para `slint::Image` só quando
-/// a imagem realmente mudou (o tick de UI roda a ~60 Hz; o snapshot, a 0,2 Hz).
+/// serviço, e `generation` permite à UI reconverter para `slint::Image` só
+/// quando a imagem realmente mudou (o tick de UI roda a ~60 Hz; o snapshot, a
+/// 0,2 Hz).
 #[derive(Debug, Clone)]
 pub struct ProbeThumbnail {
     pub width: u32,
@@ -512,10 +513,18 @@ pub struct ProbeThumbnail {
     pub generation: u64,
 }
 
-/// Mapa `slot → thumbnail` compartilhado entre a thread de snapshot e a UI.
+/// Chave do mapa de thumbnails: `(slot do feed, service_id)`.
 ///
-/// SPEC-PROBE-003
-pub type SharedThumbnails = std::sync::Arc<std::sync::RwLock<HashMap<usize, ProbeThumbnail>>>;
+/// SPEC-PROBE-024 — num MPTS o thumbnail é por serviço; o tile do feed usa o
+/// do serviço primário.
+pub type ThumbnailKey = (usize, u16);
+
+/// Mapa `(slot, serviço) → thumbnail` compartilhado entre a thread de snapshot
+/// e a UI.
+///
+/// SPEC-PROBE-003 · SPEC-PROBE-024
+pub type SharedThumbnails =
+    std::sync::Arc<std::sync::RwLock<HashMap<ThumbnailKey, ProbeThumbnail>>>;
 
 // ---------------------------------------------------------------------------
 // AppMode

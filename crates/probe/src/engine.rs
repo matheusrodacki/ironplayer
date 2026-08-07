@@ -7,12 +7,14 @@
 //!
 //! SPEC-PROBE-005 · SPEC-PROBE-006 · SPEC-PROBE-007 · SPEC-PROBE-013
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use ts::metrics::MetricsSnapshot;
+use ts::Pid;
 
 use crate::check::{
     CheckEngine, CheckProfile, Measurement, CHECK_AUDIO_MISSING, CHECK_CC_ERROR, CHECK_CRC_ERROR,
@@ -25,12 +27,13 @@ use crate::config::{FecMode, ProbeConfig};
 use crate::degrade::{DegradeController, DegradePolicy, OverloadSignals};
 use crate::event::{EventContext, EventOrigin, EventPhase, ProbeEvent};
 use crate::sample::{AvPresence, CounterBaseline, ProbeSample, RawCounters, CSV_HEADER};
-use crate::series::{MetricId, SeriesStore, SeriesWindow};
+use crate::series::{HealthScope, HealthTimeline, MetricId, SeriesStore, SeriesWindow};
+use crate::service::{ServiceInfo, ServiceVisual, StreamKind};
 use crate::session::{Encapsulation, SessionSummary, EVENTS_FILE, METRICS_FILE};
-use crate::severity::{Layer, Severity};
+use crate::severity::{Layer, LayerHealth, Severity};
 use crate::snapshot::{
-    DegradationStage, EventRow, FeedSnapshot, ProbeHealth, SnapshotState, UnavailableStats,
-    EVENT_LOG_CAPACITY,
+    DegradationStage, EventRow, FeedSnapshot, ProbeHealth, ServiceSnapshot, SnapshotState,
+    StreamSnapshot, UnavailableStats, EVENT_LOG_CAPACITY,
 };
 use crate::writer::{WriteJob, WriterHandle};
 
@@ -74,6 +77,12 @@ pub struct TickInput {
     pub writer_drops_total: u64,
     /// Tentativas de reconexão desde a última queda (SPEC-PROBE-011).
     pub reconnect_attempts: u32,
+    /// Inventário de serviços vindo de PAT/PMT/SDT; vazio = PSI ainda não
+    /// chegou.  Não confundir com "multiplex sem serviços" — enquanto está
+    /// vazio, o motor mede só o feed inteiro (SPEC-PROBE-021).
+    pub services: Vec<ServiceInfo>,
+    /// Último resultado do thumbnail por serviço (SPEC-PROBE-024).
+    pub visuals: BTreeMap<u16, ServiceVisual>,
 }
 
 /// Motor de um feed.
@@ -90,6 +99,12 @@ pub struct ProbeEngine {
 
     checks: CheckEngine,
     series: SeriesStore,
+    /// Uma linha do tempo por escopo da grade (§8.3): camada, serviço, PID.
+    ///
+    /// SPEC-PROBE-023
+    scopes: BTreeMap<HealthScope, HealthTimeline>,
+    /// Agregados por serviço do último tick, sem as linhas do tempo.
+    services: Vec<ServiceAggregate>,
     baseline: CounterBaseline,
 
     started_mono: Instant,
@@ -115,6 +130,57 @@ pub struct ProbeEngine {
     /// SPEC-PROBE-013a — quem decide o estágio de degradação.
     degrade: DegradeController,
     prev_writer_drops: u64,
+}
+
+/// Agregado de um serviço no último tick, **sem** as linhas do tempo.
+///
+/// As linhas vivem em `ProbeEngine::scopes` e são anexadas em
+/// [`ProbeEngine::snapshot`]: guardá-las aqui significaria duplicar a mesma
+/// história em dois lugares e mantê-las em sincronia à mão.
+///
+/// SPEC-PROBE-021
+#[derive(Debug, Clone, Default)]
+struct ServiceAggregate {
+    info: ServiceInfo,
+    bitrate_kbps: f64,
+    video_kbps: f64,
+    audio_kbps: f64,
+    visual: ServiceVisual,
+    layer_health: BTreeMap<Layer, LayerHealth>,
+    worst: Option<Severity>,
+    open_events: usize,
+    streams: Vec<StreamAggregate>,
+}
+
+/// Agregado de um PID elementar no último tick.
+#[derive(Debug, Clone, Default)]
+struct StreamAggregate {
+    pid: Pid,
+    kind: StreamKind,
+    codec: String,
+    language: Option<String>,
+    bitrate_kbps: f64,
+    cc_errors: u64,
+    worst: Option<Severity>,
+    open_events: usize,
+}
+
+/// Mantém a pior severidade de uma chave.
+fn worsen<K: Ord>(map: &mut BTreeMap<K, Severity>, key: K, sev: Severity) {
+    map.entry(key)
+        .and_modify(|cur| *cur = (*cur).max(sev))
+        .or_insert(sev);
+}
+
+/// Serviço que representa o feed no mosaico: o primeiro com vídeo, ou o
+/// primeiro da PAT.
+///
+/// SPEC-PROBE-024
+fn primary_service(services: &[ServiceInfo]) -> Option<&ServiceInfo> {
+    services
+        .iter()
+        .find(|s| s.primary_video_pid().is_some())
+        .or_else(|| services.first())
 }
 
 impl ProbeEngine {
@@ -164,6 +230,8 @@ impl ProbeEngine {
             events_path,
             checks,
             series,
+            scopes: BTreeMap::new(),
+            services: Vec::new(),
             baseline: CounterBaseline::new(),
             started_mono: now,
             prev_local_drops: 0,
@@ -255,7 +323,12 @@ impl ProbeEngine {
         if input.encapsulation != Encapsulation::Unknown {
             self.encapsulation = input.encapsulation;
         }
-        self.snapshot_state = input.snapshot_state;
+        // SPEC-PROBE-024 — o tile do feed mostra um quadro só, e num MPTS ele é
+        // o do serviço primário; o estado do thumbnail acompanha o mesmo
+        // serviço, senão o rótulo diria "sem keyframe" sobre a imagem de outro.
+        let primary_visual = primary_service(&input.services)
+            .and_then(|info| input.visuals.get(&info.service_id).copied());
+        self.snapshot_state = primary_visual.map_or(input.snapshot_state, |v| v.state);
         self.unavailable.reconnect_attempts = input.reconnect_attempts;
 
         let (bitrate_kbps, null_ratio) = input
@@ -273,7 +346,10 @@ impl ProbeEngine {
                 AvPresence::from_metrics(m)
             };
             presence.scrambled = input.scrambled;
-            presence.video_height = input.video_height.or(self.presence.video_height);
+            presence.video_height = primary_visual
+                .and_then(|v| v.video_height)
+                .or(input.video_height)
+                .or(self.presence.video_height);
             self.presence = presence;
         }
 
@@ -286,6 +362,17 @@ impl ProbeEngine {
             EventOrigin::Network
         };
         let net_ctx = EventContext::network().with_origin(origin);
+        // SPEC-PROBE-021 — toda ocorrência com PID conhecido também carrega o
+        // serviço dono dele.  Sem isso a grade de saúde e o mosaico de serviços
+        // não conseguiriam distinguir "o multiplex está ruim" de "**este**
+        // serviço está ruim", que é a pergunta que o operador faz.
+        let pid_ctx = |pid: Pid| {
+            let ctx = EventContext::pid(pid).with_origin(origin);
+            match crate::service::owner_of(&input.services, pid) {
+                Some(sid) => ctx.with_service(sid),
+                None => ctx,
+            }
+        };
 
         let mut measurements: Vec<Measurement> = Vec::with_capacity(16);
         measurements.push(Measurement::gauge(
@@ -306,25 +393,37 @@ impl ProbeEngine {
             for (pid, count) in &deltas.cc_by_pid {
                 measurements.push(Measurement {
                     check_id: CHECK_CC_ERROR,
-                    context: EventContext::pid(*pid).with_origin(origin),
+                    context: pid_ctx(*pid),
+                    value: *count as f64,
+                    occurrences: *count,
+                });
+            }
+            for (pid, count) in &deltas.crc_by_pid {
+                measurements.push(Measurement {
+                    check_id: CHECK_CRC_ERROR,
+                    context: pid_ctx(*pid),
+                    value: *count as f64,
+                    occurrences: *count,
+                });
+            }
+            for (pid, count) in &deltas.pcr_jitter_by_pid {
+                measurements.push(Measurement {
+                    check_id: CHECK_PCR_ERROR,
+                    context: pid_ctx(*pid),
+                    value: *count as f64,
+                    occurrences: *count,
+                });
+            }
+            for (pid, count) in &deltas.pcr_disc_by_pid {
+                measurements.push(Measurement {
+                    check_id: CHECK_PCR_DISCONTINUITY,
+                    context: pid_ctx(*pid),
                     value: *count as f64,
                     occurrences: *count,
                 });
             }
             measurements.push(
-                Measurement::counter(CHECK_CRC_ERROR, deltas.crc as f64)
-                    .with_context(net_ctx.clone()),
-            );
-            measurements.push(
                 Measurement::counter(CHECK_TS_SYNC_LOSS, deltas.sync_loss as f64)
-                    .with_context(net_ctx.clone()),
-            );
-            measurements.push(
-                Measurement::counter(CHECK_PCR_ERROR, deltas.pcr_jitter as f64)
-                    .with_context(net_ctx.clone()),
-            );
-            measurements.push(
-                Measurement::counter(CHECK_PCR_DISCONTINUITY, deltas.pcr_disc as f64)
                     .with_context(net_ctx.clone()),
             );
             if self.encapsulation.has_rtp() {
@@ -351,6 +450,9 @@ impl ProbeEngine {
         }
 
         let events = self.checks.evaluate(&measurements, now, now_utc);
+
+        // ── Saúde por escopo e agregados por serviço (§8.3) ──────────────
+        self.refresh_services(&input, now_utc);
 
         // ── Séries e linha do tempo ─────────────────────────────────────
         let worst = self.checks.worst_open_severity();
@@ -407,6 +509,188 @@ impl ProbeEngine {
 
         self.record_events(&events);
         events
+    }
+
+    /// Recalcula os agregados por serviço e alimenta a linha do tempo de cada
+    /// escopo da grade de saúde.
+    ///
+    /// Roda **depois** de `evaluate`: a severidade de uma célula é a dos
+    /// eventos que estão abertos no fim do tick, já passados por debounce.
+    /// Contar a violação crua faria a grade acender em rajadas de um segundo
+    /// que o motor de checks deliberadamente ignora.
+    ///
+    /// SPEC-PROBE-021 · SPEC-PROBE-022 · SPEC-PROBE-023
+    fn refresh_services(&mut self, input: &TickInput, now_utc: DateTime<Utc>) {
+        let open = self.checks.open_checks();
+        let connected = input.connected;
+
+        // Bitrate e CC por PID saem da tabela do aggregator; sem métrica no
+        // tick, os valores anteriores são preservados em vez de zerar o tile.
+        let mut pid_bitrate: HashMap<Pid, f64> = HashMap::new();
+        let mut pid_cc: HashMap<Pid, u64> = HashMap::new();
+        if let Some(m) = &input.metrics {
+            for entry in &m.pid_table {
+                pid_bitrate.insert(entry.pid, entry.bitrate_kbps);
+                pid_cc.insert(entry.pid, entry.cc_errors);
+            }
+        }
+
+        // Severidade por camada e por PID, uma varredura só.
+        let mut layer_worst: BTreeMap<Layer, Severity> = BTreeMap::new();
+        let mut pid_worst: BTreeMap<Pid, Severity> = BTreeMap::new();
+        let mut pid_open: BTreeMap<Pid, usize> = BTreeMap::new();
+        // Evento crítico sem PID nem serviço (feed fora do ar, sync loss):
+        // atinge **todo** serviço do multiplex, e deixar a linha do serviço
+        // verde enquanto a do transporte está vermelha seria mentir.
+        let mut feed_wide: Option<Severity> = None;
+        for o in &open {
+            worsen(&mut layer_worst, o.layer, o.severity);
+            if let Some(pid) = o.context.pid {
+                worsen(&mut pid_worst, pid, o.severity);
+                *pid_open.entry(pid).or_insert(0) += 1;
+            }
+            if o.context.pid.is_none()
+                && o.context.service_id.is_none()
+                && o.layer != Layer::Probe
+                && o.severity == Severity::Critical
+            {
+                feed_wide = Some(feed_wide.map_or(o.severity, |c: Severity| c.max(o.severity)));
+            }
+        }
+
+        // A camada RTP entra na linha `IP` da grade: são a mesma pergunta
+        // ("a rede entregou?") e uma linha só evita uma faixa quase sempre
+        // cinza nos feeds UDP puro.
+        let ip_worst = layer_worst
+            .get(&Layer::Ip)
+            .copied()
+            .into_iter()
+            .chain(layer_worst.get(&Layer::Rtp).copied())
+            .max();
+        self.push_scope(
+            HealthScope::Layer(Layer::Ip),
+            now_utc,
+            ip_worst,
+            connected,
+        );
+        self.push_scope(
+            HealthScope::Layer(Layer::Ts),
+            now_utc,
+            layer_worst.get(&Layer::Ts).copied(),
+            connected,
+        );
+
+        let mut services = Vec::with_capacity(input.services.len());
+        for info in &input.services {
+            let owned: Vec<&crate::check::OpenCheck> =
+                open.iter().filter(|o| info.owns(&o.context)).collect();
+            let worst = owned
+                .iter()
+                .map(|o| o.severity)
+                .chain(feed_wide)
+                .max();
+
+            let applicable = Self::service_layers(info);
+            let layer_health = self
+                .checks
+                .layer_health_where(&applicable, |ctx| info.owns(ctx));
+
+            let mut streams = Vec::with_capacity(info.streams.len());
+            let (mut video_kbps, mut audio_kbps, mut bitrate_kbps) = (0.0, 0.0, 0.0);
+            for s in &info.streams {
+                let kbps = pid_bitrate.get(&s.pid).copied().unwrap_or(0.0);
+                bitrate_kbps += kbps;
+                match s.kind {
+                    StreamKind::Video => video_kbps += kbps,
+                    StreamKind::Audio => audio_kbps += kbps,
+                    _ => {}
+                }
+                let worst_pid = pid_worst.get(&s.pid).copied();
+                self.push_scope(HealthScope::Pid(s.pid), now_utc, worst_pid, connected);
+                streams.push(StreamAggregate {
+                    pid: s.pid,
+                    kind: s.kind,
+                    codec: s.codec.clone(),
+                    language: s.language.clone(),
+                    bitrate_kbps: kbps,
+                    cc_errors: pid_cc.get(&s.pid).copied().unwrap_or(0),
+                    worst: worst_pid,
+                    open_events: pid_open.get(&s.pid).copied().unwrap_or(0),
+                });
+            }
+
+            self.push_scope(
+                HealthScope::Service(info.service_id),
+                now_utc,
+                worst,
+                connected,
+            );
+
+            services.push(ServiceAggregate {
+                info: info.clone(),
+                bitrate_kbps,
+                video_kbps,
+                audio_kbps,
+                visual: input
+                    .visuals
+                    .get(&info.service_id)
+                    .copied()
+                    .unwrap_or_default(),
+                layer_health,
+                worst,
+                open_events: owned.len(),
+                streams,
+            });
+        }
+
+        // Serviço ou PID que saiu da PSI perde a linha: manter história de algo
+        // que não existe mais faria a grade crescer para sempre num multiplex
+        // que muda de grade de programação.
+        self.scopes.retain(|scope, _| match scope {
+            HealthScope::Layer(_) => true,
+            HealthScope::Service(id) => input.services.iter().any(|s| s.service_id == *id),
+            HealthScope::Pid(pid) => input.services.iter().any(|s| s.contains_pid(*pid)),
+        });
+        self.services = services;
+    }
+
+    /// Camadas avaliadas para um serviço.
+    ///
+    /// `V` e `A` só ficam verdes quando o serviço **tem** aquele tipo de
+    /// stream; um rádio sem vídeo mostra `V` cinza (`n/a`), nunca verde
+    /// (SPEC-PROBE-018a).
+    fn service_layers(info: &ServiceInfo) -> Vec<Layer> {
+        let mut layers = vec![Layer::Ts];
+        if info.streams.iter().any(|s| s.kind == StreamKind::Video) {
+            layers.push(Layer::Video);
+        }
+        if info.streams.iter().any(|s| s.kind == StreamKind::Audio) {
+            layers.push(Layer::Audio);
+        }
+        layers
+    }
+
+    /// Ingere uma amostra de saúde numa linha do tempo de escopo.
+    fn push_scope(
+        &mut self,
+        scope: HealthScope,
+        ts: DateTime<Utc>,
+        worst: Option<Severity>,
+        connected: bool,
+    ) {
+        let bucket = self.series.timeline_secs();
+        self.scopes
+            .entry(scope)
+            .or_insert_with(|| HealthTimeline::new(bucket))
+            .push(ts, worst, connected);
+    }
+
+    /// Células de um escopo, ou vazio se ele nunca recebeu amostra.
+    fn scope_cells(&self, scope: HealthScope) -> Vec<crate::series::TimelineBucket> {
+        self.scopes
+            .get(&scope)
+            .map(|t| t.buckets().to_vec())
+            .unwrap_or_default()
     }
 
     /// Registra eventos no log de UI e na fila do writer.
@@ -477,6 +761,45 @@ impl ProbeEngine {
             .map(|m| (*m, self.series.points(*m, window)))
             .collect();
 
+        let availability_window = self.series.availability_window(AVAILABILITY_WINDOW_SECS);
+        let services: Vec<ServiceSnapshot> = self
+            .services
+            .iter()
+            .map(|a| ServiceSnapshot {
+                service_id: a.info.service_id,
+                name: a.info.display_name(),
+                provider: a.info.provider.clone(),
+                pmt_pid: a.info.pmt_pid,
+                pcr_pid: a.info.pcr_pid,
+                scrambled: a.info.scrambled || self.presence.scrambled,
+                bitrate_kbps: a.bitrate_kbps,
+                video_kbps: a.video_kbps,
+                audio_kbps: a.audio_kbps,
+                video_height: a.visual.video_height,
+                layer_health: a.layer_health.clone(),
+                worst_severity: a.worst,
+                open_events: a.open_events,
+                availability_window,
+                timeline: self.scope_cells(HealthScope::Service(a.info.service_id)),
+                streams: a
+                    .streams
+                    .iter()
+                    .map(|s| StreamSnapshot {
+                        pid: s.pid,
+                        kind: s.kind,
+                        codec: s.codec.clone(),
+                        language: s.language.clone(),
+                        bitrate_kbps: s.bitrate_kbps,
+                        cc_errors: s.cc_errors,
+                        worst_severity: s.worst,
+                        open_events: s.open_events,
+                        timeline: self.scope_cells(HealthScope::Pid(s.pid)),
+                    })
+                    .collect(),
+                snapshot_state: a.visual.state,
+            })
+            .collect();
+
         FeedSnapshot {
             slot: self.identity.slot,
             name: self.identity.name.clone(),
@@ -488,7 +811,7 @@ impl ProbeEngine {
                 .now_mono()
                 .duration_since(self.started_mono)
                 .as_secs(),
-            availability_window: self.series.availability_window(AVAILABILITY_WINDOW_SECS),
+            availability_window,
             availability_session: self.series.availability(),
             bitrate_kbps: self.last_sample.as_ref().map_or(0.0, |s| s.bitrate_kbps),
             null_ratio: self.last_sample.as_ref().map_or(0.0, |s| s.null_ratio),
@@ -500,6 +823,10 @@ impl ProbeEngine {
             worst_severity: self.checks.worst_open_severity(),
             open_events: self.checks.open_count(),
             timeline: self.series.timeline().to_vec(),
+            timeline_bucket_secs: self.series.timeline_secs(),
+            ip_timeline: self.scope_cells(HealthScope::Layer(Layer::Ip)),
+            ts_timeline: self.scope_cells(HealthScope::Layer(Layer::Ts)),
+            services,
             series,
             events: self.events.iter().cloned().collect(),
             health: self.health,
@@ -912,6 +1239,247 @@ mod tests {
         let ev = degraded_event.expect("degradação deve gerar evento");
         assert_eq!(ev.severity, Severity::Info, "informativo, não alarme");
         assert!(ev.measured >= DegradationStage::Thumbnail.stage_value());
+    }
+
+    /// Dois serviços num MPTS: 100 leva vídeo 6100 + áudio 6101; 200 leva
+    /// vídeo 6200.
+    fn inventory() -> Vec<ServiceInfo> {
+        use crate::service::ServiceStream;
+        let stream = |pid: Pid, kind: StreamKind, codec: &str| ServiceStream {
+            pid,
+            stream_type: 0,
+            kind,
+            codec: codec.into(),
+            language: None,
+        };
+        vec![
+            ServiceInfo {
+                service_id: 100,
+                name: Some("CANAL_A".into()),
+                pmt_pid: 0x1000,
+                pcr_pid: 6100,
+                streams: vec![
+                    stream(6100, StreamKind::Video, "H.264 Video"),
+                    stream(6101, StreamKind::Audio, "AC-3 Audio"),
+                ],
+                ..Default::default()
+            },
+            ServiceInfo {
+                service_id: 200,
+                name: Some("CANAL_B".into()),
+                pmt_pid: 0x1001,
+                pcr_pid: 6200,
+                streams: vec![stream(6200, StreamKind::Video, "H.264 Video")],
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// SPEC-PROBE-021 — um CC error no PID de um serviço acende **aquele**
+    /// serviço, não o multiplex inteiro: é a diferença entre "tem erro em algum
+    /// lugar" e um diagnóstico.
+    #[test]
+    fn spec_probe_021_errors_land_on_the_owning_service_only() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        let tick = |total: u64| TickInput {
+            services: inventory(),
+            ..connected_input(metrics(15_000.0, &[(6100, total)], 0))
+        };
+
+        eng.tick(tick(0));
+        clock.advance(Duration::from_secs(1));
+        let events = eng.tick(tick(40));
+
+        let cc = events
+            .iter()
+            .find(|e| e.check_id == CHECK_CC_ERROR)
+            .expect("CC error deve abrir");
+        assert_eq!(cc.context.pid, Some(6100));
+        assert_eq!(
+            cc.context.service_id,
+            Some(100),
+            "o evento precisa saber de quem é o PID"
+        );
+
+        let snap = eng.snapshot(SeriesWindow::WholeSession);
+        assert_eq!(snap.services.len(), 2);
+
+        let a = snap.service(100).expect("serviço 100");
+        assert_eq!(a.worst_severity, Some(Severity::Error));
+        assert_eq!(a.open_events, 1);
+        assert_eq!(
+            a.layer_health.get(&Layer::Ts),
+            Some(&crate::severity::LayerHealth::Degraded(Severity::Error))
+        );
+
+        let b = snap.service(200).expect("serviço 200");
+        assert_eq!(
+            b.worst_severity, None,
+            "erro no PID do vizinho não pode sujar este serviço"
+        );
+        assert_eq!(b.open_events, 0);
+        assert_eq!(
+            b.layer_health.get(&Layer::Ts),
+            Some(&crate::severity::LayerHealth::Ok)
+        );
+    }
+
+    /// SPEC-PROBE-023 — a grade tem uma linha por camada, por serviço e por
+    /// PID, todas no mesmo eixo de tempo.
+    #[test]
+    fn spec_probe_023_health_grid_has_a_row_per_scope() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        let mut total = 0u64;
+        for _ in 0..10 {
+            total += 5;
+            eng.tick(TickInput {
+                services: inventory(),
+                ..connected_input(metrics(15_000.0, &[(6101, total)], 0))
+            });
+            clock.advance(Duration::from_secs(1));
+        }
+
+        let snap = eng.snapshot(SeriesWindow::WholeSession);
+        assert_eq!(snap.ts_timeline.len(), 1, "10 s cabem num bucket de 5 min");
+        assert_eq!(snap.ip_timeline.len(), 1);
+        assert_eq!(
+            snap.ts_timeline[0].worst,
+            Some(Severity::Error),
+            "a linha do transporte acende com o CC error"
+        );
+        assert_eq!(
+            snap.ip_timeline[0].worst, None,
+            "a rede entregou; a linha IP fica verde"
+        );
+
+        let a = snap.service(100).expect("serviço 100");
+        assert_eq!(a.timeline.len(), 1);
+        assert_eq!(a.timeline[0].worst, Some(Severity::Error));
+        assert_eq!(a.streams.len(), 2);
+
+        let audio = a
+            .streams
+            .iter()
+            .find(|s| s.pid == 6101)
+            .expect("PID de áudio");
+        assert_eq!(audio.timeline[0].worst, Some(Severity::Error));
+        assert_eq!(audio.describe(), "AC-3 Audio (6101)");
+
+        let video = a
+            .streams
+            .iter()
+            .find(|s| s.pid == 6100)
+            .expect("PID de vídeo");
+        assert_eq!(
+            video.timeline[0].worst, None,
+            "o PID sem erro fica verde mesmo com o vizinho quebrado"
+        );
+
+        let b = snap.service(200).expect("serviço 200");
+        assert_eq!(b.timeline[0].worst, None);
+    }
+
+    /// SPEC-PROBE-021 — feed fora do ar é crítico para **todo** serviço: linha
+    /// de serviço verde com transporte vermelho seria mentira.
+    #[test]
+    fn spec_probe_021_feed_outage_reaches_every_service() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        eng.tick(TickInput {
+            services: inventory(),
+            ..connected_input(metrics(15_000.0, &[], 0))
+        });
+        clock.advance(Duration::from_secs(1));
+        eng.tick(TickInput {
+            connected: false,
+            encapsulation: Encapsulation::Rtp,
+            snapshot_state: SnapshotState::NoSignal,
+            services: inventory(),
+            ..Default::default()
+        });
+
+        let snap = eng.snapshot(SeriesWindow::WholeSession);
+        for svc in &snap.services {
+            assert_eq!(
+                svc.worst_severity,
+                Some(Severity::Critical),
+                "serviço {} deveria refletir a queda do feed",
+                svc.service_id
+            );
+        }
+    }
+
+    /// SPEC-PROBE-022 — um serviço só de áudio mostra `V` como `n/a`, nunca
+    /// verde: afirmar que o vídeo está bom quando não existe vídeo é pior do
+    /// que não medir (SPEC-PROBE-018a).
+    #[test]
+    fn spec_probe_022_radio_service_marks_video_not_applicable() {
+        use crate::service::ServiceStream;
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        eng.tick(TickInput {
+            services: vec![ServiceInfo {
+                service_id: 7,
+                pmt_pid: 0x1002,
+                streams: vec![ServiceStream {
+                    pid: 700,
+                    kind: StreamKind::Audio,
+                    codec: "MPEG-1 Audio".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..connected_input(metrics(15_000.0, &[], 0))
+        });
+
+        let snap = eng.snapshot(SeriesWindow::WholeSession);
+        let radio = snap.service(7).expect("serviço 7");
+        assert_eq!(
+            radio.layer_health.get(&Layer::Video),
+            Some(&crate::severity::LayerHealth::NotApplicable)
+        );
+        assert_eq!(
+            radio.layer_health.get(&Layer::Audio),
+            Some(&crate::severity::LayerHealth::Ok)
+        );
+        assert_eq!(radio.display_name(), "Serviço 7");
+    }
+
+    /// SPEC-PROBE-021 — serviço removido da PSI perde a linha da grade em vez
+    /// de acumular história de algo que não existe mais.
+    #[test]
+    fn spec_probe_021_service_removed_from_psi_drops_its_scope() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        eng.tick(TickInput {
+            services: inventory(),
+            ..connected_input(metrics(15_000.0, &[], 0))
+        });
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(eng.snapshot(SeriesWindow::WholeSession).services.len(), 2);
+
+        // Nova PAT sem o serviço 200.
+        eng.tick(TickInput {
+            services: vec![inventory().remove(0)],
+            ..connected_input(metrics(15_000.0, &[], 0))
+        });
+
+        let snap = eng.snapshot(SeriesWindow::WholeSession);
+        assert_eq!(snap.services.len(), 1);
+        assert!(snap.service(200).is_none());
+        assert!(
+            !eng.scopes.contains_key(&HealthScope::Service(200)),
+            "o escopo do serviço removido precisa sair do mapa"
+        );
+        assert!(!eng.scopes.contains_key(&HealthScope::Pid(6200)));
+        assert!(eng.scopes.contains_key(&HealthScope::Pid(6100)));
     }
 
     /// SPEC-PROBE-004 — `finish` fecha os eventos abertos e resume a sessão.

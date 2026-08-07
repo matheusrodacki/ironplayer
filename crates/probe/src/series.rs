@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::severity::{Severity, RGB_NO_DATA, RGB_OK};
+use crate::severity::{Layer, Severity, RGB_NO_DATA, RGB_OK};
 
 /// Métricas com série temporal mantida em memória.
 ///
@@ -187,6 +187,20 @@ impl SeriesWindow {
         }
     }
 
+    /// Quantas células de `bucket_secs` cabem na janela.
+    ///
+    /// A janela "sessão inteira" não tem tamanho conhecido a priori: devolve
+    /// [`MAX_TIMELINE_CELLS`], e quem chama recorta o que existir.
+    ///
+    /// SPEC-PROBE-023
+    pub fn cells(self, bucket_secs: u64) -> usize {
+        let width = bucket_secs.max(1);
+        match self.secs() {
+            None => MAX_TIMELINE_CELLS,
+            Some(secs) => (secs.div_ceil(width).max(1) as usize).min(MAX_TIMELINE_CELLS),
+        }
+    }
+
     /// Rótulo do seletor de janela.
     pub fn label(self) -> &'static str {
         match self {
@@ -212,19 +226,150 @@ impl SeriesWindow {
 /// 43 200 pontos por gráfico travariam a janela.
 pub const MAX_PLOT_POINTS: usize = 1000;
 
+/// Teto de células mantidas numa linha do tempo.
+///
+/// 288 células de 5 min = 24 h — o dobro da autonomia alvo (RNF-PRB-001).  O
+/// teto existe porque agora há **uma linha por escopo** (transporte, IP, cada
+/// serviço, cada PID): sem limite, uma sessão longa num MPTS grande cresceria
+/// sem teto em RAM só para desenhar histórico que ninguém rola.
+///
+/// SPEC-PROBE-023
+pub const MAX_TIMELINE_CELLS: usize = 288;
+
+/// Alinha um instante ao início do bucket de largura `width`.
+fn bucket_start(ts: DateTime<Utc>, width: u64) -> i64 {
+    let secs = ts.timestamp();
+    secs - secs.rem_euclid(width as i64)
+}
+
+/// Escopo de uma linha da grade de saúde (§8.3).
+///
+/// A grade do modo Probe deixou de ser uma faixa por feed: cada linha responde
+/// "esta parte do sinal esteve boa nesta janela?", e "esta parte" pode ser uma
+/// camada do transporte, um serviço do multiplex ou um PID elementar.
+///
+/// SPEC-PROBE-023
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HealthScope {
+    /// Uma camada do feed inteiro (`Ts` = transporte, `Ip` = rede).
+    Layer(Layer),
+    /// Um serviço do multiplex.
+    Service(u16),
+    /// Um PID elementar.
+    Pid(u16),
+}
+
+/// Linha do tempo de saúde de **um** escopo.
+///
+/// Extraída de `SeriesStore` porque deixou de haver uma linha por feed: a
+/// grade do §8.3 tem uma linha por camada, uma por serviço e uma por PID, todas
+/// com a mesma largura de bucket e o mesmo eixo de tempo.
+///
+/// SPEC-PROBE-009 · SPEC-PROBE-023
+#[derive(Debug, Clone)]
+pub struct HealthTimeline {
+    bucket_secs: u64,
+    buckets: Vec<TimelineBucket>,
+    open_start: Option<i64>,
+}
+
+impl HealthTimeline {
+    /// Cria uma linha do tempo com a largura de bucket configurada.
+    pub fn new(bucket_secs: u64) -> Self {
+        Self {
+            bucket_secs: bucket_secs.max(1),
+            buckets: Vec::new(),
+            open_start: None,
+        }
+    }
+
+    /// Largura de cada célula, em segundos.
+    pub fn bucket_secs(&self) -> u64 {
+        self.bucket_secs
+    }
+
+    /// Ingere o veredito de saúde de uma amostra.
+    ///
+    /// SPEC-PROBE-009
+    pub fn push(&mut self, ts: DateTime<Utc>, worst: Option<Severity>, connected: bool) {
+        let start = bucket_start(ts, self.bucket_secs);
+        let start_utc = DateTime::from_timestamp(start, 0).unwrap_or(ts);
+
+        if self.open_start != Some(start) {
+            self.buckets.push(TimelineBucket {
+                start_utc,
+                worst: None,
+                samples: 0,
+                connected_samples: 0,
+            });
+            self.open_start = Some(start);
+            // Descarta o histórico que já saiu do teto; `remove(0)` num Vec de
+            // 288 elementos é um memmove trivial e acontece 1× a cada bucket.
+            while self.buckets.len() > MAX_TIMELINE_CELLS {
+                self.buckets.remove(0);
+            }
+        }
+        if let Some(b) = self.buckets.last_mut() {
+            b.samples = b.samples.saturating_add(1);
+            if connected {
+                b.connected_samples = b.connected_samples.saturating_add(1);
+            }
+            if let Some(sev) = worst {
+                b.worst = Some(b.worst.map_or(sev, |cur| cur.max(sev)));
+            }
+        }
+    }
+
+    /// Todas as células, da mais antiga à mais recente.
+    pub fn buckets(&self) -> &[TimelineBucket] {
+        &self.buckets
+    }
+
+    /// Últimas `n` células.
+    ///
+    /// SPEC-PROBE-009
+    pub fn tail(&self, n: usize) -> &[TimelineBucket] {
+        let from = self.buckets.len().saturating_sub(n);
+        &self.buckets[from..]
+    }
+
+    /// Células de uma janela do seletor (§8.2).
+    ///
+    /// SPEC-PROBE-023
+    pub fn window(&self, window: SeriesWindow) -> &[TimelineBucket] {
+        self.tail(window.cells(self.bucket_secs))
+    }
+
+    /// Disponibilidade dos últimos `secs` segundos.
+    ///
+    /// SPEC-PROBE-018
+    pub fn availability_window(&self, secs: u64) -> Option<f64> {
+        let n = secs.div_ceil(self.bucket_secs).max(1) as usize;
+        let tail = self.tail(n);
+        let samples: u32 = tail.iter().map(|b| b.samples).sum();
+        let connected: u32 = tail.iter().map(|b| b.connected_samples).sum();
+        (samples > 0).then(|| connected as f64 / samples as f64)
+    }
+
+    /// Pior severidade das células de uma janela.
+    ///
+    /// SPEC-PROBE-023
+    pub fn worst_in_window(&self, window: SeriesWindow) -> Option<Severity> {
+        self.window(window).iter().filter_map(|b| b.worst).max()
+    }
+}
+
 /// Séries e linha do tempo de um feed.
 ///
 /// SPEC-PROBE-005 · SPEC-PROBE-009
 #[derive(Debug)]
 pub struct SeriesStore {
     rollup_secs: u64,
-    timeline_secs: u64,
     /// Um vetor de buckets por métrica, indexado por [`MetricId::index`].
     rollups: [Vec<RollupBucket>; 6],
     /// Índice do bucket corrente por métrica (`rollups[i].len() - 1`).
     open_bucket_start: [Option<i64>; 6],
-    timeline: Vec<TimelineBucket>,
-    timeline_open_start: Option<i64>,
+    timeline: HealthTimeline,
     /// Total de amostras 1 Hz ingeridas (para o resumo da sessão).
     total_samples: u64,
     connected_samples: u64,
@@ -237,20 +382,19 @@ impl SeriesStore {
     pub fn new(rollup_secs: u64, timeline_secs: u64) -> Self {
         Self {
             rollup_secs: rollup_secs.max(1),
-            timeline_secs: timeline_secs.max(1),
             rollups: Default::default(),
             open_bucket_start: [None; 6],
-            timeline: Vec::new(),
-            timeline_open_start: None,
+            timeline: HealthTimeline::new(timeline_secs),
             total_samples: 0,
             connected_samples: 0,
         }
     }
 
-    /// Alinha um instante ao início do bucket de largura `width`.
-    fn bucket_start(ts: DateTime<Utc>, width: u64) -> i64 {
-        let secs = ts.timestamp();
-        secs - secs.rem_euclid(width as i64)
+    /// Largura das células da linha do tempo, em segundos.
+    ///
+    /// SPEC-PROBE-009
+    pub fn timeline_secs(&self) -> u64 {
+        self.timeline.bucket_secs()
     }
 
     /// Ingere uma leitura de métrica.
@@ -261,7 +405,7 @@ impl SeriesStore {
             return; // RNF-PRB-003: NaN de divisão por zero não polui a série.
         }
         let i = metric.index();
-        let start = Self::bucket_start(ts, self.rollup_secs);
+        let start = bucket_start(ts, self.rollup_secs);
         let start_utc = DateTime::from_timestamp(start, 0).unwrap_or(ts);
 
         if self.open_bucket_start[i] == Some(start) {
@@ -282,43 +426,28 @@ impl SeriesStore {
         if connected {
             self.connected_samples += 1;
         }
-
-        let start = Self::bucket_start(ts, self.timeline_secs);
-        let start_utc = DateTime::from_timestamp(start, 0).unwrap_or(ts);
-
-        if self.timeline_open_start != Some(start) {
-            self.timeline.push(TimelineBucket {
-                start_utc,
-                worst: None,
-                samples: 0,
-                connected_samples: 0,
-            });
-            self.timeline_open_start = Some(start);
-        }
-        if let Some(b) = self.timeline.last_mut() {
-            b.samples = b.samples.saturating_add(1);
-            if connected {
-                b.connected_samples = b.connected_samples.saturating_add(1);
-            }
-            if let Some(sev) = worst {
-                b.worst = Some(b.worst.map_or(sev, |cur| cur.max(sev)));
-            }
-        }
+        self.timeline.push(ts, worst, connected);
     }
 
     /// Linha do tempo completa, do mais antigo ao mais recente.
     ///
     /// SPEC-PROBE-009
     pub fn timeline(&self) -> &[TimelineBucket] {
-        &self.timeline
+        self.timeline.buckets()
     }
 
     /// Últimas `n` células da linha do tempo (144 células = 12 h a 5 min).
     ///
     /// SPEC-PROBE-009
     pub fn timeline_tail(&self, n: usize) -> &[TimelineBucket] {
-        let from = self.timeline.len().saturating_sub(n);
-        &self.timeline[from..]
+        self.timeline.tail(n)
+    }
+
+    /// Células da linha do tempo dentro de uma janela do seletor.
+    ///
+    /// SPEC-PROBE-023
+    pub fn timeline_window(&self, window: SeriesWindow) -> &[TimelineBucket] {
+        self.timeline.window(window)
     }
 
     /// Buckets de rollup de uma métrica.
@@ -343,11 +472,7 @@ impl SeriesStore {
     ///
     /// SPEC-PROBE-018 — o tile mostra os últimos 60 min por default.
     pub fn availability_window(&self, secs: u64) -> Option<f64> {
-        let n = secs.div_ceil(self.timeline_secs).max(1) as usize;
-        let tail = self.timeline_tail(n);
-        let samples: u32 = tail.iter().map(|b| b.samples).sum();
-        let connected: u32 = tail.iter().map(|b| b.connected_samples).sum();
-        (samples > 0).then(|| connected as f64 / samples as f64)
+        self.timeline.availability_window(secs)
     }
 
     /// Total de amostras 1 Hz ingeridas.
@@ -555,6 +680,56 @@ mod tests {
         s.push_metric(MetricId::BitrateKbps, ts(0), f64::NAN);
         s.push_metric(MetricId::BitrateKbps, ts(0), f64::INFINITY);
         assert!(s.rollups(MetricId::BitrateKbps).is_empty());
+    }
+
+    /// SPEC-PROBE-023 — a janela do seletor vira uma contagem de células, e a
+    /// grade nunca pede mais do que o teto.
+    #[test]
+    fn spec_probe_023_window_maps_to_cell_count() {
+        assert_eq!(SeriesWindow::FiveMinutes.cells(300), 1);
+        assert_eq!(SeriesWindow::OneHour.cells(300), 12);
+        assert_eq!(SeriesWindow::TwelveHours.cells(300), 144);
+        assert_eq!(SeriesWindow::WholeSession.cells(300), MAX_TIMELINE_CELLS);
+        // Bucket de 1 s: 12 h dariam 43 200 células — o teto corta.
+        assert_eq!(SeriesWindow::TwelveHours.cells(1), MAX_TIMELINE_CELLS);
+        // Largura zero vinda de um TOML mal preenchido não divide por zero:
+        // vira 1 s por célula e o teto corta.
+        assert_eq!(SeriesWindow::FiveMinutes.cells(0), MAX_TIMELINE_CELLS);
+    }
+
+    /// SPEC-PROBE-023 — a linha do tempo de um escopo tem teto: uma sessão de
+    /// 24 h num MPTS grande não pode crescer sem limite só para guardar
+    /// histórico que a grade nem desenha.
+    #[test]
+    fn spec_probe_023_scope_timeline_is_capped() {
+        let mut t = HealthTimeline::new(300);
+        // 48 h a 1 Hz — o dobro do teto.
+        for i in 0..(48 * 3_600i64) {
+            t.push(ts(i), None, true);
+        }
+        assert_eq!(t.buckets().len(), MAX_TIMELINE_CELLS);
+        // O que sobrou é a cauda recente, não o começo da sessão.
+        let last = t.buckets().last().expect("célula");
+        assert_eq!(last.start_utc, ts(48 * 3_600 - 300));
+        assert_eq!(t.window(SeriesWindow::TwelveHours).len(), 144);
+    }
+
+    /// SPEC-PROBE-023 — a célula de um escopo guarda a pior severidade vista,
+    /// e a janela devolve a pior das células.
+    #[test]
+    fn spec_probe_023_scope_timeline_keeps_worst_per_cell() {
+        let mut t = HealthTimeline::new(300);
+        t.push(ts(0), Some(Severity::Warning), true);
+        t.push(ts(1), Some(Severity::Critical), true);
+        t.push(ts(400), Some(Severity::Info), true);
+
+        assert_eq!(t.buckets().len(), 2);
+        assert_eq!(t.buckets()[0].worst, Some(Severity::Critical));
+        assert_eq!(t.buckets()[1].worst, Some(Severity::Info));
+        assert_eq!(
+            t.worst_in_window(SeriesWindow::TwelveHours),
+            Some(Severity::Critical)
+        );
     }
 
     /// SPEC-PROBE-018 — disponibilidade da janela reflete os buckets recentes.

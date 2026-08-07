@@ -425,11 +425,16 @@ fn spawn_engine_thread(mut t: EngineThread) -> Result<std::thread::JoinHandle<()
                     encapsulation: t.shared.encapsulation(),
                     video_pids: t.shared.video_pids(),
                     audio_pids: t.shared.audio_pids(),
-                    video_height: t.shared.video_height(),
+                    // A altura vem por serviço, junto do thumbnail; o campo do
+                    // feed só existiria para um multiplex sem PSI, onde não há
+                    // vídeo decodificado para medir (SPEC-PROBE-024).
+                    video_height: None,
                     scrambled: t.shared.scrambled(),
                     snapshot_state: t.shared.snapshot_state(),
                     writer_drops_total: 0,
                     reconnect_attempts: t.shared.reconnect_attempts(),
+                    services: (*t.shared.services()).clone(),
+                    visuals: t.shared.visuals(),
                 });
                 for ev in &events {
                     tracing::debug!(
@@ -489,6 +494,49 @@ struct SnapshotTarget {
     rx: crossbeam_channel::Receiver<ts::PesData>,
 }
 
+/// Uma captura planejada: um serviço de um feed.
+///
+/// SPEC-PROBE-024 — o round-robin deixou de ser por feed. Num MPTS, um
+/// thumbnail por feed mostraria sempre o mesmo serviço e o mosaico de serviços
+/// (§8.2) ficaria cego.
+#[derive(Debug, Clone, Copy)]
+struct Capture {
+    target: usize,
+    service_id: u16,
+    pid: ts::Pid,
+    codec: av::MediaCodec,
+}
+
+/// Monta a volta do round-robin: um item por serviço com vídeo, de todos os
+/// feeds, na ordem dos slots.
+///
+/// O plano é refeito a cada captura de propósito: a PSI muda em runtime (troca
+/// de grade, PMT nova), e um plano fixo capturado no start apontaria para PIDs
+/// que não existem mais.
+fn plan_captures(targets: &[SnapshotTarget]) -> Vec<Capture> {
+    let mut plan = Vec::new();
+    for (index, target) in targets.iter().enumerate() {
+        for service in target.shared.services().iter() {
+            let (Some(pid), Some(stream_type)) = (
+                service.primary_video_pid(),
+                service.primary_video_stream_type(),
+            ) else {
+                continue;
+            };
+            let Some(codec) = av::MediaCodec::from_stream_type(stream_type) else {
+                continue;
+            };
+            plan.push(Capture {
+                target: index,
+                service_id: service.service_id,
+                pid,
+                codec,
+            });
+        }
+    }
+    plan
+}
+
 fn spawn_snapshot_thread(
     cfg: ProbeConfig,
     targets: Vec<SnapshotTarget>,
@@ -506,7 +554,11 @@ fn spawn_snapshot_thread(
                 return;
             }
             // SPEC-PROBE-003b — offset = intervalo / n_feeds, de modo que dois
-            // decodes SW nunca coincidam no mesmo instante.
+            // decodes SW nunca coincidam no mesmo instante.  A volta agora
+            // percorre **serviços**, então num MPTS de N serviços cada um é
+            // atualizado a cada `N × stagger`: o custo de CPU por captura fica
+            // igual ao de antes (SPEC-PROBE-002), só a cadência por serviço é
+            // que dilui.
             let stagger = cfg.snapshot_interval() / targets.len() as u32;
             let arm_window = Duration::from_secs_f64(cfg.snapshot_arm_secs.max(0.1));
             let mut generation: u64 = 0;
@@ -525,37 +577,75 @@ fn spawn_snapshot_thread(
                 }
             };
 
+            // Espera fatiada, para responder ao stop sem esperar o `stagger`
+            // inteiro no shutdown.
+            let wait = |stop: &AtomicBool| {
+                let deadline = Instant::now() + stagger;
+                while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            };
+
             while !stop.load(Ordering::Relaxed) {
-                let target = &targets[index % targets.len()];
+                let plan = plan_captures(&targets);
+                if plan.is_empty() {
+                    // Sem PSI ainda, ou multiplex sem vídeo: nada a decodificar.
+                    for target in &targets {
+                        target.shared.set_snapshot_state(if target.shared.connected() {
+                            probe::SnapshotState::Pending
+                        } else {
+                            probe::SnapshotState::NoSignal
+                        });
+                    }
+                    wait(&stop);
+                    continue;
+                }
+
+                let capture = plan[index % plan.len()];
                 index = index.wrapping_add(1);
+                let target = &targets[capture.target];
 
                 if target.shared.snapshot_suspended() {
                     // 1º estágio de degradação: o thumbnail é a primeira coisa
                     // a cair, nunca a recepção (SPEC-PROBE-013a).
-                    target.shared.set_snapshot_state(probe::SnapshotState::Suspended);
-                    let deadline = Instant::now() + stagger;
-                    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
+                    let suspended = probe::SnapshotState::Suspended;
+                    target.shared.set_snapshot_state(suspended);
+                    target.shared.set_visual(
+                        capture.service_id,
+                        probe::ServiceVisual {
+                            video_height: None,
+                            state: suspended,
+                        },
+                    );
+                    wait(&stop);
                     continue;
                 }
 
                 let result = capture_one(
                     target,
+                    capture.pid,
+                    capture.codec,
                     &mut decoder,
                     arm_window,
                     cfg.snapshot_max_width,
                     &stop,
                 );
                 match result {
-                    Some(thumb) => {
+                    Some((thumb, height)) => {
                         generation += 1;
                         target.shared.set_snapshot_state(probe::SnapshotState::Ok);
+                        target.shared.set_visual(
+                            capture.service_id,
+                            probe::ServiceVisual {
+                                video_height: Some(height),
+                                state: probe::SnapshotState::Ok,
+                            },
+                        );
                         if let Ok(mut map) = thumbnails.write() {
-                            // SPEC-PROBE-003 — só uma imagem viva por feed: a
-                            // anterior é liberada aqui, ao publicar a nova.
+                            // SPEC-PROBE-003 — só uma imagem viva por serviço:
+                            // a anterior é liberada aqui, ao publicar a nova.
                             map.insert(
-                                target.slot,
+                                (target.slot, capture.service_id),
                                 ui_slint::ProbeThumbnail {
                                     generation,
                                     ..thumb
@@ -566,40 +656,51 @@ fn spawn_snapshot_thread(
                     None => {
                         // SPEC-PROBE-003a — sem IRAP na janela o estado vira
                         // "sem keyframe"; isso **não** gera alarme por si só.
-                        target.shared.set_snapshot_state(if target.shared.connected() {
+                        let state = if target.shared.connected() {
                             probe::SnapshotState::NoKeyframe
                         } else {
                             probe::SnapshotState::NoSignal
-                        });
-                        tracing::trace!(slot = target.slot, "probe-snapshot: sem keyframe na janela");
+                        };
+                        target.shared.set_snapshot_state(state);
+                        target.shared.set_visual(
+                            capture.service_id,
+                            probe::ServiceVisual {
+                                video_height: None,
+                                state,
+                            },
+                        );
+                        tracing::trace!(
+                            slot = target.slot,
+                            service = capture.service_id,
+                            "probe-snapshot: sem keyframe na janela"
+                        );
                     }
                 }
 
-                // Espera fatiada para responder ao stop.
-                let deadline = Instant::now() + stagger;
-                while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+                wait(&stop);
             }
             tracing::info!("probe-snapshot: encerrado");
         })
         .map_err(|e| format!("falha ao criar thread probe-snapshot: {e}"))
 }
 
-/// Arma o decoder, espera **um** frame e desarma.
+/// Arma o decoder no PID de vídeo de um serviço, espera **um** frame e desarma.
+///
+/// Devolve o thumbnail e a altura **nativa** do frame (badge `HD`/`SD`, que
+/// descreve o stream e não a miniatura).
 ///
 /// SPEC-PROBE-003a — a janela de armação é limitada; sem IRAP nela, devolve
 /// `None` e o estado do tile vira "sem keyframe", sem gerar alarme.
+#[allow(clippy::too_many_arguments)]
 fn capture_one(
     target: &SnapshotTarget,
+    pid: ts::Pid,
+    codec: av::MediaCodec,
     decoder: &mut av::FfmpegDecoder,
     arm_window: Duration,
     max_width: u32,
     stop: &AtomicBool,
-) -> Option<ui_slint::ProbeThumbnail> {
-    let pid = *target.shared.video_pids().first()?;
-    let codec = target.shared.video_codec()?;
-
+) -> Option<(ui_slint::ProbeThumbnail, u32)> {
     // Descarta o que sobrou da janela anterior antes de armar.
     while target.rx.try_recv().is_ok() {}
     decoder.reset();
@@ -626,11 +727,10 @@ fn capture_one(
             };
             for frame in frames {
                 if let av::DecodedFrame::Video(vf) = frame {
-                    out = downscale(&vf, max_width);
+                    // Badge HD/SD: a altura vem do frame decodificado, já que o
+                    // modo Probe não roda o Media Info completo.
+                    out = downscale(&vf, max_width).map(|t| (t, source_height(&vf)));
                     if out.is_some() {
-                        // Badge HD/SD: a altura vem do frame decodificado, já
-                        // que o modo Probe não roda o Media Info completo.
-                        target.shared.set_video_height(source_height(&vf));
                         break 'window;
                     }
                 }

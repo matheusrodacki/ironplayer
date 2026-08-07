@@ -425,6 +425,9 @@ mod tests {
                     measured: 10.0,
                     unit: "errors".into(),
                     context: "pid 6100".into(),
+                    pid: Some(6100),
+                    service_id: None,
+                    local: false,
                 },
                 EventRow {
                     event_id: "e2".into(),
@@ -436,6 +439,9 @@ mod tests {
                     measured: 4.0,
                     unit: "pkts".into(),
                     context: String::new(),
+                    pid: None,
+                    service_id: None,
+                    local: false,
                 },
             ],
             ..Default::default()
@@ -536,6 +542,9 @@ mod tests {
                 measured: 1.0,
                 unit: "errors".into(),
                 context: String::new(),
+                pid: None,
+                service_id: None,
+                local: false,
             });
         }
         let top = top_events(&f);

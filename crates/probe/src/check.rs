@@ -301,6 +301,21 @@ pub fn default_checks() -> Vec<CheckDef> {
     ]
 }
 
+/// Camada de um check pelo id, independente do perfil carregado.
+///
+/// `[probe.checks.<id>]` sobrescreve limiar, janela e severidade, mas **não** a
+/// camada — ela é estrutural.  Por isso a UI pode resolvê-la sem carregar o
+/// perfil, que é o que permite filtrar os alertas de uma linha da grade
+/// (`TRANSPORTE`, `IP`) sem carregar a camada em cada `EventRow`.
+///
+/// SPEC-PROBE-023 · SPEC-PROBE-025
+pub fn layer_of(check_id: &str) -> Option<Layer> {
+    default_checks()
+        .into_iter()
+        .find(|d| d.id == check_id)
+        .map(|d| d.layer)
+}
+
 /// Perfil resolvido: defaults embutidos + overrides do TOML.
 ///
 /// SPEC-PROBE-007
@@ -394,6 +409,17 @@ impl Measurement {
         self.context = context;
         self
     }
+}
+
+/// Um evento aberto, resumido para atribuição por escopo.
+///
+/// SPEC-PROBE-021 · SPEC-PROBE-023
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenCheck {
+    pub check_id: &'static str,
+    pub layer: Layer,
+    pub severity: Severity,
+    pub context: EventContext,
 }
 
 // ── Estado interno por (check, contexto) ────────────────────────────────────
@@ -595,6 +621,24 @@ impl CheckEngine {
     ///
     /// SPEC-PROBE-018
     pub fn layer_health(&self, applicable: &[Layer]) -> BTreeMap<Layer, LayerHealth> {
+        self.layer_health_where(applicable, |_| true)
+    }
+
+    /// Igual a [`CheckEngine::layer_health`], mas só considera os eventos
+    /// abertos cujo contexto passa em `accepts`.
+    ///
+    /// É o que dá indicadores próprios ao tile de **serviço**: um CC error no
+    /// PID de outro serviço do mesmo multiplex não pode acender o `V` deste.
+    ///
+    /// SPEC-PROBE-022
+    pub fn layer_health_where<F>(
+        &self,
+        applicable: &[Layer],
+        accepts: F,
+    ) -> BTreeMap<Layer, LayerHealth>
+    where
+        F: Fn(&EventContext) -> bool,
+    {
         let mut map: BTreeMap<Layer, LayerHealth> = Layer::TILE_ORDER
             .iter()
             .map(|l| (*l, LayerHealth::NotApplicable))
@@ -602,18 +646,38 @@ impl CheckEngine {
         for layer in applicable {
             map.insert(*layer, LayerHealth::Ok);
         }
-        for ((check_id, _), state) in &self.states {
-            if state.open.is_none() {
+        for open in self.open_checks() {
+            if !accepts(&open.context) {
                 continue;
             }
-            let Some(def) = self.profile.get(check_id) else {
-                continue;
-            };
-            if let Some(entry) = map.get_mut(&def.layer) {
-                entry.worsen(def.severity);
+            if let Some(entry) = map.get_mut(&open.layer) {
+                entry.worsen(open.severity);
             }
         }
         map
+    }
+
+    /// Todos os eventos abertos agora, com camada, severidade e contexto.
+    ///
+    /// A grade de saúde precisa atribuir cada evento aberto ao seu escopo
+    /// (camada do feed, serviço, PID) no mesmo tick — e só o motor sabe quais
+    /// estão abertos depois do debounce.
+    ///
+    /// SPEC-PROBE-021 · SPEC-PROBE-023
+    pub fn open_checks(&self) -> Vec<OpenCheck> {
+        self.states
+            .iter()
+            .filter(|(_, s)| s.open.is_some())
+            .filter_map(|((check_id, _), state)| {
+                let def = self.profile.get(check_id)?;
+                Some(OpenCheck {
+                    check_id: def.id,
+                    layer: def.layer,
+                    severity: def.severity,
+                    context: state.context.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Pior severidade entre os eventos abertos, se houver.

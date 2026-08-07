@@ -1,0 +1,1140 @@
+// Modo Probe — mosaico e detalhe.
+//
+// Duas telas (§8): **mosaico** (visão do run) e **detalhe** (visão de um
+// feed).  O mosaico é a tela inicial; o detalhe abre ao clicar num tile e
+// volta com o botão ← ou `Esc`.
+//
+// SPEC-PROBE-009 · SPEC-PROBE-010 · SPEC-PROBE-013 · SPEC-PROBE-018 ·
+// SPEC-PROBE-019
+
+import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+// ─── Structs de dados (espelhados em Rust) ──────────────────────────────────
+
+/// Um tile do mosaico (§8.1).
+///
+/// Os cinco indicadores de camada são campos explícitos em vez de uma lista:
+/// `Layer::TILE_ORDER` tem tamanho fixo (IP · RTP · TS · V · A), e struct com
+/// array aninhado complica o mapeamento no Rust sem ganho nenhum aqui.
+export struct ProbeTile {
+    slot: int,
+    name: string,
+    url: string,
+    /// `UDP` · `RTP` · `RTP+FEC`, detectado em runtime (SPEC-PROBE-018a).
+    enc-badge: string,
+    /// `HD` / `SD`; vazio quando a altura é desconhecida.
+    res-badge: string,
+    /// `scrambling_control ≠ 0` em algum PID — badge `SCR`.
+    scrambled: bool,
+    thumbnail: image,
+    has-thumbnail: bool,
+    /// Rótulo do estado do snapshot ("sem keyframe", SPEC-PROBE-003a).
+    snapshot-state: string,
+    connected: bool,
+    bitrate: string,
+    /// Disponibilidade da janela corrente, formatada (§8.1).
+    availability: string,
+    availability-frac: float,
+    availability-color: color,
+    /// Cor de cada indicador redondo; cinza = `n/a` (SPEC-PROBE-018a).
+    ip-color: color,
+    rtp-color: color,
+    ts-color: color,
+    v-color: color,
+    a-color: color,
+    /// Eventos abertos, para o distintivo de alarme.
+    open-events: int,
+    selected: bool,
+}
+
+/// Uma célula da linha do tempo de saúde (SPEC-PROBE-009).
+export struct ProbeTimelineCell {
+    cell-color: color,
+    /// Tooltip: horário de início + pior severidade do bucket.
+    tip: string,
+    index: int,
+}
+
+/// Uma linha do event log (§8.2).
+export struct ProbeEventRow {
+    time: string,
+    level: string,
+    level-color: color,
+    check: string,
+    count: string,
+    measured: string,
+    context: string,
+}
+
+/// Linha chave/valor dos painéis Resumo e Saúde da probe (§8.2).
+export struct ProbeInfoRow {
+    key: string,
+    value: string,
+}
+
+/// Um gráfico de sessão (SPEC-PROBE-010).
+export struct ProbeChart {
+    title: string,
+    unit: string,
+    big-value: string,
+    sub-value: string,
+    /// Comandos SVG do traço e da área, gerados no Rust.
+    line: string,
+    area: string,
+    line-color: color,
+}
+
+// ─── Primitivas ─────────────────────────────────────────────────────────────
+
+/// Distintivo retangular de conteúdo/encapsulamento (§8.1).
+component Badge inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: true;
+    in property <color> tone: Theme.text-dim;
+    width: txt.preferred-width + 12px;
+    height: 17px;
+    border-radius: 3px;
+    background: root.active ? root.tone.with-alpha(0.16) : Theme.panel-alt;
+    border-width: 1px;
+    border-color: root.active ? root.tone.with-alpha(0.45) : Theme.border-soft;
+    txt := Text {
+        text: root.label;
+        color: root.active ? root.tone : Theme.text-faint;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}
+
+/// Indicador redondo de camada (§8.1: `IP RTP TS V A`).
+///
+/// A cor vem pronta do Rust: verde (ok), amarelo/vermelho (pior severidade
+/// aberta da camada) ou cinza (`n/a`, SPEC-PROBE-018a).
+component LayerDot inherits Rectangle {
+    in property <string> label;
+    in property <color> tone;
+    width: 22px;
+    height: 22px;
+    border-radius: 11px;
+    background: root.tone.with-alpha(0.18);
+    border-width: 1.5px;
+    border-color: root.tone;
+    Text {
+        text: root.label;
+        color: root.tone;
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 0.3px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}
+
+/// Barra de disponibilidade + percentual (§8.1).
+///
+/// É **disponibilidade da janela**, não "qualidade" subjetiva — o rótulo da
+/// ajuda contextual diz isso para não induzir o operador ao erro.
+component AvailabilityBar inherits HorizontalLayout {
+    in property <float> frac;
+    in property <string> label;
+    in property <color> tone: Theme.green;
+    spacing: 8px;
+    height: 14px;
+    Rectangle {
+        horizontal-stretch: 1;
+        y: (parent.height - 6px) / 2;
+        height: 6px;
+        border-radius: 3px;
+        background: Theme.panel-alt;
+        Rectangle {
+            x: 0;
+            width: parent.width * clamp(root.frac, 0, 1);
+            height: parent.height;
+            border-radius: 3px;
+            background: root.tone;
+        }
+    }
+
+    Text {
+        text: root.label;
+        color: Theme.text-dim;
+        font-size: 11px;
+        font-family: Theme.mono;
+        vertical-alignment: center;
+    }
+}
+
+/// Faixa da linha do tempo de saúde (SPEC-PROBE-009).
+///
+/// Clicar numa célula filtra o event log daquele intervalo.
+component HealthTimeline inherits Rectangle {
+    in property <[ProbeTimelineCell]> cells;
+    in property <int> selected: -1;
+    callback cell-clicked(int);
+    height: 26px;
+    HorizontalLayout {
+        spacing: 1px;
+        for c in root.cells: Rectangle {
+            horizontal-stretch: 1;
+            min-width: 2px;
+            border-radius: 1px;
+            background: c.cell-color;
+            border-width: root.selected == c.index ? 2px : 0px;
+            border-color: Theme.text;
+            ta := TouchArea {
+                clicked => { root.cell-clicked(c.index); }
+            }
+
+            // Realce de hover: a faixa é o artefato-chave depois de 12 h, e
+            // sem feedback o operador não percebe que ela é clicável.
+            Rectangle {
+                width: 100%;
+                height: 100%;
+                background: ta.has-hover ? Theme.text.with-alpha(0.18) : transparent;
+            }
+        }
+        if root.cells.length == 0: Rectangle {
+            background: Theme.sev-nodata;
+            border-radius: 2px;
+        }
+    }
+}
+
+/// Card de gráfico do detalhe (SPEC-PROBE-010).
+component ProbeChartCard inherits Rectangle {
+    in property <ProbeChart> chart;
+    background: Theme.card;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border-soft;
+    clip: true;
+    // Repintura ≤ 1 Hz: cachear evita re-tesselar o Path a cada frame (§8.2).
+    cache-rendering-hint: true;
+
+    Rectangle {
+        x: 0;
+        y: 42px;
+        width: parent.width;
+        height: parent.height - 42px;
+        clip: true;
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: 100;
+            viewbox-height: 100;
+            commands: root.chart.area;
+            fill: root.chart.line-color.with-alpha(0.14);
+        }
+
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: 100;
+            viewbox-height: 100;
+            commands: root.chart.line;
+            stroke: root.chart.line-color;
+            stroke-width: 1.5px;
+        }
+    }
+
+    VerticalLayout {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 42px;
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-top: 5px;
+        spacing: 0px;
+        alignment: start;
+        HorizontalLayout {
+            Text {
+                text: root.chart.title;
+                color: Theme.text-dim;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                overflow: elide;
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            Text {
+                text: root.chart.unit;
+                color: Theme.text-faint;
+                font-size: 9px;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            Text {
+                text: root.chart.big-value;
+                color: root.chart.line-color;
+                font-size: 16px;
+                font-weight: 800;
+                font-family: Theme.mono;
+            }
+
+            Text {
+                text: root.chart.sub-value;
+                color: Theme.text-dim;
+                font-size: 10px;
+                vertical-alignment: bottom;
+            }
+        }
+    }
+}
+
+/// Cabeçalho de seção do modo Probe.
+component ProbeSectionHeader inherits HorizontalLayout {
+    in property <string> title;
+    in property <string> trailing;
+    height: 18px;
+    spacing: 10px;
+    Text {
+        text: root.title;
+        color: Theme.text-dim;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 1.5px;
+        vertical-alignment: center;
+    }
+
+    VerticalLayout {
+        alignment: center;
+        horizontal-stretch: 1;
+        Rectangle {
+            height: 1px;
+            background: Theme.border-soft;
+        }
+    }
+
+    Text {
+        text: root.trailing;
+        color: Theme.text-faint;
+        font-size: 10px;
+        font-family: Theme.mono;
+        vertical-alignment: center;
+    }
+}
+
+// ─── Tile ───────────────────────────────────────────────────────────────────
+
+/// Anatomia do tile conforme §8.1.
+component TileView inherits Rectangle {
+    in property <ProbeTile> tile;
+    callback clicked();
+
+    background: Theme.panel;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: root.tile.selected
+        ? Theme.accent
+        : (ta.has-hover ? Theme.border.brighter(0.6) : Theme.border);
+    clip: true;
+    cache-rendering-hint: true;
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        // ── Badges de encapsulamento e conteúdo ────────────────────────
+        HorizontalLayout {
+            spacing: 5px;
+            height: 17px;
+            Badge {
+                label: root.tile.enc-badge;
+                tone: Theme.blue;
+            }
+
+            if root.tile.res-badge != "": Badge {
+                label: root.tile.res-badge;
+                tone: Theme.text-dim;
+            }
+            if root.tile.scrambled: Badge {
+                label: "SCR";
+                tone: Theme.accent;
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            if root.tile.open-events > 0: Badge {
+                label: root.tile.open-events + " ALARME";
+                tone: Theme.red;
+            }
+        }
+
+        // ── Thumbnail 5 s (SPEC-PROBE-003) ─────────────────────────────
+        Rectangle {
+            height: 158px;
+            background: #050607;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: Theme.border-soft;
+            clip: true;
+
+            if root.tile.has-thumbnail: Image {
+                width: 100%;
+                height: 100%;
+                source: root.tile.thumbnail;
+                image-fit: contain;
+            }
+            if !root.tile.has-thumbnail: VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+                Text {
+                    text: root.tile.connected ? "SEM IMAGEM" : "SEM SINAL";
+                    color: Theme.text-faint;
+                    font-size: 11px;
+                    letter-spacing: 2px;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: root.tile.snapshot-state;
+                    color: #3a434d;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                }
+            }
+
+            // Bitrate sobreposto: é a leitura que o operador confere de
+            // relance, sem abrir o detalhe.
+            Rectangle {
+                x: 6px;
+                y: parent.height - 24px;
+                width: br.preferred-width + 14px;
+                height: 18px;
+                background: #0b0d10dd;
+                border-radius: 3px;
+                br := Text {
+                    text: root.tile.bitrate;
+                    color: Theme.text;
+                    font-size: 10px;
+                    font-family: Theme.mono;
+                }
+            }
+        }
+
+        // ── Indicadores redondos por camada ────────────────────────────
+        HorizontalLayout {
+            spacing: 6px;
+            height: 22px;
+            alignment: start;
+            LayerDot {
+                label: "IP";
+                tone: root.tile.ip-color;
+            }
+
+            LayerDot {
+                label: "RTP";
+                tone: root.tile.rtp-color;
+            }
+
+            LayerDot {
+                label: "TS";
+                tone: root.tile.ts-color;
+            }
+
+            LayerDot {
+                label: "V";
+                tone: root.tile.v-color;
+            }
+
+            LayerDot {
+                label: "A";
+                tone: root.tile.a-color;
+            }
+        }
+
+        // ── Disponibilidade da janela ──────────────────────────────────
+        AvailabilityBar {
+            frac: root.tile.availability-frac;
+            label: root.tile.availability;
+            tone: root.tile.availability-color;
+        }
+
+        // ── Nome do feed ───────────────────────────────────────────────
+        Text {
+            text: root.tile.name;
+            color: Theme.text;
+            font-size: 12px;
+            font-weight: 600;
+            overflow: elide;
+        }
+    }
+}
+
+// ─── Mosaico ────────────────────────────────────────────────────────────────
+
+/// Tela inicial do modo Probe (§8.1).
+export component ProbeMosaic inherits Rectangle {
+    in property <[ProbeTile]> tiles;
+    in property <int> max-feeds: 2;
+    in property <string> run-clock: "00:00:00";
+    in property <bool> recording: false;
+    in property <string> run-id: "";
+    in property <string> status: "";
+    callback open-detail(int);
+    callback start-run();
+    callback stop-run();
+    callback export-report();
+
+    property <length> tile-w: 300px;
+    property <length> tile-h: 300px;
+    property <length> gap: 12px;
+    // Grade que reflui com a largura da janela (SPEC-PROBE-018). O número de
+    // colunas é derivado, nunca fixado em 2 — SPEC-PROBE-017a.
+    // Colunas derivadas da largura disponível, nunca fixadas em 2
+    // (SPEC-PROBE-018 pede reflow; SPEC-PROBE-017a proíbe assumir "exatamente 2").
+    // A conta parte da largura do Flickable, e não da grade: fazer o viewport
+    // depender da altura da grade e a grade depender do viewport fecha um
+    // laço de binding que o compilador do Slint rejeita.
+    property <int> cols: max(1, floor((fl.width + self.gap) / (self.tile-w + self.gap)));
+    property <int> slots: max(root.tiles.length, root.max-feeds);
+    property <int> rows: ceil(root.slots / max(root.cols, 1));
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 12px;
+
+        // ── Barra do run ───────────────────────────────────────────────
+        Rectangle {
+            height: 44px;
+            background: Theme.panel;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.border;
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 14px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Rectangle {
+                        width: 9px;
+                        height: 9px;
+                        y: (parent.height - 9px) / 2;
+                        border-radius: 4.5px;
+                        background: root.recording ? Theme.red : Theme.text-faint;
+                    }
+
+                    Text {
+                        text: root.recording ? "gravando" : "parado";
+                        color: root.recording ? Theme.red : Theme.text-faint;
+                        font-size: 11px;
+                        font-weight: 700;
+                        letter-spacing: 1px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Text {
+                    text: "run " + root.run-clock;
+                    color: Theme.text;
+                    font-size: 14px;
+                    font-weight: 700;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.run-id;
+                    color: Theme.text-faint;
+                    font-size: 11px;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                Text {
+                    text: root.status;
+                    color: Theme.text-dim;
+                    font-size: 11px;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                // Relatório do run (SPEC-PROBE-014).
+                Rectangle {
+                    width: 108px;
+                    y: 7px;
+                    height: 30px;
+                    background: ta-rep.has-hover ? Theme.panel-alt.brighter(0.35) : Theme.panel-alt;
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    Text {
+                        text: "Relatório";
+                        color: Theme.text-dim;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+
+                    ta-rep := TouchArea {
+                        clicked => { root.export-report(); }
+                    }
+                }
+
+                // Iniciar / parar o run (SPEC-PROBE-004).
+                Rectangle {
+                    width: 92px;
+                    y: 7px;
+                    height: 30px;
+                    background: root.recording
+                        ? (ta-run.has-hover ? Theme.panel-alt.brighter(0.35) : Theme.panel-alt)
+                        : (ta-run.has-hover ? Theme.accent.brighter(0.15) : Theme.accent);
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: root.recording ? Theme.red.with-alpha(0.55) : Theme.accent;
+                    Text {
+                        text: root.recording ? "Parar" : "Iniciar";
+                        color: root.recording ? Theme.text : #1a1206;
+                        font-size: 12px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+
+                    ta-run := TouchArea {
+                        clicked => {
+                            if (root.recording) { root.stop-run(); } else { root.start-run(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Grade de tiles ─────────────────────────────────────────────
+        fl := Flickable {
+            vertical-stretch: 1;
+            viewport-height: root.rows * (root.tile-h + root.gap);
+            Rectangle {
+                width: fl.width;
+                height: root.rows * (root.tile-h + root.gap);
+
+                for t[i] in root.tiles: TileView {
+                    tile: t;
+                    width: root.tile-w;
+                    height: root.tile-h;
+                    x: (i - root.cols * floor(i / root.cols)) * (root.tile-w + root.gap);
+                    y: floor(i / root.cols) * (root.tile-h + root.gap);
+                    clicked => { root.open-detail(t.slot); }
+                }
+
+                // Slots livres até `max-feeds` (§8.1 desenha o slot vazio).
+                for k in max(root.max-feeds - root.tiles.length, 0): Rectangle {
+                    property <int> idx: root.tiles.length + k;
+                    width: root.tile-w;
+                    height: root.tile-h;
+                    x: (self.idx - root.cols * floor(self.idx / root.cols)) * (root.tile-w + root.gap);
+                    y: floor(self.idx / root.cols) * (root.tile-h + root.gap);
+                    background: transparent;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border-soft;
+                    Text {
+                        text: "slot livre";
+                        color: Theme.text-faint;
+                        font-size: 11px;
+                        letter-spacing: 1px;
+                    }
+                }
+            }
+        }
+
+        if root.tiles.length == 0: Text {
+            text: "Nenhum feed configurado. Adicione blocos [[probe.feeds]] no ironstream.toml.";
+            color: Theme.text-faint;
+            font-size: 12px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// ─── Detalhe ────────────────────────────────────────────────────────────────
+
+/// Detalhe de um feed (§8.2).
+export component ProbeDetail inherits Rectangle {
+    in property <ProbeTile> tile;
+    in property <[ProbeTimelineCell]> timeline;
+    in property <[ProbeChart]> charts;
+    in property <[ProbeEventRow]> events;
+    in property <[ProbeInfoRow]> summary;
+    in property <[ProbeInfoRow]> health;
+    in property <string> timeline-caption: "";
+    in property <int> timeline-selected: -1;
+    in property <string> window-label: "1 h";
+    in property <int> window-index: 1;
+    in property <[string]> windows: ["5 min", "1 h", "12 h", "sessão"];
+    in property <string> severity-filter: "todas";
+    callback back();
+    callback select-cell(int);
+    callback select-window(int);
+    callback cycle-severity();
+
+    // `Esc` volta ao mosaico (§8). O detalhe não tem campo de texto, então
+    // tomar o foco aqui não disputa com nenhum TextInput.
+    fs := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.back();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    init => {
+        fs.focus();
+    }
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 12px;
+
+        // ── Cabeçalho ──────────────────────────────────────────────────
+        Rectangle {
+            height: 44px;
+            background: Theme.panel;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.border;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 14px;
+                spacing: 12px;
+
+                Rectangle {
+                    width: 96px;
+                    y: 7px;
+                    height: 30px;
+                    background: ta-back.has-hover ? Theme.panel-alt.brighter(0.35) : Theme.panel-alt;
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    Text {
+                        text: "← mosaico";
+                        color: Theme.text-dim;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+
+                    ta-back := TouchArea {
+                        clicked => { root.back(); }
+                    }
+                }
+
+                Text {
+                    text: root.tile.name;
+                    color: Theme.text;
+                    font-size: 14px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.tile.url;
+                    color: Theme.text-faint;
+                    font-size: 12px;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    Badge {
+                        label: root.tile.enc-badge;
+                        tone: Theme.blue;
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                Rectangle {
+                    width: 9px;
+                    height: 9px;
+                    y: (parent.height - 9px) / 2;
+                    border-radius: 4.5px;
+                    background: root.tile.connected ? Theme.green : Theme.red;
+                }
+
+                Text {
+                    text: root.tile.availability;
+                    color: Theme.text-dim;
+                    font-size: 12px;
+                    font-family: Theme.mono;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 12px;
+
+            // ── Coluna esquerda: thumbnail + resumo + saúde ────────────
+            Rectangle {
+                width: 300px;
+                background: Theme.panel;
+                border-radius: Theme.radius;
+                border-width: 1px;
+                border-color: Theme.border;
+                cache-rendering-hint: true;
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 12px;
+
+                    Rectangle {
+                        height: 158px;
+                        background: #050607;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: Theme.border-soft;
+                        clip: true;
+                        if root.tile.has-thumbnail: Image {
+                            width: 100%;
+                            height: 100%;
+                            source: root.tile.thumbnail;
+                            image-fit: contain;
+                        }
+                        if !root.tile.has-thumbnail: Text {
+                            text: root.tile.snapshot-state;
+                            color: Theme.text-faint;
+                            font-size: 11px;
+                            letter-spacing: 1px;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 6px;
+                        height: 22px;
+                        alignment: start;
+                        LayerDot {
+                            label: "IP";
+                            tone: root.tile.ip-color;
+                        }
+
+                        LayerDot {
+                            label: "RTP";
+                            tone: root.tile.rtp-color;
+                        }
+
+                        LayerDot {
+                            label: "TS";
+                            tone: root.tile.ts-color;
+                        }
+
+                        LayerDot {
+                            label: "V";
+                            tone: root.tile.v-color;
+                        }
+
+                        LayerDot {
+                            label: "A";
+                            tone: root.tile.a-color;
+                        }
+                    }
+
+                    ProbeSectionHeader {
+                        title: "RESUMO";
+                    }
+
+                    for r in root.summary: HorizontalLayout {
+                        height: 18px;
+                        spacing: 8px;
+                        Text {
+                            text: r.key;
+                            color: Theme.text-dim;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+
+                        Text {
+                            text: r.value;
+                            color: Theme.text;
+                            font-size: 11px;
+                            font-family: Theme.mono;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Saúde da probe (SPEC-PROBE-013).
+                    ProbeSectionHeader {
+                        title: "SAÚDE DA PROBE";
+                    }
+
+                    for r in root.health: HorizontalLayout {
+                        height: 18px;
+                        spacing: 8px;
+                        Text {
+                            text: r.key;
+                            color: Theme.text-dim;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+
+                        Text {
+                            text: r.value;
+                            color: Theme.text;
+                            font-size: 11px;
+                            font-family: Theme.mono;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                    }
+                }
+            }
+
+            // ── Coluna direita: timeline, gráficos, event log ──────────
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 12px;
+
+                // Linha do tempo de saúde (SPEC-PROBE-009).
+                Rectangle {
+                    height: 84px;
+                    background: Theme.panel;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    cache-rendering-hint: true;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        ProbeSectionHeader {
+                            title: "LINHA DO TEMPO DE SAÚDE";
+                            trailing: root.timeline-caption;
+                        }
+
+                        HealthTimeline {
+                            cells: root.timeline;
+                            selected: root.timeline-selected;
+                            cell-clicked(i) => { root.select-cell(i); }
+                        }
+                    }
+                }
+
+                // Gráficos de sessão (SPEC-PROBE-010).
+                Rectangle {
+                    vertical-stretch: 4;
+                    background: transparent;
+                    VerticalLayout {
+                        spacing: 8px;
+                        HorizontalLayout {
+                            height: 22px;
+                            spacing: 6px;
+                            Text {
+                                text: "JANELA";
+                                color: Theme.text-dim;
+                                font-size: 10px;
+                                font-weight: 700;
+                                letter-spacing: 1.5px;
+                                vertical-alignment: center;
+                            }
+
+                            for w[i] in root.windows: Rectangle {
+                                width: 62px;
+                                border-radius: 4px;
+                                background: root.window-index == i ? Theme.accent : Theme.panel-alt;
+                                border-width: 1px;
+                                border-color: root.window-index == i ? Theme.accent : Theme.border;
+                                Text {
+                                    text: w;
+                                    color: root.window-index == i ? #1a1206 : Theme.text-dim;
+                                    font-size: 11px;
+                                    font-weight: root.window-index == i ? 700 : 400;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                }
+
+                                TouchArea {
+                                    clicked => { root.select-window(i); }
+                                }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+                        }
+
+                        // Grade 2×N de gráficos; reflui pela largura.
+                        Rectangle {
+                            vertical-stretch: 1;
+                            property <int> cols: max(1, floor(self.width / 240px));
+                            property <int> rows: ceil(root.charts.length / max(self.cols, 1));
+                            property <length> cw: (self.width - (self.cols - 1) * 8px) / max(self.cols, 1);
+                            property <length> chh: (self.height - (self.rows - 1) * 8px) / max(self.rows, 1);
+                            for c[i] in root.charts: ProbeChartCard {
+                                chart: c;
+                                width: parent.cw;
+                                height: parent.chh;
+                                x: (i - parent.cols * floor(i / parent.cols)) * (parent.cw + 8px);
+                                y: floor(i / parent.cols) * (parent.chh + 8px);
+                            }
+                        }
+                    }
+                }
+
+                // Event log (§8.2).
+                Rectangle {
+                    vertical-stretch: 5;
+                    background: Theme.panel;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    cache-rendering-hint: true;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            height: 18px;
+                            spacing: 10px;
+                            ProbeSectionHeader {
+                                title: "EVENT LOG";
+                                horizontal-stretch: 1;
+                            }
+
+                            Rectangle {
+                                width: 106px;
+                                border-radius: 4px;
+                                background: ta-sev.has-hover ? Theme.panel-alt.brighter(0.35) : Theme.panel-alt;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                Text {
+                                    text: root.severity-filter;
+                                    color: Theme.text-dim;
+                                    font-size: 10px;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                }
+
+                                ta-sev := TouchArea {
+                                    clicked => { root.cycle-severity(); }
+                                }
+                            }
+                        }
+
+                        if root.events.length == 0: Text {
+                            text: "Nenhum evento na seleção atual.";
+                            color: Theme.text-faint;
+                            font-size: 11px;
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for e in root.events: Rectangle {
+                                height: 22px;
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Text {
+                                        text: e.time;
+                                        width: 76px;
+                                        color: Theme.text-dim;
+                                        font-size: 11px;
+                                        font-family: Theme.mono;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Rectangle {
+                                        width: 62px;
+                                        y: 3px;
+                                        height: 16px;
+                                        border-radius: 3px;
+                                        background: e.level-color.with-alpha(0.2);
+                                        border-width: 1px;
+                                        border-color: e.level-color.with-alpha(0.5);
+                                        Text {
+                                            text: e.level;
+                                            color: e.level-color;
+                                            font-size: 9px;
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+
+                                    Text {
+                                        text: e.check;
+                                        width: 150px;
+                                        color: Theme.text;
+                                        font-size: 11px;
+                                        font-family: Theme.mono;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        text: e.count;
+                                        width: 72px;
+                                        color: Theme.text-dim;
+                                        font-size: 11px;
+                                        font-family: Theme.mono;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Text {
+                                        text: e.measured;
+                                        width: 110px;
+                                        color: Theme.text-dim;
+                                        font-size: 11px;
+                                        font-family: Theme.mono;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    Text {
+                                        text: e.context;
+                                        color: Theme.text-faint;
+                                        font-size: 11px;
+                                        font-family: Theme.mono;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

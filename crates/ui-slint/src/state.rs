@@ -470,6 +470,127 @@ pub enum AppCommand {
     SetDeinterlace { profile: DeinterlaceProfileChoice },
     /// Notifica o backend que o renderer encontrou `DXGI_ERROR_DEVICE_REMOVED`.
     GpuDeviceRemoved,
+    /// Solicita troca do modo da aplicação (Cinema / Broadcast / Probe).
+    ///
+    /// SPEC-PROBE-001
+    SetMode { mode: AppMode },
+    /// Abre um run de monitoração com os feeds do `[probe]`.
+    ///
+    /// SPEC-PROBE-004
+    StartProbeRun,
+    /// Fecha o run em curso, gravando o resumo de cada sessão.
+    ///
+    /// SPEC-PROBE-004
+    StopProbeRun,
+    /// Gera o relatório HTML do run em curso.
+    ///
+    /// SPEC-PROBE-014
+    ExportProbeReport,
+    /// Troca a janela dos gráficos publicada no snapshot.
+    ///
+    /// SPEC-PROBE-010
+    SetProbeWindow { index: usize },
+}
+
+// ---------------------------------------------------------------------------
+// Thumbnails do modo Probe
+// ---------------------------------------------------------------------------
+
+/// Um snapshot de vídeo publicado pela thread `probe-snapshot`.
+///
+/// SPEC-PROBE-003 — "somente 1 imagem viva por feed; a anterior é liberada ao
+/// publicar a nova".  O mapa compartilhado guarda exatamente uma entrada por
+/// slot, e `generation` permite à UI reconverter para `slint::Image` só quando
+/// a imagem realmente mudou (o tick de UI roda a ~60 Hz; o snapshot, a 0,2 Hz).
+#[derive(Debug, Clone)]
+pub struct ProbeThumbnail {
+    pub width: u32,
+    pub height: u32,
+    /// Pixels RGBA8, `width * height * 4` bytes.
+    pub rgba: Vec<u8>,
+    /// Incrementado a cada publicação.
+    pub generation: u64,
+}
+
+/// Mapa `slot → thumbnail` compartilhado entre a thread de snapshot e a UI.
+///
+/// SPEC-PROBE-003
+pub type SharedThumbnails = std::sync::Arc<std::sync::RwLock<HashMap<usize, ProbeThumbnail>>>;
+
+// ---------------------------------------------------------------------------
+// AppMode
+// ---------------------------------------------------------------------------
+
+/// Modo de operação da aplicação.
+///
+/// SPEC-PROBE-001 — o seletor triplo da barra superior.  Antes desta spec o
+/// toggle Cinema/Broadcast era estático no `.slint` (dois retângulos sem
+/// `TouchArea`) e não existia estado correspondente em Rust; este enum é a
+/// fonte de verdade, espelhada na propriedade `app-mode` do Slint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppMode {
+    /// Vídeo em tela cheia, painéis ocultos.
+    Cinema,
+    /// Player + painéis de análise (comportamento atual).
+    #[default]
+    Broadcast,
+    /// Monitoração contínua sem reprodução.
+    Probe,
+}
+
+impl AppMode {
+    /// Identificador estável para o `ironstream.toml` e para logs.
+    ///
+    /// SPEC-PROBE-001
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cinema => "cinema",
+            Self::Broadcast => "broadcast",
+            Self::Probe => "probe",
+        }
+    }
+
+    /// Índice usado na propriedade `app-mode` do Slint e no callback
+    /// `set-mode(int)`.
+    ///
+    /// SPEC-PROBE-001
+    pub fn index(self) -> i32 {
+        match self {
+            Self::Cinema => 0,
+            Self::Broadcast => 1,
+            Self::Probe => 2,
+        }
+    }
+
+    /// Converte o índice vindo do Slint.
+    ///
+    /// Valor fora da faixa cai em `Broadcast` — a UI é dado externo do ponto
+    /// de vista do backend, e um índice inválido não pode derrubar nada.
+    ///
+    /// SPEC-PROBE-001
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            0 => Self::Cinema,
+            2 => Self::Probe,
+            _ => Self::Broadcast,
+        }
+    }
+
+    /// `true` quando o pipeline A/V (decoder contínuo, `AudioOutput`,
+    /// `VideoQueue`) deve estar instanciado.
+    ///
+    /// SPEC-PROBE-002 — em Probe nenhum device de áudio é aberto e nenhum
+    /// frame é decodificado fora do tick de thumbnail.
+    pub fn wants_av_pipeline(self) -> bool {
+        !matches!(self, Self::Probe)
+    }
+
+    /// `true` quando os painéis laterais de análise devem aparecer.
+    ///
+    /// §3.1 — ocultos em Cinema, substituídos pelos painéis Probe em Probe.
+    pub fn wants_analysis_panels(self) -> bool {
+        matches!(self, Self::Broadcast)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +661,45 @@ impl DeinterlaceProfileChoice {
 mod tests {
     use super::*;
 
+    /// SPEC-PROBE-001 — o default é Broadcast (comportamento atual do player).
+    #[test]
+    fn spec_probe_001_default_mode_is_broadcast() {
+        assert_eq!(AppMode::default(), AppMode::Broadcast);
+        assert_eq!(AppMode::default().index(), 1);
+    }
+
+    /// SPEC-PROBE-001 — índice e enum fazem roundtrip nos três modos.
+    #[test]
+    fn spec_probe_001_mode_index_roundtrips() {
+        for mode in [AppMode::Cinema, AppMode::Broadcast, AppMode::Probe] {
+            assert_eq!(AppMode::from_index(mode.index()), mode);
+        }
+    }
+
+    /// SPEC-PROBE-001 — índice inválido vindo do Slint cai em Broadcast em
+    /// vez de derrubar a UI.
+    #[test]
+    fn spec_probe_001_invalid_index_falls_back_to_broadcast() {
+        assert_eq!(AppMode::from_index(-1), AppMode::Broadcast);
+        assert_eq!(AppMode::from_index(99), AppMode::Broadcast);
+    }
+
+    /// SPEC-PROBE-002 — só o modo Probe desliga o pipeline A/V.
+    #[test]
+    fn spec_probe_002_only_probe_disables_av_pipeline() {
+        assert!(AppMode::Cinema.wants_av_pipeline());
+        assert!(AppMode::Broadcast.wants_av_pipeline());
+        assert!(!AppMode::Probe.wants_av_pipeline());
+    }
+
+    /// §3.1 — painéis de análise só aparecem em Broadcast.
+    #[test]
+    fn spec_probe_001_analysis_panels_only_in_broadcast() {
+        assert!(!AppMode::Cinema.wants_analysis_panels());
+        assert!(AppMode::Broadcast.wants_analysis_panels());
+        assert!(!AppMode::Probe.wants_analysis_panels());
+    }
+
     #[test]
     fn spec_ui_002_app_state_default_is_idle() {
         let state = AppState::default();
@@ -602,6 +762,9 @@ mod tests {
     }
 
     #[test]
+    // Mesma razão do teste equivalente em `context_menu`: montar campo a campo
+    // deixa explícito o que o `Reset` precisa limpar.
+    #[allow(clippy::field_reassign_with_default)]
     fn spec_ui_002_table_reset_clears_stream_state() {
         let mut state = AppState::default();
         state.selected_pid = Some(0x0100);

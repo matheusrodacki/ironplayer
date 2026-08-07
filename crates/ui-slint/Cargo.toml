@@ -8,9 +8,10 @@ name = "ui_slint"
 path = "src/lib.rs"
 
 [dependencies]
-ts  = { path = "../ts" }
-av  = { path = "../av" }
-net = { path = "../net" }
+ts    = { path = "../ts" }
+av    = { path = "../av" }
+net   = { path = "../net" }
+probe = { path = "../probe" }
 
 slint             = { version = "=1.17.0", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg-wgpu", "renderer-femtovg", "unstable-wgpu-29"] }
 crossbeam-channel = { workspace = true }

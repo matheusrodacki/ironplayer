@@ -363,6 +363,9 @@ mod tests {
     }
 
     #[test]
+    // O `AppState` do teste é montado campo a campo de propósito: é mais
+    // legível que um literal com `..Default::default()` no meio de uma PMT.
+    #[allow(clippy::field_reassign_with_default)]
     fn spec_ui_001_video_menu_lists_multiple_streams() {
         use ts::tables::Pmt;
 

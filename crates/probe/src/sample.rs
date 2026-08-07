@@ -1,0 +1,422 @@
+//! Amostra de 1 Hz e derivação de deltas a partir dos contadores acumulados.
+//!
+//! Decisão de projeto do §5.3: o `ProbeEngine` **amostra contadores
+//! acumulados** em vez de fazer tee dos eventos brutos.  `ErrorSnapshot` já
+//! expõe `cc_errors` por PID, `crc_errors` por `(pid, table_id)`,
+//! `sync_losses`, `rtp_out_of_order` e `udp_overflows` de forma cumulativa —
+//! a probe deriva o delta por segundo.  Isso evita duplicar canais e mantém a
+//! regra de "não duplicar métrica existente".
+//!
+//! SPEC-PROBE-005 · SPEC-PROBE-006 · §6.1
+
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+use ts::metrics::{MetricsSnapshot, PidType};
+use ts::Pid;
+
+use crate::severity::Severity;
+
+/// Versão do layout de colunas de `metrics.csv`.
+///
+/// Gravada em `session.toml`; a camada IP (spec-14) anexa colunas à mesma
+/// linha e **incrementa** este número.
+///
+/// §6.1
+pub const CSV_SCHEMA_VERSION: u32 = 1;
+
+/// Cabeçalho de `metrics.csv` — a ordem das colunas é fixa e versionada.
+///
+/// §6.1
+pub const CSV_HEADER: &str = "ts_utc,uptime_s,connected,bitrate_kbps,null_ratio,\
+cc_errors_delta,crc_errors_delta,sync_loss_delta,pcr_jitter_delta,pcr_disc_delta,\
+local_drops_delta,sched_jitter_ms,worst_severity";
+
+/// Contadores brutos que a probe amostra a cada tick.
+///
+/// Separado de [`ProbeSample`] porque é o que a [`CounterBaseline`] guarda
+/// entre ticks: os cumulativos, não os deltas.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RawCounters {
+    pub cc_errors_by_pid: HashMap<Pid, u64>,
+    pub crc_errors: u64,
+    pub sync_losses: u64,
+    pub pcr_jitter_events: u64,
+    pub pcr_discontinuities: u64,
+    pub rtp_out_of_order: u64,
+    pub udp_overflows: u64,
+}
+
+impl RawCounters {
+    /// Extrai os cumulativos de um `MetricsSnapshot`.
+    ///
+    /// §5.3
+    pub fn from_metrics(m: &MetricsSnapshot) -> Self {
+        Self {
+            cc_errors_by_pid: m.errors.cc_errors.clone(),
+            crc_errors: m.errors.crc_errors.values().sum(),
+            sync_losses: m.errors.sync_losses,
+            pcr_jitter_events: m.errors.pcr_jitter_events.len() as u64,
+            pcr_discontinuities: m.errors.pcr_discontinuities.len() as u64,
+            rtp_out_of_order: m.errors.rtp_out_of_order,
+            udp_overflows: m.errors.udp_overflows,
+        }
+    }
+}
+
+/// Deltas de um tick, já classificados por PID onde faz sentido.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CounterDeltas {
+    /// CC errors novos por PID — vira contexto do evento (SPEC-PROBE-008).
+    pub cc_by_pid: HashMap<Pid, u64>,
+    pub cc_total: u64,
+    pub crc: u64,
+    pub sync_loss: u64,
+    pub pcr_jitter: u64,
+    pub pcr_disc: u64,
+    pub rtp_out_of_order: u64,
+    pub udp_overflows: u64,
+}
+
+/// Estado entre ticks para transformar cumulativos em deltas.
+///
+/// Contadores que **diminuem** (reset de sessão, `ResetErrors` da UI,
+/// reconexão) são tratados como reinício: o delta é o novo valor, nunca
+/// negativo.  Sem isso, um `ResetErrors` produziria deltas absurdos ou
+/// underflow.
+///
+/// §5.3 · RNF-PRB-003
+#[derive(Debug, Clone, Default)]
+pub struct CounterBaseline {
+    prev: RawCounters,
+    primed: bool,
+}
+
+impl CounterBaseline {
+    /// Cria uma baseline não inicializada.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Descarta a baseline — o próximo tick vira o novo ponto zero.
+    ///
+    /// Usado ao reconectar (SPEC-PROBE-011): os contadores do pipeline são
+    /// zerados junto com o `Reset`, e a probe não deve reportar isso como
+    /// rajada de erros.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Consome os cumulativos deste tick e devolve os deltas.
+    ///
+    /// O **primeiro** tick após um reset devolve deltas zerados: sem ponto de
+    /// comparação, qualquer valor seria uma leitura inventada.
+    ///
+    /// §5.3
+    pub fn delta(&mut self, now: RawCounters) -> CounterDeltas {
+        if !self.primed {
+            self.prev = now;
+            self.primed = true;
+            return CounterDeltas::default();
+        }
+
+        let mut cc_by_pid = HashMap::new();
+        for (pid, total) in &now.cc_errors_by_pid {
+            let before = self.prev.cc_errors_by_pid.get(pid).copied().unwrap_or(0);
+            let d = total.saturating_sub(before);
+            if d > 0 {
+                cc_by_pid.insert(*pid, d);
+            }
+        }
+
+        let deltas = CounterDeltas {
+            cc_total: cc_by_pid.values().sum(),
+            cc_by_pid,
+            crc: now.crc_errors.saturating_sub(self.prev.crc_errors),
+            sync_loss: now.sync_losses.saturating_sub(self.prev.sync_losses),
+            pcr_jitter: now
+                .pcr_jitter_events
+                .saturating_sub(self.prev.pcr_jitter_events),
+            pcr_disc: now
+                .pcr_discontinuities
+                .saturating_sub(self.prev.pcr_discontinuities),
+            rtp_out_of_order: now
+                .rtp_out_of_order
+                .saturating_sub(self.prev.rtp_out_of_order),
+            udp_overflows: now.udp_overflows.saturating_sub(self.prev.udp_overflows),
+        };
+
+        self.prev = now;
+        deltas
+    }
+}
+
+/// Bitrate agregado dos PIDs de vídeo e de áudio do multiplex.
+///
+/// Alimenta os indicadores `V` e `A` do tile — **presença e bitrate**, nunca
+/// nível de áudio (§8.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AvPresence {
+    pub video_kbps: f64,
+    pub audio_kbps: f64,
+    /// `true` se algum PID do multiplex está com `scrambling_control ≠ 0`.
+    ///
+    /// Preenchido pelo pipeline (badge `SCR` do tile), não por
+    /// [`AvPresence::from_metrics`] — o `MetricsSnapshot` não carrega o campo.
+    pub scrambled: bool,
+    /// Altura do vídeo, quando conhecida — badge `HD`/`SD` do tile.
+    ///
+    /// Preenchido pelo pipeline a partir do Media Info, não por
+    /// [`AvPresence::from_metrics`].
+    pub video_height: Option<u32>,
+}
+
+impl AvPresence {
+    /// Soma os bitrates por classificação de PID do snapshot.
+    ///
+    /// Só serve quando o produtor do snapshot classifica os PIDs; num feed do
+    /// modo Probe o `MetricsAggregator` roda sem `TableDispatcher` e devolve
+    /// `PidType::Unknown` para tudo — use
+    /// [`AvPresence::from_metrics_with_pids`] nesse caso.
+    ///
+    /// SPEC-PROBE-018
+    pub fn from_metrics(m: &MetricsSnapshot) -> Self {
+        let mut out = Self::default();
+        for entry in &m.pid_table {
+            match entry.pid_type {
+                PidType::Video { .. } => out.video_kbps += entry.bitrate_kbps,
+                PidType::Audio { .. } => out.audio_kbps += entry.bitrate_kbps,
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Soma os bitrates usando os PIDs vindos da PMT.
+    ///
+    /// SPEC-PROBE-018 — os conjuntos vazios significam "PMT ainda não
+    /// recebida", **não** "sem vídeo": nesse caso a presença fica indefinida e
+    /// o chamador deve omitir os checks `video_missing`/`audio_missing`, senão
+    /// todo feed abriria um alarme crítico nos primeiros segundos.
+    pub fn from_metrics_with_pids(
+        m: &MetricsSnapshot,
+        video_pids: &[Pid],
+        audio_pids: &[Pid],
+    ) -> Self {
+        let mut out = Self::default();
+        for entry in &m.pid_table {
+            if video_pids.contains(&entry.pid) {
+                out.video_kbps += entry.bitrate_kbps;
+            } else if audio_pids.contains(&entry.pid) {
+                out.audio_kbps += entry.bitrate_kbps;
+            }
+        }
+        out
+    }
+}
+
+/// Uma linha de `metrics.csv`.
+///
+/// SPEC-PROBE-005 · §6.1
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeSample {
+    pub ts_utc: DateTime<Utc>,
+    /// Segundos desde o início da sessão do feed.
+    pub uptime_s: u64,
+    pub connected: bool,
+    pub bitrate_kbps: f64,
+    pub null_ratio: f64,
+    pub cc_errors_delta: u64,
+    pub crc_errors_delta: u64,
+    pub sync_loss_delta: u64,
+    pub pcr_jitter_delta: u64,
+    pub pcr_disc_delta: u64,
+    /// Descartes atribuídos à própria probe neste segundo (SPEC-PROBE-013).
+    pub local_drops_delta: u64,
+    /// Atraso do tick em relação ao agendado, em ms (SPEC-PROBE-013).
+    pub sched_jitter_ms: f64,
+    /// Pior severidade aberta no instante da amostra (SPEC-PROBE-009).
+    pub worst_severity: Option<Severity>,
+}
+
+impl ProbeSample {
+    /// Serializa como uma linha de `metrics.csv`, sem quebra de linha.
+    ///
+    /// Formatação decimal com ponto e casas fixas: o arquivo é aberto no Excel
+    /// (§6.1), e notação científica de `f64` em `to_string` estragaria a coluna.
+    ///
+    /// SPEC-PROBE-006
+    pub fn to_csv(&self) -> String {
+        format!(
+            "{},{},{},{:.1},{:.5},{},{},{},{},{},{},{:.1},{}",
+            self.ts_utc.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+            self.uptime_s,
+            u8::from(self.connected),
+            self.bitrate_kbps,
+            self.null_ratio,
+            self.cc_errors_delta,
+            self.crc_errors_delta,
+            self.sync_loss_delta,
+            self.pcr_jitter_delta,
+            self.pcr_disc_delta,
+            self.local_drops_delta,
+            self.sched_jitter_ms,
+            self.worst_severity.map_or("", Severity::label),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn counters(cc: &[(Pid, u64)], crc: u64, sync: u64) -> RawCounters {
+        RawCounters {
+            cc_errors_by_pid: cc.iter().copied().collect(),
+            crc_errors: crc,
+            sync_losses: sync,
+            ..Default::default()
+        }
+    }
+
+    /// §5.3 — o primeiro tick após o reset não inventa delta.
+    #[test]
+    fn spec_probe_005_first_tick_yields_zero_deltas() {
+        let mut base = CounterBaseline::new();
+        let d = base.delta(counters(&[(100, 42)], 7, 3));
+        assert_eq!(d, CounterDeltas::default());
+    }
+
+    /// §5.3 — deltas por PID são derivados dos cumulativos.
+    #[test]
+    fn spec_probe_005_delta_is_derived_per_pid() {
+        let mut base = CounterBaseline::new();
+        base.delta(counters(&[(100, 10), (200, 5)], 0, 0));
+
+        let d = base.delta(counters(&[(100, 13), (200, 5), (300, 2)], 4, 1));
+        assert_eq!(d.cc_by_pid.get(&100), Some(&3));
+        assert_eq!(
+            d.cc_by_pid.get(&200),
+            None,
+            "PID sem novos erros sai do mapa"
+        );
+        assert_eq!(d.cc_by_pid.get(&300), Some(&2));
+        assert_eq!(d.cc_total, 5);
+        assert_eq!(d.crc, 4);
+        assert_eq!(d.sync_loss, 1);
+    }
+
+    /// RNF-PRB-003 — contador que regride (ResetErrors, reconexão) não faz
+    /// underflow nem produz delta negativo.
+    #[test]
+    fn rnf_prb_003_counter_reset_does_not_underflow() {
+        let mut base = CounterBaseline::new();
+        base.delta(counters(&[(100, 1000)], 500, 9));
+        let d = base.delta(counters(&[(100, 0)], 0, 0));
+        assert_eq!(d.cc_total, 0);
+        assert_eq!(d.crc, 0);
+        assert_eq!(d.sync_loss, 0);
+    }
+
+    /// SPEC-PROBE-011 — `reset()` faz o próximo tick virar o novo ponto zero.
+    #[test]
+    fn spec_probe_011_reset_rebaselines_without_burst() {
+        let mut base = CounterBaseline::new();
+        base.delta(counters(&[(100, 10)], 0, 0));
+        base.reset();
+        // Após a reconexão os contadores voltam do zero; nenhum delta deve
+        // aparecer só por causa disso.
+        let d = base.delta(counters(&[(100, 0)], 0, 0));
+        assert_eq!(d.cc_total, 0);
+        let d = base.delta(counters(&[(100, 2)], 0, 0));
+        assert_eq!(d.cc_total, 2);
+    }
+
+    /// SPEC-PROBE-018 — a presença de A/V sai dos PIDs da PMT, não da
+    /// classificação do aggregator (que num feed de Probe é sempre `Unknown`).
+    #[test]
+    fn spec_probe_018_presence_uses_pmt_pids() {
+        let entry = |pid: Pid, kbps: f64| ts::metrics::PidEntry {
+            pid,
+            pid_type: PidType::Unknown,
+            label: String::new(),
+            bitrate_kbps: kbps,
+            cc_errors: 0,
+            packet_count: 0,
+        };
+        let m = MetricsSnapshot {
+            pid_table: vec![entry(100, 14_000.0), entry(101, 192.0), entry(8191, 800.0)],
+            total_bitrate_kbps: 15_000.0,
+            null_ratio: 0.05,
+            errors: Default::default(),
+            tdt_offset_secs: None,
+            timestamp: std::time::Instant::now(),
+            av_sync_offset_ms: 0,
+            late_frames_dropped: 0,
+            early_frames_held: 0,
+            pts_discontinuities: 0,
+            video_queue_depth: 0,
+            pipeline: Default::default(),
+        };
+
+        // Sem PMT, a classificação por tipo não enxerga nada.
+        assert_eq!(AvPresence::from_metrics(&m).video_kbps, 0.0);
+
+        let p = AvPresence::from_metrics_with_pids(&m, &[100], &[101]);
+        assert!((p.video_kbps - 14_000.0).abs() < 1e-9);
+        assert!((p.audio_kbps - 192.0).abs() < 1e-9);
+    }
+
+    /// §6.1 — a linha CSV tem exatamente as colunas do cabeçalho, na ordem.
+    #[test]
+    fn spec_probe_006_csv_row_matches_header_arity() {
+        let s = ProbeSample {
+            ts_utc: Utc.timestamp_opt(1_700_000_000, 0).single().expect("ts"),
+            uptime_s: 3661,
+            connected: true,
+            bitrate_kbps: 15002.4,
+            null_ratio: 0.03125,
+            cc_errors_delta: 3,
+            crc_errors_delta: 0,
+            sync_loss_delta: 0,
+            pcr_jitter_delta: 1,
+            pcr_disc_delta: 0,
+            local_drops_delta: 0,
+            sched_jitter_ms: 2.4,
+            worst_severity: Some(Severity::Error),
+        };
+
+        let row = s.to_csv();
+        assert_eq!(
+            row.split(',').count(),
+            CSV_HEADER.split(',').count(),
+            "linha e cabeçalho precisam ter a mesma aridade"
+        );
+        assert!(!row.contains('\n'));
+        assert!(row.ends_with(",error"));
+        assert!(row.contains(",15002.4,"), "bitrate sem notação científica");
+        assert!(row.starts_with("2023-11-14T22:13:20.000Z,3661,1,"));
+    }
+
+    /// §6.1 — sem severidade aberta, a coluna fica vazia (não "none").
+    #[test]
+    fn spec_probe_009_empty_severity_column_when_healthy() {
+        let s = ProbeSample {
+            ts_utc: Utc.timestamp_opt(0, 0).single().expect("ts"),
+            uptime_s: 0,
+            connected: false,
+            bitrate_kbps: 0.0,
+            null_ratio: 0.0,
+            cc_errors_delta: 0,
+            crc_errors_delta: 0,
+            sync_loss_delta: 0,
+            pcr_jitter_delta: 0,
+            pcr_disc_delta: 0,
+            local_drops_delta: 0,
+            sched_jitter_ms: 0.0,
+            worst_severity: None,
+        };
+        assert!(s.to_csv().ends_with(",0.0,"));
+    }
+}

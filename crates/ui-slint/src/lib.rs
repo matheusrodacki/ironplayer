@@ -7,25 +7,30 @@
 slint::include_modules!();
 
 mod context_menu;
+mod probe_view;
 mod state;
 mod tree;
-mod video;
+pub mod video;
 
+pub use probe_view::SharedProbe;
 pub use state::{
-    AppCommand, AppState, AspectRatioMode, AudioErrorSnapshot, AudioOperationalState,
-    AudioStatusSnapshot, AudioTrackInfo, ConnectionState, DeinterlaceProfileChoice,
-    HwAccelChoice, PidRecord, TableEvent, TablesSnapshot,
+    AppCommand, AppMode, AppState, AspectRatioMode, AudioErrorSnapshot, AudioOperationalState,
+    AudioStatusSnapshot, AudioTrackInfo, ConnectionState, DeinterlaceProfileChoice, HwAccelChoice,
+    PidRecord, ProbeThumbnail, SharedThumbnails, TableEvent, TablesSnapshot,
 };
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use slint::{Color, ComponentHandle, Image, ModelRc, RenderingState, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use slint::wgpu_29::{wgpu, WGPUConfiguration};
+use slint::{
+    Color, ComponentHandle, Image, ModelRc, RenderingState, Rgba8Pixel, SharedPixelBuffer,
+    SharedString, VecModel,
+};
 
 use av::video_queue::PopResult;
 use av::{Clock, MasterClock, VideoFrame, VideoQueue};
@@ -43,6 +48,8 @@ type SharedVideoPid = Arc<RwLock<Option<u16>>>;
 type SharedPipeline = Arc<RwLock<ts::metrics::PipelineMetrics>>;
 type SharedAudioClock = Arc<RwLock<Option<av::AudioClockHandle>>>;
 type SharedMediaInfo = Arc<RwLock<ts::MediaInfoCodecSnapshot>>;
+/// Dimensões do último frame: `(largura, altura, sar_num, sar_den)`.
+type SharedVideoDims = Rc<Cell<Option<(u32, u32, u32, u32)>>>;
 
 /// Pacote de handles do pipeline necessário para a UI.
 pub struct PipelineHandles {
@@ -58,6 +65,14 @@ pub struct PipelineHandles {
     pub audio_clock_rx: SharedAudioClock,
     pub media_info_rx: SharedMediaInfo,
     pub initial_url: String,
+    /// Estado do modo Probe publicado a 1 Hz (SPEC-PROBE-018).
+    pub probe_rx: SharedProbe,
+    /// Thumbnails por slot (SPEC-PROBE-003).
+    pub probe_thumbnails: SharedThumbnails,
+    /// Modo restaurado de `[ui] mode` (SPEC-PROBE-001).
+    pub initial_mode: AppMode,
+    /// Limite de feeds do mosaico, para desenhar os slots livres (§8.1).
+    pub probe_max_feeds: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,6 +87,9 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
 
     let window = AppWindow::new()?;
     window.set_url(SharedString::from(handles.initial_url.as_str()));
+    // SPEC-PROBE-001 — o modo vem de `[ui] mode` e é restaurado no start.
+    window.set_app_mode(handles.initial_mode.index());
+    window.set_probe_max_feeds(handles.probe_max_feeds as i32);
 
     // Modelos persistentes das listas roláveis (PIDs, Serviços, árvore PSI/SI,
     // Media Info). Trocar `ModelRc` inteira a cada refresh (~4 Hz) força o
@@ -82,7 +100,8 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
     // a posição de rolagem (propriedade do próprio ScrollView) é preservada.
     let pid_rows_model: Rc<VecModel<PidRow>> = Rc::new(VecModel::from(Vec::<PidRow>::new()));
     window.set_pid_rows(ModelRc::from(pid_rows_model.clone()));
-    let services_model: Rc<VecModel<ServiceRow>> = Rc::new(VecModel::from(Vec::<ServiceRow>::new()));
+    let services_model: Rc<VecModel<ServiceRow>> =
+        Rc::new(VecModel::from(Vec::<ServiceRow>::new()));
     window.set_services(ModelRc::from(services_model.clone()));
     let psi_tree_model: Rc<VecModel<TreeRow>> = Rc::new(VecModel::from(Vec::<TreeRow>::new()));
     window.set_psi_tree(ModelRc::from(psi_tree_model.clone()));
@@ -90,6 +109,10 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
     window.set_media_rows(ModelRc::from(media_rows_model.clone()));
 
     let selected_pid: Rc<RefCell<Option<Pid>>> = Rc::new(RefCell::new(None));
+    // Interações na tela Probe (abrir detalhe, clicar numa célula, trocar a
+    // janela) reaplicam os modelos no próximo tick sem esperar o ciclo de
+    // 1 Hz — o mesmo padrão de `force_refresh` da tabela de PIDs.
+    let force_refresh_probe: Rc<Cell<bool>> = Rc::new(Cell::new(true));
 
     // ── Callbacks → comandos ao backend ───────────────────────────────────
     {
@@ -107,6 +130,78 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
             let _ = cmd_tx.try_send(AppCommand::Disconnect);
         });
     }
+    // ── Modo Probe: modelos + callbacks (SPEC-PROBE-001/018/019) ──────────
+    //
+    // `ProbeView` guarda o estado de UI da tela (slot aberto, janela dos
+    // gráficos, célula selecionada, filtro do log). Fica num `RefCell` porque
+    // vários callbacks e o tick do `Poller` precisam mutá-lo, todos na mesma
+    // thread do event loop.
+    let probe_view = Rc::new(RefCell::new(probe_view::ProbeView::new(
+        &window,
+        handles.probe_rx.clone(),
+        handles.probe_thumbnails.clone(),
+        handles.cmd_tx.clone(),
+    )));
+    {
+        let cmd_tx = handles.cmd_tx.clone();
+        let weak = window.as_weak();
+        window.on_set_mode(move |index| {
+            let mode = AppMode::from_index(index);
+            if let Some(win) = weak.upgrade() {
+                win.set_app_mode(mode.index());
+                // Trocar de modo sempre volta ao mosaico: manter um detalhe
+                // aberto ao sair e voltar de Probe deixaria a UI apontando
+                // para um slot que pode nem existir no run novo.
+                win.set_probe_detail_slot(-1);
+            }
+            let _ = cmd_tx.try_send(AppCommand::SetMode { mode });
+        });
+    }
+    {
+        let view = probe_view.clone();
+        window.on_probe_start_run(move || view.borrow().send(AppCommand::StartProbeRun));
+    }
+    {
+        let view = probe_view.clone();
+        window.on_probe_stop_run(move || view.borrow().send(AppCommand::StopProbeRun));
+    }
+    {
+        let view = probe_view.clone();
+        window.on_probe_export_report(move || view.borrow().send(AppCommand::ExportProbeReport));
+    }
+    {
+        let view = probe_view.clone();
+        let force = force_refresh_probe.clone();
+        window.on_probe_open_detail(move |slot| {
+            view.borrow_mut().open_detail(slot);
+            force.set(true);
+        });
+    }
+    {
+        let view = probe_view.clone();
+        let force = force_refresh_probe.clone();
+        window.on_probe_select_cell(move |index| {
+            view.borrow_mut().select_cell(index);
+            force.set(true);
+        });
+    }
+    {
+        let view = probe_view.clone();
+        let force = force_refresh_probe.clone();
+        window.on_probe_select_window(move |index| {
+            view.borrow_mut().select_window(index);
+            force.set(true);
+        });
+    }
+    {
+        let view = probe_view.clone();
+        let force = force_refresh_probe.clone();
+        window.on_probe_cycle_severity(move || {
+            view.borrow_mut().cycle_severity();
+            force.set(true);
+        });
+    }
+
     {
         let cmd_tx = handles.cmd_tx.clone();
         let selected = selected_pid.clone();
@@ -254,7 +349,7 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         handles.video_frames_rx,
         handles.audio_clock_rx,
     )));
-    let video_dims_shared: Rc<Cell<Option<(u32, u32, u32, u32)>>> = Rc::new(Cell::new(None));
+    let video_dims_shared: SharedVideoDims = Rc::new(Cell::new(None));
 
     // Modo GPU: o vídeo é dirigido pelo PRÓPRIO ciclo de render do Slint
     // (render-loop contínuo alinhado ao vsync), não pelo timer da UI.
@@ -337,6 +432,8 @@ pub fn run(handles: PipelineHandles) -> Result<(), slint::PlatformError> {
         video_dims_shared,
         render,
         gpu_bridge,
+        probe_view,
+        force_refresh_probe,
     };
 
     // Preenche já no primeiro tick.
@@ -446,18 +543,19 @@ fn setup_wgpu_backend() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
     // caminho zero-copy de hardware (Fase 2). Sem suporte, o flag fica desligado
     // e o decoder usa planos CPU.
     let nv12 = adapter.features() & wgpu::Features::TEXTURE_FORMAT_NV12;
-    let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("ironplayer-video"),
-        required_features: nv12,
-        required_limits: adapter.limits(),
-        ..Default::default()
-    })) {
-        Ok(dq) => dq,
-        Err(e) => {
-            tracing::warn!(error = %e, "wgpu: request_device falhou; fallback CPU");
-            return None;
-        }
-    };
+    let (device, queue) =
+        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("ironplayer-video"),
+            required_features: nv12,
+            required_limits: adapter.limits(),
+            ..Default::default()
+        })) {
+            Ok(dq) => dq,
+            Err(e) => {
+                tracing::warn!(error = %e, "wgpu: request_device falhou; fallback CPU");
+                return None;
+            }
+        };
 
     let device_for_renderer = device.clone();
     let queue_for_renderer = queue.clone();
@@ -472,10 +570,7 @@ fn setup_wgpu_backend() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
     {
         Ok(()) => {
             tracing::info!("slint: backend wgpu ativo (render zero-copy)");
-            Some((
-                Arc::new(device_for_renderer),
-                Arc::new(queue_for_renderer),
-            ))
+            Some((Arc::new(device_for_renderer), Arc::new(queue_for_renderer)))
         }
         Err(e) => {
             tracing::warn!(error = %e, "slint: require_wgpu_29 falhou; fallback CPU/GL");
@@ -553,11 +648,14 @@ struct Poller {
     video: Rc<RefCell<VideoState>>,
     /// Dims do último frame `(w, h, sar_num, sar_den)` gravadas pelo caminho
     /// ativo (notifier GPU ou poll CPU) e consumidas no tick.
-    video_dims_shared: Rc<Cell<Option<(u32, u32, u32, u32)>>>,
+    video_dims_shared: SharedVideoDims,
     /// Estratégia de exibição (GPU zero-copy ou CPU via worker).
     render: RenderMode,
     /// Ponte GPU (cache de texturas compartilhadas); `None` no modo CPU.
     gpu_bridge: Option<Arc<GpuVideoBridge>>,
+    /// Estado e modelos da tela Probe (SPEC-PROBE-018/019).
+    probe_view: Rc<RefCell<probe_view::ProbeView>>,
+    force_refresh_probe: Rc<Cell<bool>>,
 }
 
 impl Poller {
@@ -600,7 +698,7 @@ impl Poller {
         // Métricas/tabelas a ~4 Hz (snapshots chegam a 1 Hz); interações de UI
         // (ordenação, filtro, expandir nó) forçam a reaplicação imediata.
         let forced = self.force_refresh.replace(false);
-        let refresh_meta = forced || self.tick % 15 == 0;
+        let refresh_meta = forced || self.tick.is_multiple_of(15);
         self.poll_table_events(win);
         self.poll_snapshot();
 
@@ -621,6 +719,15 @@ impl Poller {
         }
         // Sempre atualiza timecode e status leves (baratos).
         self.apply_live(win);
+
+        // Tela Probe: repintura a ≤ 1 Hz (§8.2), ou imediata após uma
+        // interação. Fora do modo Probe nem vale o custo de clonar o snapshot.
+        let probe_forced = self.force_refresh_probe.replace(false);
+        if win.get_app_mode() == AppMode::Probe.index()
+            && (probe_forced || self.tick.is_multiple_of(60))
+        {
+            self.probe_view.borrow_mut().refresh(win);
+        }
     }
 
     fn poll_table_events(&mut self, win: &AppWindow) {
@@ -1228,7 +1335,11 @@ fn video_res_caption(st: &AppState) -> (String, String) {
     let mbps = format!("{:.1} Mbps", e.bitrate_kbps / 1000.0);
     let parts: Vec<String> = [
         codec,
-        if res != "—" { res.clone() } else { String::new() },
+        if res != "—" {
+            res.clone()
+        } else {
+            String::new()
+        },
         fps,
         mbps,
     ]
@@ -1288,7 +1399,7 @@ fn build_media_rows(st: &AppState) -> Vec<MediaRow> {
 // ---------------------------------------------------------------------------
 
 /// Gera comandos de linha "M x y L x y …" a partir de pontos (x,y) em 0..100.
-fn line_path(points: &[(f32, f32)]) -> String {
+pub(crate) fn line_path(points: &[(f32, f32)]) -> String {
     if points.is_empty() {
         return String::new();
     }
@@ -1351,10 +1462,7 @@ fn build_bitrate_chart(st: &AppState) -> (String, String, String, String) {
 
 fn build_jitter_chart(st: &AppState) -> (String, String, String) {
     // PID com mais registros de jitter (PCR principal).
-    let hist = st
-        .pcr_history
-        .values()
-        .max_by_key(|h| h.len());
+    let hist = st.pcr_history.values().max_by_key(|h| h.len());
     let Some(hist) = hist else {
         return ("±0".into(), String::new(), String::new());
     };
@@ -1481,7 +1589,10 @@ fn build_pipeline_info(st: &AppState) -> (Vec<InfoRow>, Vec<InfoRow>, Vec<InfoRo
 
     rows.push(info(
         "GPU upload",
-        format!("{:.1} MB/s", p.gpu_upload_bytes_per_sec as f64 / 1_000_000.0),
+        format!(
+            "{:.1} MB/s",
+            p.gpu_upload_bytes_per_sec as f64 / 1_000_000.0
+        ),
         false,
     ));
     rows.push(info(
@@ -1589,7 +1700,7 @@ fn update_metric_histories_if_new_snapshot(
         state
             .pcr_history
             .entry(record.pid)
-            .or_insert_with(VecDeque::new)
+            .or_default()
             .push_back(record.clone());
     }
     *seen_jitter = jitter_events.len();

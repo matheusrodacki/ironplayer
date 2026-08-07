@@ -10,6 +10,7 @@ use av::{AudioFrame, PesPacket, VideoFrame};
 use bytes::Bytes;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use net::NetEvent;
+use std::sync::Arc;
 use ts::{CompleteSection, PcrEvent, PesData, SectionData, TsEvent};
 use ui_slint::TableEvent;
 
@@ -64,12 +65,28 @@ pub struct AppCommand;
 /// Dropa o item e emite `tracing::warn!` quando o canal estiver 100% cheio.
 pub struct BoundedSender<T> {
     inner: Sender<T>,
-    name: &'static str,
+    /// `Arc<str>` em vez de `&'static str` porque os canais por feed carregam
+    /// sufixo de slot (`ts_raw-1`) — sem isso, dois feeds saturando ficariam
+    /// indistinguíveis no log (SPEC-PROBE-017, §5.2).
+    name: Arc<str>,
 }
 
 impl<T> BoundedSender<T> {
     pub(crate) fn new(inner: Sender<T>, name: &'static str) -> Self {
-        Self { inner, name }
+        Self {
+            inner,
+            name: Arc::from(name),
+        }
+    }
+
+    /// Variante com nome construído em runtime (canais por slot).
+    ///
+    /// SPEC-PROBE-017
+    pub(crate) fn new_named(inner: Sender<T>, name: String) -> Self {
+        Self {
+            inner,
+            name: Arc::from(name.as_str()),
+        }
     }
 
     /// Retorna a capacidade máxima do canal.
@@ -172,7 +189,7 @@ impl<T> Clone for BoundedSender<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            name: self.name,
+            name: Arc::clone(&self.name),
         }
     }
 }

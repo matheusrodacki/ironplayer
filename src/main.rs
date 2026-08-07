@@ -1,6 +1,8 @@
 mod channels;
 mod config;
+mod feed;
 mod ffmpeg_check;
+mod probe_run;
 mod table_dispatcher;
 
 use bytes::Bytes;
@@ -10,6 +12,7 @@ use net::{
     ReceiverConfig, RtpStripper, StopHandle as NetStopHandle, StopToken as NetStopToken, StreamUrl,
     UdpReceiver,
 };
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use table_dispatcher::{DecodeCommand, DemuxCommand, PesCommand, TableCommand, TableDispatcher};
@@ -141,7 +144,7 @@ impl PipelineGuard {
 ///
 /// Spawna uma thread auxiliar para nao bloquear o deadline total.
 /// Emite `WARN` se o deadline expirar antes da thread encerrar.
-fn join_with_deadline(handle: std::thread::JoinHandle<()>, deadline: Instant) {
+pub(crate) fn join_with_deadline(handle: std::thread::JoinHandle<()>, deadline: Instant) {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         tracing::warn!(
@@ -290,6 +293,14 @@ fn bootstrap_d3d11_device(
     }
 }
 
+/// `true` quando o modo corrente quer o pipeline A/V instanciado.
+///
+/// SPEC-PROBE-002 — em modo Probe não há decoder contínuo, `AudioOutput` nem
+/// `VideoQueue`; as threads existem, mas drenam e descartam sem alocar nada.
+fn av_enabled(mode: &Arc<AtomicU8>) -> bool {
+    ui_slint::AppMode::from_index(mode.load(Ordering::Relaxed) as i32).wants_av_pipeline()
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
@@ -343,7 +354,23 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    tracing::info!(hwaccel = cfg.player.hwaccel.label(), "IronPlayer iniciado");
+    let initial_mode: ui_slint::AppMode = cfg.ui.mode.into();
+    tracing::info!(
+        hwaccel = cfg.player.hwaccel.label(),
+        mode = initial_mode.label(),
+        "IronPlayer iniciado"
+    );
+
+    // SPEC-PROBE-002 — modo corrente compartilhado com as threads de A/V.
+    // Um átomo (e não um `RwLock`) porque é lido a cada pacote decodificado:
+    // o custo precisa ser zero no caminho quente do player.
+    let app_mode = Arc::new(AtomicU8::new(initial_mode.index() as u8));
+
+    // Estado do modo Probe publicado para a UI (SPEC-PROBE-018).
+    let probe_snapshot: probe_run::SharedProbeSnapshot =
+        Arc::new(std::sync::RwLock::new(probe::ProbeSnapshot::default()));
+    let probe_thumbnails: ui_slint::SharedThumbnails =
+        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
 
     // 4. Cria todos os canais bounded do pipeline
     let ch = channels::AppChannels::create();
@@ -366,8 +393,9 @@ fn main() -> anyhow::Result<()> {
     // Estado de conexão compartilhado entre cmd-handler e IronPlayerApp
     let conn_state: Arc<std::sync::RwLock<ui_slint::ConnectionState>> =
         Arc::new(std::sync::RwLock::new(ui_slint::ConnectionState::Idle));
-    let audio_status: Arc<std::sync::RwLock<ui_slint::AudioStatusSnapshot>> =
-        Arc::new(std::sync::RwLock::new(ui_slint::AudioStatusSnapshot::default()));
+    let audio_status: Arc<std::sync::RwLock<ui_slint::AudioStatusSnapshot>> = Arc::new(
+        std::sync::RwLock::new(ui_slint::AudioStatusSnapshot::default()),
+    );
     if let Ok(mut status) = audio_status.write() {
         status.set_volume(cfg.player.volume);
     }
@@ -715,6 +743,7 @@ fn main() -> anyhow::Result<()> {
         let pipeline_metrics_decode = std::sync::Arc::clone(&pipeline_metrics_shared);
         let d3d11_device_for_decode = d3d11_device_arc.clone();
         let initial_hwaccel_choice = cfg.player.hwaccel;
+        let app_mode_decode = Arc::clone(&app_mode);
         handles.push(
             std::thread::Builder::new()
                 .name("av-decode".into())
@@ -758,6 +787,10 @@ fn main() -> anyhow::Result<()> {
                     > = std::collections::HashMap::new();
                     const TIMING_WINDOW: usize = 100;
                     let mut pipeline_update_timer = std::time::Instant::now();
+                    // SPEC-PROBE-002 — ao entrar em Probe o decoder é resetado
+                    // uma vez (libera contextos e frame pools) e a partir daí
+                    // nenhum PES é decodificado.
+                    let mut av_was_enabled = true;
 
                     loop {
                         // Drena comandos de controle (ex.: Reset ao trocar serviço).
@@ -821,7 +854,26 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
 
+                        let av_on = av_enabled(&app_mode_decode);
+                        if av_was_enabled != av_on {
+                            decoder.reset();
+                            decode_times.clear();
+                            tracing::info!(
+                                av_pipeline = av_on,
+                                "av-decode: pipeline A/V {} pela troca de modo",
+                                if av_on { "reativado" } else { "desativado" }
+                            );
+                            av_was_enabled = av_on;
+                        }
+
                         match pes_packets_rx.recv_timeout(Duration::from_millis(20)) {
+                            Ok(packet) if !av_on => {
+                                // Modo Probe: drena sem decodificar. O canal
+                                // precisa continuar sendo esvaziado, senão o
+                                // backpressure sobe até o demuxer.
+                                drop(packet);
+                                continue;
+                            }
                             Ok(packet) => {
                                 let is_video = matches!(packet.codec, av::MediaCodec::Video(_));
                                 let pid = packet.pid;
@@ -959,6 +1011,7 @@ fn main() -> anyhow::Result<()> {
         let audio_status = audio_status.clone();
         let audio_clock_tx = audio_clock_for_audio_out;
         let selected_audio_pid_rx = selected_audio_pid.clone();
+        let app_mode_audio = Arc::clone(&app_mode);
         handles.push(
             std::thread::Builder::new()
                 .name("audio-out".into())
@@ -982,6 +1035,31 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     tracing::info!("audio-out: estado resetado e fila drenada");
                                 }
+                            }
+                        }
+
+                        // SPEC-PROBE-002 — em Probe nenhum device de áudio
+                        // fica aberto: soltar o `AudioOutput` fecha o stream
+                        // WASAPI, o que é verificável no Gerenciador de Som.
+                        if !av_enabled(&app_mode_audio) {
+                            if audio_out.is_some() {
+                                audio_out = None;
+                                active_audio_pid = None;
+                                clock_published = false;
+                                if let Ok(mut guard) = audio_clock_tx.write() {
+                                    *guard = None;
+                                }
+                                if let Ok(mut status) = audio_status.write() {
+                                    status.reset_stream_runtime(
+                                        ui_slint::AudioOperationalState::Idle,
+                                    );
+                                }
+                                tracing::info!("audio-out: device liberado (modo Probe)");
+                            }
+                            match audio_frames_rx.recv_timeout(Duration::from_millis(50)) {
+                                Ok(_) => continue,
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                             }
                         }
 
@@ -1146,7 +1224,8 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(threads = handles.len() + 1, "pipeline de backend iniciado");
 
     // 13. Canal de comandos UI → pipeline
-    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<ui_slint::AppCommand>(channels::CAP_APP_COMMANDS);
+    let (cmd_tx, cmd_rx) =
+        crossbeam_channel::bounded::<ui_slint::AppCommand>(channels::CAP_APP_COMMANDS);
 
     // 14. Thread: cmd-handler — processa Connect/Disconnect da UI dinamicamente
     {
@@ -1168,12 +1247,85 @@ fn main() -> anyhow::Result<()> {
             buf_size: cfg.network.udp_buffer_bytes,
             timeout_ms: cfg.network.timeout_ms,
         };
+        let app_mode_cmd = Arc::clone(&app_mode);
+        let probe_cfg = cfg.probe.clone();
+        let probe_snapshot_cmd = probe_snapshot.clone();
+        let probe_thumbnails_cmd = probe_thumbnails.clone();
+        let receiver_cfg_probe = receiver_cfg.clone();
+        let initial_mode_cmd = initial_mode;
 
         let handle = std::thread::Builder::new()
             .name("cmd-handler".into())
             .spawn(move || {
-                for cmd in cmd_rx.iter() {
+                // O supervisor do run vive nesta thread: é ela quem recebe os
+                // comandos da UI e quem publica o snapshot a 1 Hz (§5.5).
+                let mut runner = probe_run::ProbeRunner::new(
+                    probe_cfg,
+                    receiver_cfg_probe,
+                    probe_snapshot_cmd,
+                    probe_thumbnails_cmd,
+                );
+                // Restaurar o modo Probe do TOML abre o run sozinho: é o que
+                // permite deixar o notebook plugado e sair (SPEC-PROBE-001).
+                if initial_mode_cmd == ui_slint::AppMode::Probe {
+                    if let Err(e) = runner.start() {
+                        tracing::warn!(error = %e, "probe: run inicial não pôde ser aberto");
+                    }
+                }
+
+                loop {
+                    let cmd = match cmd_rx.recv_timeout(Duration::from_millis(500)) {
+                        Ok(cmd) => {
+                            runner.publish();
+                            cmd
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            runner.publish();
+                            continue;
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    };
                     match cmd {
+                        ui_slint::AppCommand::SetMode { mode } => {
+                            app_mode_cmd.store(mode.index() as u8, Ordering::Relaxed);
+                            config::AppConfig::persist_ui_mode(mode.into());
+
+                            // §5.5 — `ResetVideo`, nunca `Reset`: a troca de
+                            // modo não pode zerar PAT/PMT/SDT nem o menu de
+                            // contexto (L-010 do STATE.md).
+                            if !table_events_tx_cmd.try_send(ui_slint::TableEvent::ResetVideo) {
+                                tracing::warn!("cmd-handler: canal table-events cheio; ResetVideo descartado");
+                            }
+                            let _ = audio_cmd_tx.try_send(AudioCommand::Reset);
+                            let _ = decode_cmd_tx.try_send(DecodeCommand::Reset);
+
+                            match mode {
+                                ui_slint::AppMode::Probe => {
+                                    if let Err(e) = runner.start() {
+                                        tracing::warn!(error = %e, "probe: falha ao abrir o run");
+                                    }
+                                }
+                                _ => runner.stop(),
+                            }
+                            tracing::info!(mode = mode.label(), "modo alterado");
+                        }
+                        ui_slint::AppCommand::StartProbeRun => {
+                            if runner.is_running() {
+                                tracing::debug!("probe: run já está aberto");
+                            } else if let Err(e) = runner.start() {
+                                tracing::warn!(error = %e, "probe: falha ao abrir o run");
+                            }
+                        }
+                        ui_slint::AppCommand::StopProbeRun => runner.stop(),
+                        ui_slint::AppCommand::ExportProbeReport => {
+                            match runner.export_report() {
+                                Ok(path) => tracing::info!(path = %path.display(), "probe: relatório pronto"),
+                                Err(e) => tracing::warn!(error = %e, "probe: relatório não gerado"),
+                            }
+                        }
+                        ui_slint::AppCommand::SetProbeWindow { index } => {
+                            runner.set_window(index);
+                        }
                         ui_slint::AppCommand::Connect { url, iface: _ } => {
                             // Para conexão anterior, se existir
                             if let Some(h) = current_net_stop.lock().unwrap().take() {
@@ -1400,6 +1552,8 @@ fn main() -> anyhow::Result<()> {
     // precisa do D3d11Device nem da validação de adapter wgpu (Fase A).
     drop(d3d11_device_arc);
 
+    let probe_max_feeds_ui = cfg.probe.max_feeds.clamp(1, feed::MAX_FEEDS);
+
     // 16. Loop de UI via Slint
     let mut guard = PipelineGuard {
         pipeline_handles: handles.into_iter().map(Some).collect(),
@@ -1422,6 +1576,10 @@ fn main() -> anyhow::Result<()> {
         audio_clock_rx: audio_clock_for_ui,
         media_info_rx: media_info_ui,
         initial_url: "udp://@239.0.0.1:1234".to_string(),
+        probe_rx: probe_snapshot,
+        probe_thumbnails,
+        initial_mode,
+        probe_max_feeds: probe_max_feeds_ui,
     });
 
     // Janela fechada: encerra o pipeline em cascata antes de sair.

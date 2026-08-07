@@ -17,6 +17,33 @@
 | 2026-05-19 | D-007 | MSRV Rust 1.78 (stable)                                   | Suporte a `impl Trait` em posições variadas; disponível no CI               |
 | 2026-06-24 | D-008 | `AudioClockHandle::anchor_pts` imutável na UI; skew de mux absorvido pela `VideoQueue` (cap=64) | `shift_anchor` na UI adiantava vídeo ~1–2 s vs áudio audível; cf. L-002 |
 | 2026-06-26 | D-009 | UI Broadcast migrada de egui para **Slint 1.17** (femtovg); `crates/ui` removida, nova `crates/ui-slint`; vídeo via conversão CPU YUV→RGBA em thread worker (sem device wgpu compartilhado) | POC de reestilização (spec-11-slint). femtovg escolhido por compatibilidade com `+crt-static` (Skia/`skia-bindings` conflita). `av` mantém egui interno. Decoder já entrega planos na CPU → não precisa de zero-copy para um 1º corte. cf. L-006 |
+| 2026-08-06 | D-010 | Modo Probe: **checks TS de camada base entram no spec-13**, não só no spec-15 | O critério de aceite do SPEC-PROBE-008 é literalmente "1000 CC errors ⇒ 1 evento com count = 1000". Sem os checks de CC/CRC/sync/PCR no perfil embutido, a spec-13 não teria como ser aceita. O spec-15 continua sendo a **promoção completa** (contexto por serviço, PSI, tabelas) |
+| 2026-08-06 | D-011 | Em Probe o pipeline A/V é **gated por átomo**, não desmontado | §5.5 exige que a recepção do slot 0 nunca reinicie na troca de modo. As threads `av-decode`/`audio-out` continuam vivas mas drenam sem alocar; `AudioOutput` é solto, então nenhum device fica aberto (SPEC-PROBE-002). Desmontar e remontar o wiring a cada troca de modo seria muito mais arriscado |
+| 2026-08-06 | D-012 | `FeedPipeline` cobre **rede + TS**, não A/V | O modo Probe não decodifica; replicar o ramo A/V por slot seria custo sem uso. Cinema/Broadcast seguem com o pipeline único do `main.rs` no slot 0 — zero regressão de player (RNF-PRB-006) |
+| 2026-08-06 | D-013 | Presença de A/V no tile sai dos **PIDs da PMT**, não do `PidType` do aggregator | Num feed de Probe o `MetricsAggregator` roda sem `TableDispatcher` e classifica tudo como `Unknown`; usar isso faria `video_missing` abrir alarme crítico em todo feed. `feed-tables-{slot}` parseia PAT/PMT e publica os PIDs |
+
+---
+
+## Estado do modo Probe (spec-13, 2026-08-06)
+
+Implementado: SPEC-PROBE-001 a 020, incluindo checks da camada base, sessão em
+disco, linha do tempo, mosaico/detalhe, snapshot de vídeo, reconexão,
+anti-suspensão, retenção e relatório HTML.
+
+**Lacunas conhecidas, todas ligadas ao spec-14 (camada IP):**
+
+| Lacuna | Efeito hoje | Fecha em |
+| ------ | ----------- | -------- |
+| Portas de FEC `base+2`/`base+4` não são abertas (`net-fec-{slot}` não existe) | `Encapsulation::RtpFec` nunca é atingido; um feed com FEC exibe o badge `RTP` | spec-14 |
+| Sem PDV/inter-arrival/jitter de IP | `MetricId` não tem as séries de IP; o gráfico "PDV / inter-arrival" do §8.2 não aparece | spec-14 |
+| `metrics.csv` tem só as colunas da camada base (`csv_schema_version = 1`) | As colunas de IP do spec-14 §6 ainda não são anexadas | spec-14 |
+| `udp_overflows` nunca incrementa | `net::NetEvent` ainda não reporta overflow de buffer; o descarte local cobre canal cheio, não socket | crate `net` |
+
+**Débito de lint pré-existente** (fora dos arquivos do spec-13, não tocado):
+`crates/ts/tests/gen_fixtures.rs`, `src/table_dispatcher.rs` e
+`src/ffmpeg_check.rs` ainda quebram `cargo clippy --workspace -- -D warnings`.
+Os testes de loopback multicast de `net` e o teste de DLL do `av` falham nesta
+máquina por ambiente, também na baseline.
 
 ---
 

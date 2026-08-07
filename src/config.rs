@@ -221,6 +221,45 @@ impl Default for DecoderConfig {
     }
 }
 
+/// Modo de operação persistido em `[ui] mode`.
+///
+/// Espelha [`ui_slint::AppMode`]; existe separado porque `ui-slint` não
+/// depende de `serde`/`toml` e a direção de dependência é
+/// `ui-slint → ts, av, net`, nunca o binário.
+///
+/// SPEC-PROBE-001
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppModeChoice {
+    /// Vídeo em tela cheia, painéis ocultos.
+    Cinema,
+    /// Player + painéis de análise.
+    #[default]
+    Broadcast,
+    /// Monitoração contínua sem reprodução.
+    Probe,
+}
+
+impl From<ui_slint::AppMode> for AppModeChoice {
+    fn from(value: ui_slint::AppMode) -> Self {
+        match value {
+            ui_slint::AppMode::Cinema => Self::Cinema,
+            ui_slint::AppMode::Broadcast => Self::Broadcast,
+            ui_slint::AppMode::Probe => Self::Probe,
+        }
+    }
+}
+
+impl From<AppModeChoice> for ui_slint::AppMode {
+    fn from(value: AppModeChoice) -> Self {
+        match value {
+            AppModeChoice::Cinema => Self::Cinema,
+            AppModeChoice::Broadcast => Self::Broadcast,
+            AppModeChoice::Probe => Self::Probe,
+        }
+    }
+}
+
 /// Configurações de interface gráfica.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -231,6 +270,10 @@ pub struct UiConfig {
     pub window_width: u32,
     /// Altura inicial da janela em pixels. Padrão: 900.
     pub window_height: u32,
+    /// Modo ativo na última execução, restaurado no start.
+    ///
+    /// SPEC-PROBE-001
+    pub mode: AppModeChoice,
 }
 
 impl Default for UiConfig {
@@ -239,6 +282,7 @@ impl Default for UiConfig {
             dark_theme: true,
             window_width: 1400,
             window_height: 900,
+            mode: AppModeChoice::Broadcast,
         }
     }
 }
@@ -257,6 +301,11 @@ pub struct AppConfig {
     pub analyzer: AnalyzerConfig,
     pub ui: UiConfig,
     pub decoder: DecoderConfig,
+    /// Seção `[probe]` — SPEC-PROBE-015.
+    ///
+    /// Aditiva: um arquivo sem a seção mantém o comportamento atual de feed
+    /// único vindo da barra de URL (§9).
+    pub probe: probe::ProbeConfig,
 }
 
 impl AppConfig {
@@ -304,6 +353,53 @@ impl AppConfig {
                     AppConfig::default()
                 }
             },
+        }
+    }
+
+    /// Persiste o modo ativo em `[ui] mode`.
+    ///
+    /// Edita **cirurgicamente** o arquivo em vez de reserializar o
+    /// `AppConfig` inteiro: o `ironstream.toml` é editado à mão pelo operador
+    /// (limiares de check, lista de feeds) e reescrevê-lo a cada clique no
+    /// seletor apagaria comentários e ordem das seções.
+    ///
+    /// Falha de I/O é logada e ignorada — não perder o modo salvo é
+    /// desejável, mas não ao ponto de derrubar a troca de modo.
+    ///
+    /// SPEC-PROBE-001
+    pub fn persist_ui_mode(mode: AppModeChoice) {
+        let path = config_path();
+        Self::persist_ui_mode_at(&path, mode);
+    }
+
+    pub(crate) fn persist_ui_mode_at(path: &PathBuf, mode: AppModeChoice) {
+        let label = match mode {
+            AppModeChoice::Cinema => "cinema",
+            AppModeChoice::Broadcast => "broadcast",
+            AppModeChoice::Probe => "probe",
+        };
+
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let mut doc = match text.parse::<toml_edit::DocumentMut>() {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "ironstream.toml inválido; modo não persistido"
+                );
+                return;
+            }
+        };
+
+        doc["ui"]["mode"] = toml_edit::value(label);
+
+        if let Err(e) = std::fs::write(path, doc.to_string()) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "não foi possível persistir [ui] mode"
+            );
         }
     }
 
@@ -497,13 +593,19 @@ window_height = 1080
         assert_eq!(cfg.ui.window_height, 900);
     }
 
-    /// SPEC-CFG-001 — bloco [decoder] padrão: conservador (flags desabilitadas)
+    /// SPEC-CFG-001 — defaults do bloco [decoder].
+    ///
+    /// `skip_loop_filter` é `true` por decisão explícita (ver o comentário em
+    /// `DecoderConfig::default`): para monitoramento broadcast, pular o
+    /// deblocking em frames não-referência economiza ~15–25 % de CPU em HEVC.
+    /// A asserção anterior ainda cobrava o valor antigo e deixava a suíte
+    /// vermelha.
     #[test]
     fn spec_cfg_001_decoder_defaults_conservative() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.decoder.thread_count, 0);
         assert_eq!(cfg.decoder.thread_type, DecoderThreadType::Auto);
-        assert!(!cfg.decoder.skip_loop_filter);
+        assert!(cfg.decoder.skip_loop_filter);
         assert!(!cfg.decoder.flag2_fast);
     }
 
@@ -535,6 +637,127 @@ timeout_ms = 5000
         let (_dir, path) = temp_toml(toml_str);
         let cfg = AppConfig::load_from_path_or_default(&path);
         assert_eq!(cfg.decoder, DecoderConfig::default());
+    }
+
+    // ── AppMode / [probe] (SPEC-PROBE-001 · SPEC-PROBE-015) ────────────────
+
+    /// SPEC-PROBE-001 — o modo default é Broadcast (sem regressão de player).
+    #[test]
+    fn spec_probe_001_default_mode_is_broadcast() {
+        assert_eq!(AppConfig::default().ui.mode, AppModeChoice::Broadcast);
+    }
+
+    /// SPEC-PROBE-001 — `[ui] mode` é lido do TOML e convertido para a UI.
+    #[test]
+    fn spec_probe_001_mode_is_read_from_toml() {
+        let (_dir, path) = temp_toml("[ui]\nmode = \"probe\"\n");
+        let cfg = AppConfig::load_from_path_or_default(&path);
+        assert_eq!(cfg.ui.mode, AppModeChoice::Probe);
+        assert_eq!(
+            ui_slint::AppMode::from(cfg.ui.mode),
+            ui_slint::AppMode::Probe
+        );
+    }
+
+    /// SPEC-PROBE-001 — o modo persiste e é restaurado na execução seguinte.
+    #[test]
+    fn spec_probe_001_mode_persists_and_is_restored() {
+        let (_dir, path) = temp_absent();
+        let _ = AppConfig::load_from_path_or_default(&path);
+
+        AppConfig::persist_ui_mode_at(&path, AppModeChoice::Probe);
+        let cfg = AppConfig::load_from_path_or_default(&path);
+        assert_eq!(cfg.ui.mode, AppModeChoice::Probe);
+
+        AppConfig::persist_ui_mode_at(&path, AppModeChoice::Cinema);
+        let cfg = AppConfig::load_from_path_or_default(&path);
+        assert_eq!(cfg.ui.mode, AppModeChoice::Cinema);
+    }
+
+    /// SPEC-PROBE-001 — persistir o modo não destrói comentários nem outras
+    /// seções editadas à mão pelo operador.
+    #[test]
+    fn spec_probe_001_persisting_mode_preserves_handwritten_toml() {
+        let toml_str = r#"
+# limiares combinados com a operação
+[network]
+timeout_ms = 7000  # comentário do operador
+
+[[probe.feeds]]
+name = "0084_CANAL_A"
+url  = "rtp://@239.15.0.183:50000"
+"#;
+        let (_dir, path) = temp_toml(toml_str);
+        AppConfig::persist_ui_mode_at(&path, AppModeChoice::Probe);
+
+        let text = std::fs::read_to_string(&path).expect("relê");
+        assert!(text.contains("# limiares combinados com a operação"));
+        assert!(text.contains("# comentário do operador"));
+        assert!(text.contains("0084_CANAL_A"));
+        assert!(text.contains("mode = \"probe\""));
+
+        let cfg = AppConfig::load_from_path_or_default(&path);
+        assert_eq!(cfg.ui.mode, AppModeChoice::Probe);
+        assert_eq!(cfg.network.timeout_ms, 7_000);
+        assert_eq!(cfg.probe.feeds.len(), 1);
+    }
+
+    /// SPEC-PROBE-015 — a seção `[probe]` é aditiva: ausente ⇒ defaults, e um
+    /// arquivo sem ela mantém o comportamento de feed único.
+    #[test]
+    fn spec_probe_015_probe_section_is_additive() {
+        let (_dir, path) = temp_toml("[network]\ntimeout_ms = 5000\n");
+        let cfg = AppConfig::load_from_path_or_default(&path);
+        assert_eq!(cfg.probe, probe::ProbeConfig::default());
+        assert!(cfg.probe.effective_feeds().is_empty());
+    }
+
+    /// SPEC-PROBE-015 — `[[probe.feeds]]` e `[probe.checks.*]` desserializam.
+    #[test]
+    fn spec_probe_015_feeds_and_check_overrides_parse() {
+        let toml_str = r#"
+[probe]
+profile_version = 3
+snapshot_interval_secs = 7
+
+[[probe.feeds]]
+name = "0084_CANAL_A"
+url  = "rtp://@239.15.0.183:50000"
+fec  = "auto"
+
+[[probe.feeds]]
+name = "0116_CANAL_B"
+url  = "udp://@239.15.0.190:50000"
+fec  = "off"
+
+[probe.checks.cc_error]
+threshold = 5.0
+"#;
+        let (_dir, path) = temp_toml(toml_str);
+        let cfg = AppConfig::load_from_path_or_default(&path);
+
+        assert_eq!(cfg.probe.profile_version, 3);
+        assert_eq!(cfg.probe.snapshot_interval_secs, 7);
+        let feeds = cfg.probe.effective_feeds();
+        assert_eq!(feeds.len(), 2);
+        assert_eq!(feeds[0].name, "0084_CANAL_A");
+        assert_eq!(feeds[1].fec, probe::FecMode::Off);
+        assert_eq!(
+            cfg.probe.checks.get("cc_error").and_then(|o| o.threshold),
+            Some(5.0)
+        );
+    }
+
+    /// SPEC-PROBE-015 — arquivo ausente gera a seção `[probe]` com defaults.
+    #[test]
+    fn spec_probe_015_absent_file_generates_probe_section() {
+        let (_dir, path) = temp_absent();
+        let _ = AppConfig::load_from_path_or_default(&path);
+        let text = std::fs::read_to_string(&path).expect("arquivo gerado");
+        assert!(text.contains("[probe]"), "faltou a seção [probe]:\n{text}");
+        assert!(text.contains("profile_version"));
+        let back: AppConfig = toml::from_str(&text).expect("TOML gerado deve ser válido");
+        assert_eq!(back, AppConfig::default());
     }
 
     // ── HwAccelChoice (SPEC-CFG-HW-001) ────────────────────────────────────

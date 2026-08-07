@@ -21,24 +21,13 @@ import "fonts/JetBrainsMono-Bold.ttf";
 import "fonts/JetBrainsMono-ExtraBold.ttf";
 
 // ─── Tema ───────────────────────────────────────────────────────────────────
-export global Theme {
-    out property <color> bg: #0a0c0e;
-    out property <color> panel: #111418;
-    out property <color> panel-alt: #161b21;
-    out property <color> card: #15191f;
-    out property <color> border: #20262e;
-    out property <color> border-soft: #1a1f25;
-    out property <color> accent: #e8943a;
-    out property <color> text: #dde4ec;
-    out property <color> text-dim: #8a95a3;
-    out property <color> text-faint: #5f6b78;
-    out property <color> green: #57c08a;
-    out property <color> red: #d6605f;
-    out property <color> blue: #5aa0d0;
-    out property <length> radius: 6px;
-    out property <string> sans: "Inter";
-    out property <string> mono: "JetBrains Mono";
-}
+// Mora em theme.slint para que probe.slint também o use sem ciclo de import.
+import { Theme } from "theme.slint";
+export { Theme }
+
+// ─── Modo Probe (SPEC-PROBE-018/019) ────────────────────────────────────────
+import { ProbeMosaic, ProbeDetail, ProbeTile, ProbeTimelineCell, ProbeEventRow, ProbeChart, ProbeInfoRow } from "probe.slint";
+export { ProbeTile, ProbeTimelineCell, ProbeEventRow, ProbeChart, ProbeInfoRow }
 
 // ─── Structs de dados (espelhados em Rust) ──────────────────────────────────
 export struct PidRow {
@@ -553,6 +542,31 @@ export component AppWindow inherits Window {
     // Aba ativa da coluna esquerda: 0 PIDs · 1 Tabelas · 2 Serviços · 3 Media Info
     in-out property <int> active-tab: 0;
 
+    // ── Modo da aplicação (SPEC-PROBE-001) ─────────────────────────────────
+    // 0 Cinema · 1 Broadcast · 2 Probe. Espelha `ui_slint::AppMode`; o valor
+    // inicial vem de `[ui] mode` do ironstream.toml.
+    in-out property <int> app-mode: 1;
+
+    // ── Estado do modo Probe (SPEC-PROBE-018/019) ──────────────────────────
+    in property <[ProbeTile]> probe-tiles: [];
+    in property <int> probe-max-feeds: 2;
+    in property <string> probe-run-clock: "00:00:00";
+    in property <string> probe-run-id: "";
+    in property <bool> probe-recording: false;
+    in property <string> probe-status: "";
+    /// Slot aberto no detalhe; -1 = mosaico (§8).
+    in-out property <int> probe-detail-slot: -1;
+    in property <ProbeTile> probe-detail-tile;
+    in property <[ProbeTimelineCell]> probe-timeline: [];
+    in property <[ProbeChart]> probe-charts: [];
+    in property <[ProbeEventRow]> probe-events: [];
+    in property <[ProbeInfoRow]> probe-summary: [];
+    in property <[ProbeInfoRow]> probe-health: [];
+    in property <string> probe-timeline-caption: "";
+    in-out property <int> probe-timeline-selected: -1;
+    in-out property <int> probe-window-index: 1;
+    in property <string> probe-severity-filter: "todas";
+
     // ── Callbacks (tratados em Rust) ───────────────────────────────────────
     callback connect(string);
     callback disconnect();
@@ -569,6 +583,23 @@ export component AppWindow inherits Window {
     callback set-aspect-ratio(int);
     callback set-deinterlace(int);
     callback set-hwaccel(int);
+    /// Troca de modo pelo seletor triplo (0 Cinema · 1 Broadcast · 2 Probe).
+    ///
+    /// SPEC-PROBE-001
+    callback set-mode(int);
+    /// Abre/fecha o run de monitoração (SPEC-PROBE-004).
+    callback probe-start-run();
+    callback probe-stop-run();
+    /// Gera o relatório HTML do run (SPEC-PROBE-014).
+    callback probe-export-report();
+    /// Abre o detalhe de um feed (SPEC-PROBE-019).
+    callback probe-open-detail(int);
+    /// Clique numa célula da linha do tempo (SPEC-PROBE-009).
+    callback probe-select-cell(int);
+    /// Troca a janela dos gráficos (SPEC-PROBE-010).
+    callback probe-select-window(int);
+    /// Alterna o filtro de severidade do event log (§8.2).
+    callback probe-cycle-severity();
 
     // ── Estado do menu de contexto (interno) ───────────────────────────────
     // Posição do clique direito (relativa à janela).
@@ -954,9 +985,11 @@ export component AppWindow inherits Window {
                     width: 4px;
                 }
 
-                // Toggle Cinema/Broadcast
+                // Seletor triplo Cinema · Broadcast · Probe (SPEC-PROBE-001).
+                // Antes era estático: dois retângulos sem TouchArea, sem
+                // callback e sem estado.
                 Rectangle {
-                    width: 184px;
+                    width: 276px;
                     background: Theme.panel-alt;
                     border-radius: Theme.radius;
                     border-width: 1px;
@@ -964,25 +997,21 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         padding: 4px;
                         spacing: 4px;
-                        Rectangle {
+                        for m[i] in ["Cinema", "Broadcast", "Probe"]: Rectangle {
                             horizontal-stretch: 1;
                             border-radius: 4px;
+                            background: root.app-mode == i
+                                ? Theme.accent
+                                : (ta-mode.has-hover ? Theme.panel-alt.brighter(0.45) : transparent);
                             Text {
-                                text: "Cinema";
-                                color: Theme.text-dim;
+                                text: m;
+                                color: root.app-mode == i ? #1a1206 : Theme.text-dim;
                                 font-size: 13px;
+                                font-weight: root.app-mode == i ? 700 : 400;
                             }
-                        }
 
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            border-radius: 4px;
-                            background: Theme.accent;
-                            Text {
-                                text: "Broadcast";
-                                color: #1a1206;
-                                font-size: 13px;
-                                font-weight: 700;
+                            ta-mode := TouchArea {
+                                clicked => { root.set-mode(i); }
                             }
                         }
                     }
@@ -991,12 +1020,15 @@ export component AppWindow inherits Window {
         }
 
         // ══ CORPO ════════════════════════════════════════════════════════
-        HorizontalLayout {
+        // Cinema e Broadcast compartilham o corpo do player; Probe substitui
+        // a área inteira pelas telas de mosaico/detalhe (§3.1).
+        if root.app-mode != 2: HorizontalLayout {
             padding: 12px;
             spacing: 12px;
+            vertical-stretch: 1;
 
-            // ── PAINEL ESQUERDO: abas ──────────────────────────────────
-            Rectangle {
+            // ── PAINEL ESQUERDO: abas (ocultas em Cinema, §3.1) ────────
+            if root.app-mode == 1: Rectangle {
                 width: 528px;
                 background: Theme.panel;
                 border-radius: Theme.radius;
@@ -1608,7 +1640,7 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                HorizontalLayout {
+                if root.app-mode == 1: HorizontalLayout {
                     vertical-stretch: 1;
                     spacing: 12px;
                     ChartCard {
@@ -1642,6 +1674,39 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+
+        // ══ MODO PROBE ═══════════════════════════════════════════════════
+        // Mosaico é a tela inicial; o detalhe abre ao clicar num tile (§8).
+        if root.app-mode == 2 && root.probe-detail-slot < 0: ProbeMosaic {
+            vertical-stretch: 1;
+            tiles: root.probe-tiles;
+            max-feeds: root.probe-max-feeds;
+            run-clock: root.probe-run-clock;
+            run-id: root.probe-run-id;
+            recording: root.probe-recording;
+            status: root.probe-status;
+            open-detail(slot) => { root.probe-open-detail(slot); }
+            start-run => { root.probe-start-run(); }
+            stop-run => { root.probe-stop-run(); }
+            export-report => { root.probe-export-report(); }
+        }
+        if root.app-mode == 2 && root.probe-detail-slot >= 0: ProbeDetail {
+            vertical-stretch: 1;
+            tile: root.probe-detail-tile;
+            timeline: root.probe-timeline;
+            charts: root.probe-charts;
+            events: root.probe-events;
+            summary: root.probe-summary;
+            health: root.probe-health;
+            timeline-caption: root.probe-timeline-caption;
+            timeline-selected: root.probe-timeline-selected;
+            window-index: root.probe-window-index;
+            severity-filter: root.probe-severity-filter;
+            back => { root.probe-open-detail(-1); }
+            select-cell(i) => { root.probe-select-cell(i); }
+            select-window(i) => { root.probe-select-window(i); }
+            cycle-severity => { root.probe-cycle-severity(); }
         }
 
         // ══ STATUS BAR ═══════════════════════════════════════════════════

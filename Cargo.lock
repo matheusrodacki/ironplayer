@@ -721,6 +721,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -2528,12 +2529,15 @@ dependencies = [
  "anyhow",
  "av",
  "bytes",
+ "chrono",
  "crossbeam-channel",
  "libloading",
  "net",
+ "probe",
  "serde",
  "tempfile",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
  "ts",
@@ -3912,6 +3916,21 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn",
+]
+
+[[package]]
+name = "probe"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "crossbeam-channel",
+ "net",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.23",
+ "tracing",
+ "ts",
 ]
 
 [[package]]
@@ -5449,6 +5468,7 @@ dependencies = [
  "crossbeam-channel",
  "net",
  "pollster",
+ "probe",
  "slint",
  "slint-build",
  "tracing",

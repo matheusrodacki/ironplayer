@@ -53,6 +53,8 @@
     │
     ├── spec-13-probe-mode/
     │   └── spec.md         ← SPEC-PROBE-001–020: modo Probe (seletor triplo, mosaico 2 feeds, sessão)
+    │                          IMPLEMENTADA em `crates/probe`, `src/feed.rs`, `src/probe_run.rs`,
+    │                          `crates/ui-slint/ui/probe.slint`
     │
     └── spec-14-probe-ip/
         └── spec.md         ← SPEC-PROBE-IP-001–046: camada IP/UDP/RTP/FEC
@@ -72,7 +74,7 @@
 | 6     | `spec-06-ui` (PidPanel)    | `spec-04-ts-metrics`, `spec-05-wiring` | Alpha v0.1             |
 | 7     | `spec-07-av`               | `spec-01-ts-core`                      | Alpha v0.2             |
 | 8     | `spec-06-ui` (completo)    | `spec-07-av`, `spec-03-ts-tables`      | Alpha v0.2 + Beta v0.3 |
-| 9     | `spec-13-probe-mode`       | `spec-04-ts-metrics`, `spec-11-slint`  | v0.4 Probe             |
+| 9     | `spec-13-probe-mode` ✅    | `spec-04-ts-metrics`, `spec-11-slint`  | v0.4 Probe             |
 | 10    | `spec-14-probe-ip`         | `spec-13-probe-mode`, `spec-02-net`    | v0.4 Probe             |
 
 ---

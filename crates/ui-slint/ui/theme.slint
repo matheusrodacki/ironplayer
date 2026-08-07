@@ -1,0 +1,37 @@
+// Paleta e métricas compartilhadas entre a tela Broadcast (appwindow.slint) e
+// a tela Probe (probe.slint).
+//
+// Vive num arquivo próprio porque `probe.slint` precisa do tema e
+// `appwindow.slint` importa `probe.slint` — mantê-lo no appwindow criaria um
+// ciclo de import.
+
+export global Theme {
+    out property <color> bg: #0a0c0e;
+    out property <color> panel: #111418;
+    out property <color> panel-alt: #161b21;
+    out property <color> card: #15191f;
+    out property <color> border: #20262e;
+    out property <color> border-soft: #1a1f25;
+    out property <color> accent: #e8943a;
+    out property <color> text: #dde4ec;
+    out property <color> text-dim: #8a95a3;
+    out property <color> text-faint: #5f6b78;
+    out property <color> green: #57c08a;
+    out property <color> red: #d6605f;
+    out property <color> blue: #5aa0d0;
+    out property <length> radius: 6px;
+    out property <string> sans: "Inter";
+    out property <string> mono: "JetBrains Mono";
+
+    // ── Severidades do modo Probe ──────────────────────────────────────────
+    // Espelham `probe::severity` (SPEC-PROBE-009): a cor efetiva de cada
+    // célula/indicador vem do Rust já resolvida; estas entradas servem para a
+    // legenda e para os estados desenhados só no .slint.
+    out property <color> sev-ok: #57c08a;
+    out property <color> sev-info: #5aa0d0;
+    out property <color> sev-warning: #e8943a;
+    out property <color> sev-error: #d6605f;
+    out property <color> sev-critical: #8e2c2b;
+    /// Cinza de "sem dado" — obrigatoriamente distinto de `sev-ok`.
+    out property <color> sev-nodata: #3a434d;
+}

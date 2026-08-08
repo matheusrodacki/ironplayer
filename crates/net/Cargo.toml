@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.78"
 
+[features]
+default = []
+# SPEC-PROBE-IP-003 — backend de captura pcap/Npcap (fase 4 do faseamento).
+# Desligado por default: `cargo build` sem a feature não exige Npcap instalado.
+capture-pcap = []
+
 [dependencies]
 socket2           = "0.5"
 tokio             = { workspace = true }

@@ -12,9 +12,15 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 
 use crate::check::{
-    CHECK_AUDIO_MISSING, CHECK_CC_ERROR, CHECK_CRC_ERROR, CHECK_DEGRADED, CHECK_FEED_UNAVAILABLE,
-    CHECK_LOCAL_DROPS, CHECK_PCR_DISCONTINUITY, CHECK_PCR_ERROR, CHECK_RTP_OUT_OF_ORDER,
-    CHECK_SCHED_JITTER, CHECK_TS_SYNC_LOSS, CHECK_VIDEO_MISSING,
+    CHECK_AUDIO_MISSING, CHECK_BAD_PAYLOAD_SIZE, CHECK_CC_ERROR, CHECK_CRC_ERROR, CHECK_DEGRADED,
+    CHECK_ENCAPSULATION_MISMATCH, CHECK_FEC_DUAL_STREAM, CHECK_FEC_D_RANGE, CHECK_FEC_LXD,
+    CHECK_FEC_L_RANGE, CHECK_FEC_MISSING, CHECK_FEC_SSRC_MISMATCH, CHECK_FEC_UNEXPECTED,
+    CHECK_FEED_UNAVAILABLE, CHECK_IAT_MAX, CHECK_LOCAL_DROPS, CHECK_MULTI_SOURCE,
+    CHECK_PCR_DISCONTINUITY, CHECK_PCR_ERROR, CHECK_RTP_DUPLICATE, CHECK_RTP_EXTENSION,
+    CHECK_RTP_INVALID_PT, CHECK_RTP_LOSS_RATIO, CHECK_RTP_MARKER, CHECK_RTP_MISSING,
+    CHECK_RTP_OUT_OF_ORDER, CHECK_RTP_PADDING, CHECK_RTP_REORDER, CHECK_RTP_SOURCE_RESTART,
+    CHECK_RTP_SSRC_CHANGED, CHECK_RTP_TOO_OLD, CHECK_SCHED_JITTER, CHECK_TS_PER_DATAGRAM,
+    CHECK_TS_SYNC_LOSS, CHECK_VIDEO_MISSING,
 };
 use crate::event::{EventContext, EventOrigin, EventPhase, ProbeEvent};
 use crate::series::{MetricId, SeriesPoints, TimelineBucket};
@@ -148,6 +154,10 @@ pub struct EventRow {
     pub service_id: Option<u16>,
     /// `true` quando a ocorrência foi atribuída à própria probe.
     pub local: bool,
+    /// Check que causou esta ocorrência, quando a correlação foi conclusiva.
+    ///
+    /// SPEC-PROBE-IP-039 · SPEC-PROBE-IP-041
+    pub caused_by: Option<String>,
 }
 
 impl EventRow {
@@ -166,7 +176,17 @@ impl EventRow {
             pid: ev.context.pid,
             service_id: ev.context.service_id,
             local: ev.context.origin == EventOrigin::Local,
+            caused_by: ev.context.caused_by.clone(),
         }
+    }
+
+    /// `true` quando este evento é **causa** e não consequência.
+    ///
+    /// SPEC-PROBE-IP-040 — a lista de alertas de uma janela põe a raiz primeiro
+    /// e as consequências abaixo, em vez de despejar causa e efeito lado a lado
+    /// como se fossem dois incidentes.
+    pub fn is_root_cause(&self) -> bool {
+        self.caused_by.is_none()
     }
 
     /// Descrição do problema em uma frase, para a lista consolidada de alertas.
@@ -208,6 +228,109 @@ impl EventRow {
             CHECK_RTP_OUT_OF_ORDER => format!(
                 "RTP: {n} pacote(s) fora de ordem ou faltando na sequência."
             ),
+            // ── Camada IP / UDP (spec-14) ───────────────────────────────
+            CHECK_MULTI_SOURCE => format!(
+                "Mais de uma fonte transmitindo no mesmo grupo/porta ({:.0} endereços \
+                 observados) — os fluxos se misturam e a contagem de sequência deixa de \
+                 fazer sentido.",
+                self.measured
+            ),
+            CHECK_ENCAPSULATION_MISMATCH => {
+                "Encapsulamento declarado na configuração difere do observado no tráfego. \
+                 A análise segue pelo **observado**; corrija a URL do feed para que o \
+                 relatório não contradiga o que está na rede."
+                    .to_string()
+            }
+            CHECK_IAT_MAX => format!(
+                "Rajada no inter-arrival: {:.0} µs entre datagramas, acima do limiar do \
+                 perfil e do piso de ruído medido pela própria probe.",
+                self.measured
+            ),
+            // ── Camada RTP (spec-14) ────────────────────────────────────
+            CHECK_RTP_MISSING => format!(
+                "RTP packet(s) lost: {n} pacote(s) não chegaram e não voltaram dentro da \
+                 janela de reordenação — perda confirmada."
+            ),
+            CHECK_RTP_LOSS_RATIO => format!(
+                "Razão de perda RTP em {:.2e} na janela do perfil: acima do ruído normal \
+                 de um multicast de produção, é degradação sustentada.",
+                self.measured
+            ),
+            CHECK_RTP_REORDER => format!(
+                "RTP: {n} pacote(s) chegaram fora de ordem e foram reconciliados dentro da \
+                 janela — não é perda, mas indica caminho instável."
+            ),
+            CHECK_RTP_DUPLICATE => format!(
+                "RTP: {n} pacote(s) duplicados. Não foram repassados ao demux, para não \
+                 gerarem erro de continuidade que não existe no stream."
+            ),
+            CHECK_RTP_TOO_OLD => format!(
+                "RTP: {n} pacote(s) chegaram abaixo da janela de reordenação — atraso \
+                 grande demais para reconciliar, contados como pacote velho e não como perda."
+            ),
+            CHECK_RTP_SOURCE_RESTART => format!(
+                "RTP: {n} reinício(s) da fonte — a numeração de sequência recomeçou, os \
+                 contadores foram rebaseados sem contabilizar perda em massa."
+            ),
+            CHECK_RTP_SSRC_CHANGED => format!(
+                "RTP: {n} troca(s) de SSRC — a fonte do fluxo mudou; contadores reiniciados \
+                 para o novo SSRC."
+            ),
+            CHECK_RTP_INVALID_PT => format!(
+                "RTP Invalid Payload Type: {n} pacote(s) com payload type fora do perfil \
+                 configurado."
+            ),
+            CHECK_RTP_PADDING => format!(
+                "RTP: bit de padding presente em {n} pacote(s) — proibido pelo perfil \
+                 ST 2022-2."
+            ),
+            CHECK_RTP_EXTENSION => format!(
+                "RTP: header de extensão presente em {n} pacote(s) — proibido pelo perfil \
+                 ST 2022-2."
+            ),
+            CHECK_RTP_MARKER => format!(
+                "RTP: bit marker presente em {n} pacote(s) — proibido pelo perfil ST 2022-2."
+            ),
+            CHECK_BAD_PAYLOAD_SIZE => format!(
+                "Transport packet size: {n} datagrama(s) com payload que não é múltiplo de \
+                 188 bytes ou não começa em 0x47. Não foram repassados ao demux."
+            ),
+            CHECK_TS_PER_DATAGRAM => format!(
+                "TS packets per IP packet: {n} datagrama(s) com número de pacotes TS \
+                 diferente do esperado pelo perfil."
+            ),
+            // ── FEC ST 2022-1 (spec-14) ─────────────────────────────────
+            CHECK_FEC_L_RANGE => {
+                "FEC: dimensão L da matriz fora da faixa do perfil.".to_string()
+            }
+            CHECK_FEC_D_RANGE => {
+                "FEC: dimensão D da matriz fora da faixa do perfil.".to_string()
+            }
+            CHECK_FEC_LXD => {
+                "FEC: L×D acima do teto do perfil — matriz grande demais aumenta a latência \
+                 de recuperação sem ganho proporcional de proteção."
+                    .to_string()
+            }
+            CHECK_FEC_DUAL_STREAM => {
+                "FEC: apenas um fluxo observado onde o perfil espera dois (coluna e linha). \
+                 Regra derivada do RFC 2733 e ainda a validar contra o ST 2022-1."
+                    .to_string()
+            }
+            CHECK_FEC_SSRC_MISMATCH => {
+                "FEC: o SSRC do fluxo de correção não corresponde ao do fluxo principal — \
+                 a FEC pode estar protegendo outro stream."
+                    .to_string()
+            }
+            CHECK_FEC_MISSING => {
+                "FEC ausente: o perfil declara FEC obrigatória neste feed e não há tráfego \
+                 nas portas de correção."
+                    .to_string()
+            }
+            CHECK_FEC_UNEXPECTED => {
+                "FEC presente sem o perfil declarar: há tráfego nas portas de correção deste \
+                 feed. Informativo — vale conferir a configuração."
+                    .to_string()
+            }
             CHECK_VIDEO_MISSING => format!(
                 "Vídeo ausente: bitrate do PID de vídeo abaixo do limiar ({:.1} kbps){pid}.",
                 self.measured
@@ -237,6 +360,15 @@ impl EventRow {
         };
         if self.local && self.check_id != CHECK_LOCAL_DROPS {
             text.push_str(" Ocorreu no mesmo segundo de um descarte local — atribuído à probe.");
+        }
+        // SPEC-PROBE-IP-039 · SPEC-PROBE-IP-040 — sem esta frase, 12 h de log
+        // mostram `RTP packet(s) lost: 130` e dezenas de `Continuity Counter
+        // Error` lado a lado como se fossem incidentes diferentes.  São o mesmo.
+        if let Some(cause) = &self.caused_by {
+            text.push_str(&format!(
+                " Consequência de {cause} no mesmo segundo — perda na rede até este ponto \
+                 de captura, não erro que já chegou no stream."
+            ));
         }
         text
     }
@@ -370,6 +502,7 @@ impl ServiceSnapshot {
             service_id: row.service_id,
             ssrc: None,
             origin: EventOrigin::Network,
+            caused_by: None,
         })
     }
 }
@@ -412,10 +545,19 @@ pub struct FeedSnapshot {
     ///
     /// SPEC-PROBE-023
     pub timeline_bucket_secs: u64,
-    /// Linha do tempo da camada IP/RTP — linha `IP` da grade (§8.3).
+    /// Linha do tempo da camada IP/UDP — linha `IP` da grade (§8.3).
     pub ip_timeline: Vec<TimelineBucket>,
+    /// Linha do tempo da camada RTP/FEC — vazia num feed UDP puro.
+    ///
+    /// SPEC-PROBE-IP-048 — com RTP presente são duas linhas; sem ele, uma só,
+    /// e nenhuma faixa fantasma.
+    pub rtp_timeline: Vec<TimelineBucket>,
     /// Linha do tempo da camada TS — linha `TRANSPORTE` da grade (§8.3).
     pub ts_timeline: Vec<TimelineBucket>,
+    /// Estado da camada IP no último tick — alimenta a aba `Rede` do nível 1.
+    ///
+    /// SPEC-PROBE-IP-047
+    pub ip: Option<crate::ip::IpTick>,
     /// Serviços do multiplex, na ordem da PAT.
     ///
     /// SPEC-PROBE-021
@@ -576,6 +718,7 @@ mod tests {
             pid: None,
             service_id: None,
             local: false,
+            caused_by: None,
         };
         let f = FeedSnapshot {
             events: vec![row(0), row(299), row(300), row(900)],
@@ -620,6 +763,7 @@ mod tests {
             pid,
             service_id: None,
             local: false,
+            caused_by: None,
         }
     }
 

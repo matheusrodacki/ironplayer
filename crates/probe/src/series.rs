@@ -25,17 +25,20 @@ pub enum MetricId {
     LocalDropsPerS,
     /// Jitter de agendamento do tick, em ms (SPEC-PROBE-013).
     SchedJitterMs,
+    /// p99 do inter-arrival dos datagramas, em µs (SPEC-PROBE-IP-026).
+    IatP99Us,
 }
 
 impl MetricId {
     /// Todas as métricas, na ordem em que aparecem nos gráficos do detalhe.
     ///
     /// SPEC-PROBE-010
-    pub const ALL: [MetricId; 6] = [
+    pub const ALL: [MetricId; 7] = [
         MetricId::BitrateKbps,
         MetricId::CcErrorsPerS,
         MetricId::CrcErrorsPerS,
         MetricId::RtpLossPerS,
+        MetricId::IatP99Us,
         MetricId::LocalDropsPerS,
         MetricId::SchedJitterMs,
     ];
@@ -49,6 +52,7 @@ impl MetricId {
             Self::RtpLossPerS => "PERDA RTP/S",
             Self::LocalDropsPerS => "DESCARTE LOCAL/S",
             Self::SchedJitterMs => "JITTER DE TICK",
+            Self::IatP99Us => "INTER-ARRIVAL p99",
         }
     }
 
@@ -57,6 +61,7 @@ impl MetricId {
         match self {
             Self::BitrateKbps => "kbps",
             Self::SchedJitterMs => "ms",
+            Self::IatP99Us => "us",
             _ => "/s",
         }
     }
@@ -69,6 +74,7 @@ impl MetricId {
             Self::RtpLossPerS => 3,
             Self::LocalDropsPerS => 4,
             Self::SchedJitterMs => 5,
+            Self::IatP99Us => 6,
         }
     }
 }
@@ -359,6 +365,12 @@ impl HealthTimeline {
     }
 }
 
+/// Quantas métricas o `SeriesStore` guarda.
+///
+/// Deriva de [`MetricId::ALL`]: acrescentar uma métrica não pode exigir mexer
+/// no tamanho de dois arrays paralelos.
+const METRIC_COUNT: usize = MetricId::ALL.len();
+
 /// Séries e linha do tempo de um feed.
 ///
 /// SPEC-PROBE-005 · SPEC-PROBE-009
@@ -366,9 +378,9 @@ impl HealthTimeline {
 pub struct SeriesStore {
     rollup_secs: u64,
     /// Um vetor de buckets por métrica, indexado por [`MetricId::index`].
-    rollups: [Vec<RollupBucket>; 6],
+    rollups: [Vec<RollupBucket>; METRIC_COUNT],
     /// Índice do bucket corrente por métrica (`rollups[i].len() - 1`).
-    open_bucket_start: [Option<i64>; 6],
+    open_bucket_start: [Option<i64>; METRIC_COUNT],
     timeline: HealthTimeline,
     /// Total de amostras 1 Hz ingeridas (para o resumo da sessão).
     total_samples: u64,
@@ -383,7 +395,7 @@ impl SeriesStore {
         Self {
             rollup_secs: rollup_secs.max(1),
             rollups: Default::default(),
-            open_bucket_start: [None; 6],
+            open_bucket_start: [None; METRIC_COUNT],
             timeline: HealthTimeline::new(timeline_secs),
             total_samples: 0,
             connected_samples: 0,

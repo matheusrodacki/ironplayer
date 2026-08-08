@@ -17,15 +17,21 @@ use ts::metrics::MetricsSnapshot;
 use ts::Pid;
 
 use crate::check::{
-    CheckEngine, CheckProfile, Measurement, CHECK_AUDIO_MISSING, CHECK_CC_ERROR, CHECK_CRC_ERROR,
-    CHECK_DEGRADED, CHECK_FEED_UNAVAILABLE, CHECK_LOCAL_DROPS, CHECK_PCR_DISCONTINUITY,
-    CHECK_PCR_ERROR, CHECK_RTP_OUT_OF_ORDER, CHECK_SCHED_JITTER, CHECK_TS_SYNC_LOSS,
-    CHECK_VIDEO_MISSING,
+    CheckEngine, CheckProfile, Measurement, CHECK_AUDIO_MISSING, CHECK_BAD_PAYLOAD_SIZE,
+    CHECK_CC_ERROR, CHECK_CRC_ERROR, CHECK_DEGRADED, CHECK_ENCAPSULATION_MISMATCH,
+    CHECK_FEC_DUAL_STREAM, CHECK_FEC_D_RANGE, CHECK_FEC_LXD, CHECK_FEC_L_RANGE, CHECK_FEC_MISSING,
+    CHECK_FEC_SSRC_MISMATCH, CHECK_FEC_UNEXPECTED, CHECK_FEED_UNAVAILABLE, CHECK_IAT_MAX,
+    CHECK_LOCAL_DROPS, CHECK_MULTI_SOURCE, CHECK_PCR_DISCONTINUITY, CHECK_PCR_ERROR,
+    CHECK_RTP_DUPLICATE, CHECK_RTP_EXTENSION, CHECK_RTP_INVALID_PT, CHECK_RTP_LOSS_RATIO,
+    CHECK_RTP_MARKER, CHECK_RTP_MISSING, CHECK_RTP_OUT_OF_ORDER, CHECK_RTP_PADDING,
+    CHECK_RTP_REORDER, CHECK_RTP_SOURCE_RESTART, CHECK_RTP_SSRC_CHANGED, CHECK_RTP_TOO_OLD,
+    CHECK_SCHED_JITTER, CHECK_TS_PER_DATAGRAM, CHECK_TS_SYNC_LOSS, CHECK_VIDEO_MISSING,
 };
 use crate::clock::ProbeClock;
 use crate::config::{FecMode, ProbeConfig};
 use crate::degrade::{DegradeController, DegradePolicy, OverloadSignals};
 use crate::event::{EventContext, EventOrigin, EventPhase, ProbeEvent};
+use crate::ip::IpTick;
 use crate::sample::{AvPresence, CounterBaseline, ProbeSample, RawCounters, CSV_HEADER};
 use crate::series::{HealthScope, HealthTimeline, MetricId, SeriesStore, SeriesWindow};
 use crate::service::{ServiceInfo, ServiceVisual, StreamKind};
@@ -83,6 +89,9 @@ pub struct TickInput {
     pub services: Vec<ServiceInfo>,
     /// Último resultado do thumbnail por serviço (SPEC-PROBE-024).
     pub visuals: BTreeMap<u16, ServiceVisual>,
+    /// Camada IP do segundo; `None` antes do primeiro datagrama ou quando o
+    /// feed roda sem análise de rede (spec-14 §5).
+    pub ip: Option<IpTick>,
 }
 
 /// Motor de um feed.
@@ -118,6 +127,8 @@ pub struct ProbeEngine {
     // Estado publicado.
     connected: bool,
     encapsulation: Encapsulation,
+    /// Última fotografia da camada IP (spec-14 §5.7 — aba `Rede`).
+    ip: Option<IpTick>,
     last_sample: Option<ProbeSample>,
     presence: AvPresence,
     health: ProbeHealth,
@@ -239,6 +250,7 @@ impl ProbeEngine {
             events_opened: 0,
             connected: false,
             encapsulation: Encapsulation::Unknown,
+            ip: None,
             last_sample: None,
             presence: AvPresence::default(),
             health: ProbeHealth::default(),
@@ -362,6 +374,18 @@ impl ProbeEngine {
             EventOrigin::Network
         };
         let net_ctx = EventContext::network().with_origin(origin);
+
+        // SPEC-PROBE-IP-039 — correlação IP→TS **no mesmo tick**: se houve
+        // perda RTP confirmada neste segundo, os erros de continuidade deste
+        // segundo são consequência dela, e não um incidente independente.
+        // SPEC-PROBE-IP-041 — a ausência do carimbo classifica o CC error como
+        // originado no TS, upstream do ponto de captura.
+        let rtp_missing_now = input
+            .ip
+            .as_ref()
+            .and_then(|ip| ip.rtp)
+            .is_some_and(|rtp| rtp.missing > 0);
+
         // SPEC-PROBE-021 — toda ocorrência com PID conhecido também carrega o
         // serviço dono dele.  Sem isso a grade de saúde e o mosaico de serviços
         // não conseguiriam distinguir "o multiplex está ruim" de "**este**
@@ -371,6 +395,17 @@ impl ProbeEngine {
             match crate::service::owner_of(&input.services, pid) {
                 Some(sid) => ctx.with_service(sid),
                 None => ctx,
+            }
+        };
+        // SPEC-PROBE-IP-040a — a correlação atravessa escopos: o `caused_by` é
+        // acrescentado **sem** apagar PID nem serviço, senão a grade do nível 2
+        // perderia a célula vermelha que aponta o problema.
+        let cc_ctx = |pid: Pid| {
+            let ctx = pid_ctx(pid);
+            if rtp_missing_now {
+                ctx.caused_by(CHECK_RTP_MISSING)
+            } else {
+                ctx
             }
         };
 
@@ -393,7 +428,7 @@ impl ProbeEngine {
             for (pid, count) in &deltas.cc_by_pid {
                 measurements.push(Measurement {
                     check_id: CHECK_CC_ERROR,
-                    context: pid_ctx(*pid),
+                    context: cc_ctx(*pid),
                     value: *count as f64,
                     occurrences: *count,
                 });
@@ -426,11 +461,18 @@ impl ProbeEngine {
                 Measurement::counter(CHECK_TS_SYNC_LOSS, deltas.sync_loss as f64)
                     .with_context(net_ctx.clone()),
             );
-            if self.encapsulation.has_rtp() {
+            // O contador do `RtpStripper` só é usado quando **não** há camada IP
+            // detalhada: com a spec-14 ligada, `rtp_missing`/`rtp_reorder` dizem
+            // a mesma coisa com muito mais precisão, e manter os dois abriria
+            // dois alarmes para o mesmo pacote perdido.
+            if self.encapsulation.has_rtp() && input.ip.is_none() {
                 measurements.push(
                     Measurement::counter(CHECK_RTP_OUT_OF_ORDER, deltas.rtp_out_of_order as f64)
                         .with_context(net_ctx.clone()),
                 );
+            }
+            if let Some(ip) = &input.ip {
+                self.push_ip_measurements(ip, &net_ctx, &mut measurements);
             }
             // Só afirma "falta vídeo/áudio" depois de saber quais PIDs
             // procurar: antes da PMT, a ausência de medição não é ausência de
@@ -472,11 +514,18 @@ impl ProbeEngine {
                 .push_metric(MetricId::CcErrorsPerS, now_utc, deltas.cc_total as f64);
             self.series
                 .push_metric(MetricId::CrcErrorsPerS, now_utc, deltas.crc as f64);
-            self.series.push_metric(
-                MetricId::RtpLossPerS,
-                now_utc,
-                deltas.rtp_out_of_order as f64,
-            );
+            // Com a camada IP ligada, a perda vem da máquina de sequência por
+            // SSRC — que é exata; sem ela, resta o contador do `RtpStripper`.
+            let rtp_loss = input
+                .ip
+                .as_ref()
+                .and_then(|ip| ip.rtp)
+                .map_or(deltas.rtp_out_of_order as f64, |rtp| rtp.missing as f64);
+            self.series
+                .push_metric(MetricId::RtpLossPerS, now_utc, rtp_loss);
+            if let Some(p99) = input.ip.as_ref().and_then(|ip| ip.iat.p99_us) {
+                self.series.push_metric(MetricId::IatP99Us, now_utc, p99);
+            }
             self.series
                 .push_metric(MetricId::LocalDropsPerS, now_utc, local_drops_delta as f64);
             self.series
@@ -498,7 +547,9 @@ impl ProbeEngine {
             local_drops_delta,
             sched_jitter_ms,
             worst_severity: worst,
+            ip: input.ip.clone(),
         };
+        self.ip = input.ip;
 
         if let (Some(w), Some(path)) = (&self.writer, &self.metrics_path) {
             if !w.append(path.clone(), sample.to_csv()) {
@@ -509,6 +560,120 @@ impl ProbeEngine {
 
         self.record_events(&events);
         events
+    }
+
+    /// Leva a camada IP ao motor de checks.
+    ///
+    /// Regra que organiza o bloco inteiro: num feed **UDP puro**, nada de §5.2,
+    /// §5.3 e §5.5 é medido — nenhuma medição de RTP ou FEC é sequer enfileirada,
+    /// e as camadas ficam `n/a` no snapshot.  É a diferença entre "verificado e
+    /// sem problema" e "não verificado" (SPEC-PROBE-IP-043).
+    ///
+    /// SPEC-PROBE-IP-010 … SPEC-PROBE-IP-037
+    fn push_ip_measurements(
+        &self,
+        ip: &IpTick,
+        net_ctx: &EventContext,
+        out: &mut Vec<Measurement>,
+    ) {
+        // ── Camada IP / UDP: vale para os três encapsulamentos ───────────
+        out.push(
+            Measurement::gauge(CHECK_MULTI_SOURCE, ip.sources.len() as f64)
+                .with_context(net_ctx.clone()),
+        );
+        out.push(
+            Measurement::gauge(
+                CHECK_ENCAPSULATION_MISMATCH,
+                f64::from(u8::from(ip.encapsulation_mismatch)),
+            )
+            .with_context(net_ctx.clone()),
+        );
+        // SPEC-PROBE-IP-006 — o alarme de temporização só dispara acima de
+        // `max(threshold, k × noise_floor_us)`.  O portão é aplicado aqui, na
+        // medição, para que o evento continue reportando o pico **real**: o
+        // operador precisa ver 8 ms, não o limiar que foi ultrapassado.
+        if let Some(max_us) = ip.iat.max_us {
+            let threshold = self
+                .checks
+                .profile()
+                .get(CHECK_IAT_MAX)
+                .map_or(5_000.0, |d| d.threshold);
+            let effective = match ip.noise_floor_us {
+                Some(floor) if floor.is_finite() => threshold.max(self.cfg.noise_k * floor),
+                _ => threshold,
+            };
+            let gated = if max_us > effective { max_us } else { 0.0 };
+            out.push(Measurement::gauge(CHECK_IAT_MAX, gated).with_context(net_ctx.clone()));
+        }
+
+        // ── Camada RTP: nada disto existe num feed UDP puro ──────────────
+        let Some(rtp) = ip.rtp else {
+            return;
+        };
+        let ctx = match ip.ssrc {
+            Some(ssrc) => net_ctx.clone().with_ssrc(ssrc),
+            None => net_ctx.clone(),
+        };
+        let counter = |id: &'static str, value: u64| {
+            Measurement::counter(id, value as f64).with_context(ctx.clone())
+        };
+
+        out.push(counter(CHECK_RTP_MISSING, rtp.missing));
+        out.push(counter(CHECK_RTP_REORDER, rtp.reorder));
+        out.push(counter(CHECK_RTP_DUPLICATE, rtp.dup));
+        out.push(counter(CHECK_RTP_TOO_OLD, rtp.too_old));
+        out.push(counter(CHECK_RTP_SOURCE_RESTART, rtp.source_restarts));
+        out.push(counter(CHECK_RTP_SSRC_CHANGED, rtp.ssrc_changes));
+        out.push(counter(CHECK_RTP_INVALID_PT, ip.violations.invalid_pt));
+        out.push(counter(CHECK_RTP_PADDING, ip.violations.padding));
+        out.push(counter(CHECK_RTP_EXTENSION, ip.violations.extension));
+        out.push(counter(CHECK_RTP_MARKER, ip.violations.marker));
+        out.push(counter(
+            CHECK_BAD_PAYLOAD_SIZE,
+            ip.violations.bad_payload_size,
+        ));
+        out.push(counter(
+            CHECK_TS_PER_DATAGRAM,
+            ip.violations.ts_per_datagram,
+        ));
+        if let Some(ratio) = ip.loss_ratio {
+            out.push(Measurement::gauge(CHECK_RTP_LOSS_RATIO, ratio).with_context(ctx.clone()));
+        }
+
+        // ── FEC: só quando a probe está de fato escutando as portas ──────
+        if !ip.fec.listening {
+            return;
+        }
+        let fec = &self.cfg.fec;
+        let flag = |id: &'static str, raised: bool| {
+            Measurement::gauge(id, f64::from(u8::from(raised))).with_context(ctx.clone())
+        };
+
+        // Faixa só é verificável com a dimensão conhecida; sem ela o check fica
+        // sem medição no tick, que o motor trata como "sem violação" — nunca
+        // como violação por ausência de dado.
+        if let Some(l) = ip.fec.l {
+            out.push(flag(
+                CHECK_FEC_L_RANGE,
+                l < fec.l_range[0] || l > fec.l_range[1],
+            ));
+            out.push(flag(
+                CHECK_FEC_DUAL_STREAM,
+                l >= fec.dual_stream_min_l && ip.fec.streams < 2,
+            ));
+        }
+        if let Some(d) = ip.fec.d {
+            out.push(flag(
+                CHECK_FEC_D_RANGE,
+                d < fec.d_range[0] || d > fec.d_range[1],
+            ));
+        }
+        if let Some(lxd) = ip.fec.lxd() {
+            out.push(flag(CHECK_FEC_LXD, lxd > fec.max_lxd));
+        }
+        out.push(flag(CHECK_FEC_SSRC_MISMATCH, ip.fec.ssrc_mismatch));
+        out.push(flag(CHECK_FEC_MISSING, fec.required && !ip.fec.present));
+        out.push(flag(CHECK_FEC_UNEXPECTED, !fec.required && ip.fec.present));
     }
 
     /// Recalcula os agregados por serviço e alimenta a linha do tempo de cada
@@ -558,21 +723,37 @@ impl ProbeEngine {
             }
         }
 
-        // A camada RTP entra na linha `IP` da grade: são a mesma pergunta
-        // ("a rede entregou?") e uma linha só evita uma faixa quase sempre
-        // cinza nos feeds UDP puro.
-        let ip_worst = layer_worst
-            .get(&Layer::Ip)
-            .copied()
-            .into_iter()
-            .chain(layer_worst.get(&Layer::Rtp).copied())
-            .max();
-        self.push_scope(
-            HealthScope::Layer(Layer::Ip),
-            now_utc,
-            ip_worst,
-            connected,
-        );
+        // SPEC-PROBE-IP-048 — `IP` e `RTP` são **duas** linhas quando o feed tem
+        // RTP.  A fusão do spec-13 §8.2 continua valendo para UDP puro, onde a
+        // faixa de RTP ficaria permanentemente cinza; com RTP presente, porém,
+        // essa camada passa a ser a que mais mede (perda, reordenação,
+        // duplicata, `too_old`, SSRC, jitter, L×D), e uma célula verde única
+        // afirmando "IP e RTP estão bons" deixaria de ser resumo para virar
+        // afirmação não verificada.
+        let split = self.encapsulation.has_rtp();
+        let ip_worst = if split {
+            layer_worst.get(&Layer::Ip).copied()
+        } else {
+            layer_worst
+                .get(&Layer::Ip)
+                .copied()
+                .into_iter()
+                .chain(layer_worst.get(&Layer::Rtp).copied())
+                .max()
+        };
+        self.push_scope(HealthScope::Layer(Layer::Ip), now_utc, ip_worst, connected);
+        if split {
+            self.push_scope(
+                HealthScope::Layer(Layer::Rtp),
+                now_utc,
+                layer_worst.get(&Layer::Rtp).copied(),
+                connected,
+            );
+        } else {
+            // Feed UDP puro: a linha de RTP não existe, e o escopo sai do mapa
+            // em vez de acumular história de algo que não é medido.
+            self.scopes.remove(&HealthScope::Layer(Layer::Rtp));
+        }
         self.push_scope(
             HealthScope::Layer(Layer::Ts),
             now_utc,
@@ -825,7 +1006,11 @@ impl ProbeEngine {
             timeline: self.series.timeline().to_vec(),
             timeline_bucket_secs: self.series.timeline_secs(),
             ip_timeline: self.scope_cells(HealthScope::Layer(Layer::Ip)),
+            // SPEC-PROBE-IP-048 — vazio num feed UDP puro: a UI usa isso para
+            // não desenhar uma faixa fantasma de RTP.
+            rtp_timeline: self.scope_cells(HealthScope::Layer(Layer::Rtp)),
             ts_timeline: self.scope_cells(HealthScope::Layer(Layer::Ts)),
+            ip: self.ip.clone(),
             services,
             series,
             events: self.events.iter().cloned().collect(),
@@ -1480,6 +1665,245 @@ mod tests {
         );
         assert!(!eng.scopes.contains_key(&HealthScope::Pid(6200)));
         assert!(eng.scopes.contains_key(&HealthScope::Pid(6100)));
+    }
+
+    /// Camada IP de um feed RTP saudável, com `missing` pacotes perdidos no
+    /// segundo.
+    fn ip_tick(missing: u64) -> IpTick {
+        IpTick {
+            encapsulation: Encapsulation::Rtp,
+            datagrams: 1_400,
+            bytes: 1_842_400,
+            mbps: 14.7,
+            ts_per_datagram: Some(7.0),
+            ssrc: Some(0x1A2B_3C4D),
+            rtp: Some(crate::ip::RtpDelta {
+                received: 1_400,
+                missing,
+                ..Default::default()
+            }),
+            loss_ratio: Some(0.0),
+            ..Default::default()
+        }
+    }
+
+    /// SPEC-PROBE-IP-039 · SPEC-PROBE-IP-040a — 1 pacote RTP perdido carrega
+    /// 7 pacotes TS: os CC errors do mesmo tick são **consequência**, e cada um
+    /// diz isso sem perder o PID nem o serviço que a grade precisa pintar.
+    #[test]
+    fn spec_probe_ip_039_cc_errors_are_correlated_with_rtp_loss_of_the_same_tick() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        let tick = |total: u64, missing: u64| TickInput {
+            services: inventory(),
+            ip: Some(ip_tick(missing)),
+            ..connected_input(metrics(15_000.0, &[(6100, total)], 0))
+        };
+
+        eng.tick(tick(0, 0));
+        clock.advance(Duration::from_secs(1));
+        let events = eng.tick(tick(7, 1));
+
+        let cc = events
+            .iter()
+            .find(|e| e.check_id == CHECK_CC_ERROR)
+            .expect("CC error deve abrir");
+        assert_eq!(
+            cc.context.caused_by.as_deref(),
+            Some(CHECK_RTP_MISSING),
+            "o CC error do mesmo tick é consequência da perda de rede"
+        );
+        assert_eq!(cc.context.pid, Some(6100), "o PID não pode ser apagado");
+        assert_eq!(cc.context.service_id, Some(100));
+
+        // A perda RTP abre o seu próprio evento — o raiz.
+        let loss = events
+            .iter()
+            .find(|e| e.check_id == CHECK_RTP_MISSING)
+            .expect("a perda RTP é o evento raiz");
+        assert_eq!(loss.severity, Severity::Error);
+        assert!(loss.context.caused_by.is_none(), "a raiz não tem causa");
+        assert_eq!(loss.context.ssrc.as_deref(), Some("0x1A2B3C4D"));
+
+        let snap = eng.snapshot(SeriesWindow::WholeSession);
+        let row = snap
+            .events
+            .iter()
+            .find(|e| e.check_id == CHECK_CC_ERROR)
+            .expect("linha do log");
+        assert!(!row.is_root_cause());
+        assert!(row.describe().contains("Consequência de rtp_missing"));
+    }
+
+    /// SPEC-PROBE-IP-041 — CC error **sem** perda RTP no mesmo tick é erro que
+    /// já chegou no stream, upstream do ponto de captura.
+    #[test]
+    fn spec_probe_ip_041_cc_error_without_rtp_loss_is_attributed_to_the_ts() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        let tick = |total: u64| TickInput {
+            services: inventory(),
+            ip: Some(ip_tick(0)),
+            ..connected_input(metrics(15_000.0, &[(6100, total)], 0))
+        };
+
+        eng.tick(tick(0));
+        clock.advance(Duration::from_secs(1));
+        let events = eng.tick(tick(9));
+
+        let cc = events
+            .iter()
+            .find(|e| e.check_id == CHECK_CC_ERROR)
+            .expect("CC error deve abrir");
+        assert!(
+            cc.context.caused_by.is_none(),
+            "sem perda de rede, o erro é do stream"
+        );
+        assert!(!events.iter().any(|e| e.check_id == CHECK_RTP_MISSING));
+
+        let snap = eng.snapshot(SeriesWindow::WholeSession);
+        let row = snap
+            .events
+            .iter()
+            .find(|e| e.check_id == CHECK_CC_ERROR)
+            .expect("linha do log");
+        assert!(row.is_root_cause());
+        assert!(!row.describe().contains("Consequência"));
+    }
+
+    /// SPEC-PROBE-IP-043 — 12 h de feed UDP puro sem **um** evento de RTP ou
+    /// FEC, mesmo com a camada IP medindo o tempo todo.
+    #[test]
+    fn spec_probe_ip_043_udp_feed_opens_no_rtp_or_fec_event() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        for _ in 0..200 {
+            let events = eng.tick(TickInput {
+                encapsulation: Encapsulation::Udp,
+                ip: Some(IpTick {
+                    encapsulation: Encapsulation::Udp,
+                    datagrams: 1_400,
+                    bytes: 1_842_400,
+                    rtp: None,
+                    ..Default::default()
+                }),
+                ..connected_input(metrics(15_000.0, &[], 0))
+            });
+            for ev in &events {
+                let layer = crate::layer_of(&ev.check_id);
+                assert_ne!(
+                    layer,
+                    Some(Layer::Rtp),
+                    "feed UDP puro não pode abrir {}",
+                    ev.check_id
+                );
+            }
+            clock.advance(Duration::from_secs(1));
+        }
+
+        let snap = eng.snapshot(SeriesWindow::WholeSession);
+        assert_eq!(
+            snap.layer_health.get(&Layer::Rtp),
+            Some(&LayerHealth::NotApplicable),
+            "a camada RTP fica n/a, nunca verde"
+        );
+        assert_eq!(snap.layer_health.get(&Layer::Ip), Some(&LayerHealth::Ok));
+    }
+
+    /// SPEC-PROBE-IP-048 — com RTP presente a grade ganha **duas** linhas de
+    /// rede; num feed UDP puro continua com uma, sem faixa fantasma.
+    #[test]
+    fn spec_probe_ip_048_rtp_feed_splits_the_network_row() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        for _ in 0..3 {
+            eng.tick(TickInput {
+                ip: Some(ip_tick(3)),
+                ..connected_input(metrics(15_000.0, &[], 0))
+            });
+            clock.advance(Duration::from_secs(1));
+        }
+        let snap = eng.snapshot(SeriesWindow::WholeSession);
+        assert!(!snap.ip_timeline.is_empty(), "linha IP / UDP");
+        assert!(!snap.rtp_timeline.is_empty(), "linha RTP / FEC");
+        assert_eq!(
+            snap.rtp_timeline[0].worst,
+            Some(Severity::Error),
+            "a perda acende a linha de RTP, não a de IP"
+        );
+        assert_eq!(
+            snap.ip_timeline[0].worst, None,
+            "o datagrama chegou; a linha IP fica verde"
+        );
+
+        // Um feed UDP puro não tem linha de RTP nenhuma.
+        let clock = Arc::new(TestClock::new());
+        let mut udp = engine(clock.clone());
+        for _ in 0..3 {
+            udp.tick(TickInput {
+                encapsulation: Encapsulation::Udp,
+                ..connected_input(metrics(15_000.0, &[], 0))
+            });
+            clock.advance(Duration::from_secs(1));
+        }
+        let snap = udp.snapshot(SeriesWindow::WholeSession);
+        assert!(!snap.ip_timeline.is_empty());
+        assert!(
+            snap.rtp_timeline.is_empty(),
+            "sem RTP não pode existir faixa de RTP"
+        );
+    }
+
+    /// SPEC-PROBE-IP-006 — um pico de inter-arrival abaixo de `k × piso de
+    /// ruído` não abre alarme; acima dele, abre reportando o pico **real**.
+    #[test]
+    fn spec_probe_ip_006_iat_alarm_respects_the_measured_noise_floor() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        // Piso de 4 ms ⇒ limiar efetivo de 12 ms, acima dos 5 ms do perfil.
+        let with_iat = |max_us: f64| TickInput {
+            ip: Some(IpTick {
+                iat: net::IatSummary {
+                    count: 1_400,
+                    max_us: Some(max_us),
+                    ..Default::default()
+                },
+                noise_floor_us: Some(4_000.0),
+                ..ip_tick(0)
+            }),
+            ..connected_input(metrics(15_000.0, &[], 0))
+        };
+
+        // 8 ms passa dos 5 ms do perfil, mas não dos 12 ms efetivos.
+        for _ in 0..20 {
+            let events = eng.tick(with_iat(8_000.0));
+            assert!(
+                !events.iter().any(|e| e.check_id == CHECK_IAT_MAX),
+                "notebook carregado não pode virar falso positivo de jitter"
+            );
+            clock.advance(Duration::from_secs(1));
+        }
+
+        let mut opened = None;
+        for _ in 0..20 {
+            for ev in eng.tick(with_iat(50_000.0)) {
+                if ev.check_id == CHECK_IAT_MAX && ev.phase == EventPhase::Open {
+                    opened = Some(ev);
+                }
+            }
+            clock.advance(Duration::from_secs(1));
+        }
+        let ev = opened.expect("50 ms passa de qualquer piso razoável");
+        assert!(
+            (ev.measured - 50_000.0).abs() < 1.0,
+            "o evento precisa reportar o pico real, não o limiar: {}",
+            ev.measured
+        );
     }
 
     /// SPEC-PROBE-004 — `finish` fecha os eventos abertos e resume a sessão.

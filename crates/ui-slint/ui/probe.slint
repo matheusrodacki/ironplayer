@@ -139,6 +139,19 @@ export struct ProbeInfoRow {
     value: string,
 }
 
+/// Uma barra do histograma de inter-arrival da aba `Rede`.
+///
+/// SPEC-PROBE-IP-026 · SPEC-PROBE-IP-047 — a altura já vem normalizada do Rust;
+/// o Slint só desenha.
+export struct ProbeHistBar {
+    /// Altura relativa, 0..1.
+    frac: float,
+    /// Rótulo do eixo; vazio nas barras sem marca.
+    label: string,
+    /// Realce da barra que contém o p99.
+    highlight: bool,
+}
+
 /// Um gráfico de sessão (SPEC-PROBE-010).
 export struct ProbeChart {
     title: string,
@@ -1533,7 +1546,207 @@ component ProbeSidePanel inherits Rectangle {
     }
 }
 
-// ─── Nível 1: feed (Resumo | Serviços) ──────────────────────────────────────
+// ─── Nível 1, aba Rede: a camada IP inteira (spec-14 §5.7) ──────────────────
+
+/// Coluna de chave/valor de um bloco da aba `Rede`.
+component NetworkColumn inherits Rectangle {
+    in property <string> title;
+    in property <[ProbeInfoRow]> rows;
+    /// Bloco inaplicável a este feed: cinza de `n/a`, distinto de "sem dado".
+    ///
+    /// SPEC-PROBE-IP-002 · SPEC-PROBE-IP-049
+    in property <bool> not-applicable: false;
+    in property <string> not-applicable-hint;
+
+    background: Theme.panel;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    cache-rendering-hint: true;
+
+    Flickable {
+        viewport-height: col.preferred-height;
+        col := VerticalLayout {
+            padding: 12px;
+            spacing: 6px;
+
+            ProbeSectionHeader {
+                title: root.title;
+            }
+
+            if root.not-applicable: Text {
+                text: root.not-applicable-hint;
+                color: Theme.text-faint;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+
+            if !root.not-applicable: VerticalLayout {
+                spacing: 4px;
+                for r in root.rows: HorizontalLayout {
+                    height: 18px;
+                    spacing: 8px;
+                    Text {
+                        text: r.key;
+                        color: Theme.text-dim;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+
+                    Text {
+                        text: r.value;
+                        color: Theme.text;
+                        font-size: 11px;
+                        font-family: Theme.mono;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Histograma log-espaçado de inter-arrival (SPEC-PROBE-IP-026).
+component InterArrivalHistogram inherits Rectangle {
+    in property <[ProbeHistBar]> bars;
+    in property <string> caption;
+
+    background: Theme.panel;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        ProbeSectionHeader {
+            title: "INTER-ARRIVAL";
+            trailing: root.caption;
+        }
+
+        if root.bars.length == 0: Text {
+            text: "aguardando datagramas…";
+            color: Theme.text-faint;
+            font-size: 11px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+            vertical-stretch: 1;
+        }
+
+        if root.bars.length > 0: plot := Rectangle {
+            vertical-stretch: 1;
+            for b[i] in root.bars: Rectangle {
+                // Barras de largura igual, ancoradas na base do gráfico.
+                width: plot.width / root.bars.length;
+                x: i * (plot.width / root.bars.length);
+                height: max(1px, plot.height * b.frac);
+                y: plot.height - self.height;
+                background: b.highlight ? Theme.accent : Theme.text-dim;
+                opacity: b.highlight ? 1.0 : 0.55;
+            }
+        }
+
+        // Régua: posicionamento explícito, e não um `HorizontalLayout` cuja
+        // largura dependa da largura do pai — isso fecharia um laço de binding
+        // que o Slint aceita mas avisa que vai virar panic.
+        axis := Rectangle {
+            height: 12px;
+            for b[i] in root.bars: Text {
+                width: axis.width / max(root.bars.length, 1);
+                x: i * (axis.width / max(root.bars.length, 1));
+                text: b.label;
+                color: Theme.text-faint;
+                font-size: 9px;
+                horizontal-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+/// Aba `Rede` do nível 1 — onde toda a camada IP vive.
+///
+/// SPEC-PROBE-IP-047 — reúne encapsulamento, fontes, datagramas, taxa IP,
+/// TS/datagrama, interface e `SO_RCVBUF` efetivos, piso de ruído, contadores
+/// RTP, histograma de inter-arrival e matriz FEC.
+/// SPEC-PROBE-IP-047a — nada disto entra na barra lateral do `Resumo`, que
+/// continua respondendo "o transporte está bom?" em uma tela.
+component ProbeNetworkTab inherits Rectangle {
+    in property <[ProbeInfoRow]> input-rows;
+    in property <[ProbeInfoRow]> rtp-rows;
+    in property <[ProbeInfoRow]> fec-rows;
+    in property <[ProbeHistBar]> histogram;
+    in property <string> histogram-caption;
+    in property <bool> rtp-applicable: true;
+    in property <bool> fec-applicable: true;
+    in property <string> rtp-hint;
+    in property <string> fec-hint;
+    in property <string> help;
+
+    VerticalLayout {
+        spacing: 12px;
+
+        HorizontalLayout {
+            vertical-stretch: 3;
+            spacing: 12px;
+
+            NetworkColumn {
+                horizontal-stretch: 1;
+                title: "ENTRADA";
+                rows: root.input-rows;
+            }
+
+            NetworkColumn {
+                horizontal-stretch: 1;
+                title: "RTP";
+                rows: root.rtp-rows;
+                not-applicable: !root.rtp-applicable;
+                not-applicable-hint: root.rtp-hint;
+            }
+
+            NetworkColumn {
+                horizontal-stretch: 1;
+                title: "FEC · ST 2022-1";
+                rows: root.fec-rows;
+                not-applicable: !root.fec-applicable;
+                not-applicable-hint: root.fec-hint;
+            }
+        }
+
+        InterArrivalHistogram {
+            vertical-stretch: 2;
+            bars: root.histogram;
+            caption: root.histogram-caption;
+        }
+
+        // SPEC-PROBE-IP-044 — num feed UDP puro a ajuda diz, com todas as
+        // letras, por que a perda não é observável ali.
+        if root.help != "": Rectangle {
+            height: 34px;
+            background: Theme.panel-alt;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: Theme.border;
+            Text {
+                x: 10px;
+                width: parent.width - 20px;
+                text: root.help;
+                color: Theme.text-dim;
+                font-size: 11px;
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+// ─── Nível 1: feed (Resumo | Serviços | Rede) ───────────────────────────────
 
 /// Tile do mosaico de serviços.
 ///
@@ -1678,6 +1891,17 @@ export component ProbeFeedView inherits Rectangle {
     in property <[ProbeEventRow]> events;
     in property <[ProbeInfoRow]> summary;
     in property <[ProbeInfoRow]> health;
+    // ── Aba `Rede` (SPEC-PROBE-IP-047) ─────────────────────────────────
+    in property <[ProbeInfoRow]> net-input;
+    in property <[ProbeInfoRow]> net-rtp;
+    in property <[ProbeInfoRow]> net-fec;
+    in property <[ProbeHistBar]> net-histogram;
+    in property <string> net-histogram-caption;
+    in property <bool> net-rtp-applicable: true;
+    in property <bool> net-fec-applicable: true;
+    in property <string> net-rtp-hint;
+    in property <string> net-fec-hint;
+    in property <string> net-help;
     in property <int> window-index: 1;
     in property <string> severity-filter: "todas";
     callback back();
@@ -1726,7 +1950,10 @@ export component ProbeFeedView inherits Rectangle {
             height: 30px;
             spacing: 6px;
             alignment: start;
-            for t[i] in ["Resumo", "Serviços"]: Rectangle {
+            // SPEC-PROBE-IP-047 — a terceira aba: toda a camada IP vive no
+            // nível 1, porque é o feed que tem socket.  Um serviço do multiplex
+            // não tem camada IP própria.
+            for t[i] in ["Resumo", "Serviços", "Rede"]: Rectangle {
                 width: 118px;
                 border-radius: 4px;
                 background: root.tab == i ? Theme.accent : Theme.panel-alt;
@@ -1834,6 +2061,21 @@ export component ProbeFeedView inherits Rectangle {
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
+        }
+
+        // ── Aba Rede: a camada IP inteira ──────────────────────────────
+        if root.tab == 2: ProbeNetworkTab {
+            vertical-stretch: 1;
+            input-rows: root.net-input;
+            rtp-rows: root.net-rtp;
+            fec-rows: root.net-fec;
+            histogram: root.net-histogram;
+            histogram-caption: root.net-histogram-caption;
+            rtp-applicable: root.net-rtp-applicable;
+            fec-applicable: root.net-fec-applicable;
+            rtp-hint: root.net-rtp-hint;
+            fec-hint: root.net-fec-hint;
+            help: root.net-help;
         }
     }
 }

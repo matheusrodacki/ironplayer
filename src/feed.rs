@@ -25,11 +25,12 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use crossbeam_channel::bounded;
 use net::{
-    NetEvent, ReceiverConfig, RtpStripper, StopHandle as NetStopHandle, StopToken as NetStopToken,
-    StreamUrl, UdpReceiver,
+    Datagram, NetEvent, PacketSource, ReceiverConfig, SocketSource, SocketSourceConfig,
+    SourceBinding, StopHandle as NetStopHandle, StopToken as NetStopToken, StreamUrl, UdpReceiver,
 };
 use probe::{
-    Encapsulation, FecMode, ProbeConfig, ServiceInfo, ServiceStream, ServiceVisual, StreamKind,
+    Encapsulation, FecMode, IpAnalyzer, IpAnalyzerConfig, IpTick, ProbeConfig, ServiceInfo,
+    ServiceStream, ServiceVisual, StreamKind,
 };
 use ts::aggregator::{
     AggregatorNetEvent, MetricsAggregator, SnapshotReceiver, StopHandle as MetricsStopHandle,
@@ -51,6 +52,16 @@ pub const MAX_FEEDS: usize = probe::MAX_FEEDS;
 /// num stream de 15 Mbps já seria anômalo, mas exigir dois evita marcar
 /// indisponibilidade por um hiccup de agendamento da própria probe.
 const OFFLINE_AFTER: Duration = Duration::from_millis(2_000);
+
+/// Piso da janela em que os joins de FEC ficam abertos sem tráfego.
+///
+/// SPEC-PROBE-IP-030 manda liberar o join extra "após `detect_secs`" quando não
+/// há FEC.  Com o default de 3 s isso tornaria SPEC-PROBE-IP-037 inalcançável —
+/// os eventos de FEC ausente/inesperada têm debounce de ≥ 10 s, e a probe teria
+/// parado de escutar antes de qualquer um deles poder concluir.  O piso
+/// reconcilia os dois: solta o grupo que não existe, mas só depois de o
+/// diagnóstico sobre ele ter tido chance de fechar.
+const FEC_PROBE_GRACE: Duration = Duration::from_secs(15);
 
 /// Descrição de um feed a instanciar.
 #[derive(Debug, Clone)]
@@ -181,6 +192,15 @@ pub struct FeedShared {
     snapshot_state: AtomicU32,
     /// Thumbnail suspenso pelo 1º estágio de degradação (SPEC-PROBE-013a).
     snapshot_suspended: AtomicBool,
+    /// Análise da camada 1 (spec-14).
+    ///
+    /// Compartilhado entre a thread de recepção — que o alimenta datagrama a
+    /// datagrama — e a de engine, que fecha a janela uma vez por segundo.  O
+    /// `Mutex` é tomado ~1 400 vezes por segundo sem contenção real, e a única
+    /// alternativa (canal por datagrama) custaria uma alocação por pacote.
+    ip: Mutex<IpAnalyzer>,
+    /// Parâmetros efetivos do join principal (SPEC-PROBE-IP-013 · IP-051).
+    binding: Mutex<Option<SourceBinding>>,
 }
 
 /// `Encapsulation` guardado num átomo.
@@ -216,8 +236,10 @@ impl AtomicU8Encap {
 }
 
 impl FeedShared {
-    fn new() -> Self {
+    fn new(ip: IpAnalyzerConfig) -> Self {
         Self {
+            ip: Mutex::new(IpAnalyzer::new(ip)),
+            binding: Mutex::new(None),
             epoch: Instant::now(),
             last_packet_ms: AtomicU64::new(0),
             packets: AtomicU64::new(0),
@@ -376,6 +398,66 @@ impl FeedShared {
     pub fn set_snapshot_suspended(&self, suspended: bool) {
         self.snapshot_suspended.store(suspended, Ordering::Relaxed);
     }
+
+    /// Fecha a janela da camada IP e devolve a fotografia do segundo.
+    ///
+    /// `None` enquanto nenhum datagrama chegou: sem pacote não há o que
+    /// afirmar, e publicar zeros faria a planilha dizer "medido e deu zero"
+    /// sobre um feed que nunca ligou (§6).
+    ///
+    /// SPEC-PROBE-IP-011
+    pub fn take_ip_tick(&self, bitrate_kbps: f64) -> Option<IpTick> {
+        let mut guard = self.ip.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .has_data()
+            .then(|| guard.take_tick(Instant::now(), bitrate_kbps))
+    }
+
+    /// Piso de ruído medido pela camada IP (SPEC-PROBE-IP-005).
+    pub fn noise_floor_us(&self) -> Option<f64> {
+        self.ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .noise_floor_us()
+    }
+
+    /// Parâmetros efetivos do join principal.
+    ///
+    /// SPEC-PROBE-IP-013 · SPEC-PROBE-IP-051
+    pub fn binding(&self) -> Option<SourceBinding> {
+        *self.binding.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_binding(&self, binding: SourceBinding) {
+        *self.binding.lock().unwrap_or_else(|e| e.into_inner()) = Some(binding);
+        self.so_rcvbuf
+            .store(binding.so_rcvbuf_bytes, Ordering::Relaxed);
+    }
+
+    /// Alimenta a camada IP com um datagrama do fluxo principal e devolve o
+    /// payload TS a repassar ao demux.
+    fn on_datagram(&self, datagram: &Datagram) -> Option<Bytes> {
+        let (payload, observed) = {
+            let mut ip = self.ip.lock().unwrap_or_else(|e| e.into_inner());
+            (ip.on_datagram(datagram), ip.encapsulation())
+        };
+        // O encapsulamento publicado acompanha o detectado pela camada IP, que
+        // é o único que olha para o tráfego em vez do esquema da URL.
+        if observed != Encapsulation::Unknown {
+            self.encapsulation.set(observed);
+        }
+        payload
+    }
+
+    /// Alimenta a camada IP com um datagrama de um dos grupos de FEC.
+    ///
+    /// SPEC-PROBE-IP-031 … SPEC-PROBE-IP-036
+    fn on_fec_datagram(&self, datagram: &Datagram) {
+        self.ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_fec_datagram(datagram);
+    }
 }
 
 /// Derivação do snapshot de vídeo a partir do PES do feed.
@@ -462,7 +544,7 @@ enum DemuxRoute {
 /// feed 1 não pode fechar o `net_raw` do feed 0 (§5.2).
 #[allow(dead_code)]
 struct FeedSenderGuard {
-    net_raw_tx: BoundedSender<Bytes>,
+    net_raw_tx: BoundedSender<Datagram>,
     section_data_tx: BoundedSender<ts::SectionData>,
     ts_events_tx: BoundedSender<ts::TsEvent>,
     complete_sections_tx: BoundedSender<CompleteSection>,
@@ -474,16 +556,26 @@ impl FeedPipeline {
     /// SPEC-PROBE-017
     pub fn spawn(spec: FeedSpec, cfg: &ProbeConfig, receiver_cfg: ReceiverConfig) -> Self {
         let slot = spec.slot;
-        let shared = Arc::new(FeedShared::new());
+        // O encapsulamento **declarado** vem da URL; o observado vem do
+        // tráfego, e é ele que vale (SPEC-PROBE-IP-045).
+        let declared = match spec.url {
+            StreamUrl::UdpMulticast { .. } => Encapsulation::Udp,
+            StreamUrl::RtpMulticast { .. } => Encapsulation::Rtp,
+        };
+        let shared = Arc::new(FeedShared::new(IpAnalyzerConfig::from_config(
+            cfg, spec.fec, declared,
+        )));
         shared
             .so_rcvbuf
             .store(receiver_cfg.buf_size, Ordering::Relaxed);
-        // O encapsulamento nominal vem da URL; a detecção em runtime (RTP com
-        // ou sem FEC) refina isso no `rtp-strip` (SPEC-PROBE-018a).
-        shared.encapsulation.set(match spec.url {
-            StreamUrl::UdpMulticast { .. } => Encapsulation::Udp,
-            StreamUrl::RtpMulticast { .. } => Encapsulation::Rtp,
-        });
+        shared.encapsulation.set(declared);
+
+        // Os sockets de FEC nascem com o mesmo `SO_RCVBUF` do principal e um
+        // timeout curto, para responderem ao stop sem segurar o shutdown.
+        let fec_socket_cfg = SocketSourceConfig {
+            buf_size: receiver_cfg.buf_size,
+            timeout: Duration::from_millis(receiver_cfg.timeout_ms.min(500)),
+        };
 
         let stop = Arc::new(AtomicBool::new(false));
         let net_stop: Arc<Mutex<Option<NetStopHandle>>> = Arc::new(Mutex::new(None));
@@ -492,7 +584,10 @@ impl FeedPipeline {
         // Capacidades iguais às do pipeline global (SPEC-CHAN-001); os nomes
         // ganham sufixo de slot para que o log de backpressure identifique o
         // feed (§5.2).
-        let (net_raw_tx, net_raw_rx) = bounded::<Bytes>(crate::channels::CAP_NET_RAW);
+        // SPEC-PROBE-IP-004 · SPEC-PROBE-IP-009 — o canal carrega o datagrama
+        // inteiro, com o instante de chegada e o endereço de origem: sem eles
+        // não há inter-arrival nem detecção de múltiplas fontes.
+        let (net_raw_tx, net_raw_rx) = bounded::<Datagram>(crate::channels::CAP_NET_RAW);
         let (ts_raw_tx, ts_raw_rx) = bounded::<Bytes>(crate::channels::CAP_TS_RAW);
         let (section_data_tx, section_data_rx) =
             bounded::<ts::SectionData>(crate::channels::CAP_SECTION_DATA);
@@ -503,7 +598,6 @@ impl FeedPipeline {
         let (complete_sections_tx, complete_sections_rx) =
             bounded::<CompleteSection>(crate::channels::CAP_COMPLETE_SECTIONS);
         let (net_events_tx, net_events_rx) = bounded::<NetEvent>(crate::channels::CAP_NET_EVENTS);
-        let (rtp_events_tx, rtp_events_rx) = bounded::<net::RtpEvent>(64);
         // Registros de roteamento PAT/PMT → demuxer. Capacidade folgada: só
         // recebe tráfego quando a PSI muda.
         let (route_tx, route_rx) = bounded::<DemuxRoute>(256);
@@ -565,7 +659,7 @@ impl FeedPipeline {
                     let (token, handle) = NetStopToken::new();
                     *net_stop_t.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 
-                    let receiver = UdpReceiver::new(
+                    let receiver = UdpReceiver::with_datagrams(
                         url.clone(),
                         raw_tx.clone(),
                         events_tx.clone(),
@@ -613,65 +707,99 @@ impl FeedPipeline {
         // ── net-events-{slot}: dreno dos eventos do receptor ────────────
         {
             let shared_t = shared.clone();
-            let agg_tx = agg_net_tx.clone();
             handles.push(thread(format!("net-events-{slot}"), move || {
                 for evt in net_events_rx.iter() {
                     match evt {
                         NetEvent::Timeout => {
                             tracing::debug!(slot, "net-recv: timeout de recepção");
                         }
-                        NetEvent::Started | NetEvent::Stopped => {}
+                        // SPEC-PROBE-IP-013 · SPEC-PROBE-IP-051 — a interface e
+                        // o `SO_RCVBUF` **efetivos** do join são o que vai para
+                        // o `session.toml`.  Foi a falta deles que custou uma
+                        // sessão inteira procurando regressão no código quando
+                        // o multicast estava preso num adaptador virtual.
+                        NetEvent::Joined(binding) => {
+                            tracing::info!(
+                                slot,
+                                group = %binding.group,
+                                port = binding.port,
+                                iface = %binding.iface_label(),
+                                so_rcvbuf = binding.so_rcvbuf_bytes,
+                                "net-recv: join efetivo"
+                            );
+                            shared_t.set_binding(binding);
+                        }
+                        NetEvent::JoinFailed { reason } => {
+                            tracing::warn!(slot, %reason, "net-recv: falha de join");
+                        }
+                        NetEvent::SourceSeen(addr) => {
+                            tracing::info!(slot, source = %addr, "net-recv: nova fonte no grupo");
+                        }
+                        NetEvent::Left | NetEvent::Started | NetEvent::Stopped => {}
                     }
-                    // Overflow de buffer UDP, quando o crate `net` passar a
-                    // reportá-lo, entra aqui como descarte local.
-                    let _ = (&shared_t, &agg_tx);
                 }
             }));
         }
 
-        // ── rtp-strip-{slot}: header RTP + detecção de encapsulamento ───
+        // ── ip-analyze-{slot}: camada 1 completa (spec-14) ──────────────
         {
             let shared_t = shared.clone();
             let ts_raw = ts_raw_tx.clone();
-            let agg_tx = agg_net_tx.clone();
-            handles.push(thread(format!("rtp-strip-{slot}"), move || {
-                let mut stripper = RtpStripper::new(rtp_events_tx);
-                let mut classified = false;
-
-                while let Ok(bytes) = net_raw_rx.recv() {
+            // O `RtpStripper` (SPEC-NET-003) não participa deste caminho: a
+            // contagem de perda vem da máquina de sequência por SSRC, que é
+            // exata, e manter os dois abriria dois alarmes para o mesmo pacote.
+            handles.push(thread(format!("ip-analyze-{slot}"), move || {
+                while let Ok(datagram) = net_raw_rx.recv() {
                     shared_t.mark_packet();
-
-                    // SPEC-PROBE-018a — o encapsulamento é detectado em
-                    // runtime, não deduzido apenas do esquema da URL: um
-                    // `rtp://` que na verdade entrega TS puro precisa ficar
-                    // com os checks de RTP em `n/a`, não verdes.
-                    if !classified {
-                        if let Some(first) = bytes.first() {
-                            shared_t.encapsulation.set(if *first == 0x47 {
-                                Encapsulation::Udp
-                            } else {
-                                Encapsulation::Rtp
-                            });
-                            classified = true;
-                        }
-                    }
-
-                    let stripped = stripper.strip(bytes);
-                    if !stripped.is_empty() && !ts_raw.try_send(stripped) {
+                    // Duplicata RTP e payload malformado param aqui: repassá-los
+                    // ao demux produziria erro de continuidade que não existe no
+                    // stream (SPEC-PROBE-IP-017 · SPEC-PROBE-IP-022).
+                    let Some(payload) = shared_t.on_datagram(&datagram) else {
+                        continue;
+                    };
+                    if !payload.is_empty() && !ts_raw.try_send(payload) {
                         shared_t.add_local_drops(1);
                     }
-
-                    while let Ok(evt) = rtp_events_rx.try_recv() {
-                        let agg_evt = match evt {
-                            net::RtpEvent::OutOfOrder { .. } => AggregatorNetEvent::RtpOutOfOrder,
-                        };
-                        if agg_tx.try_send(agg_evt).is_err() {
-                            shared_t.add_local_drops(1);
-                        }
-                    }
                 }
-                tracing::info!(slot, "rtp-strip: encerrado");
+                tracing::info!(slot, "ip-analyze: encerrado");
             }));
+        }
+
+        // ── fec-recv-{slot}-{eixo}: joins de FEC em base+2/+4 ───────────
+        //
+        // SPEC-PROBE-IP-030a — independentes do join principal: um grupo de FEC
+        // inexistente não pode derrubar a recepção do feed.
+        // SPEC-PROBE-IP-030b · SPEC-PROBE-IP-051 — a interface é a **mesma** do
+        // join principal; caindo na interface default enquanto o principal está
+        // fixado, a FEC apareceria como ausente por motivo de rota, e não de
+        // stream — um falso negativo caro.
+        if let Some((column, row)) = spec.fec.ports(spec.group_port().1, cfg.fec.port_offsets) {
+            let (group, iface, source) = match spec.url {
+                StreamUrl::UdpMulticast {
+                    group,
+                    iface,
+                    source,
+                    ..
+                }
+                | StreamUrl::RtpMulticast {
+                    group,
+                    iface,
+                    source,
+                    ..
+                } => (group, iface, source),
+            };
+            let grace = cfg.detect_window().max(FEC_PROBE_GRACE);
+            let socket_cfg = fec_socket_cfg;
+            for (axis, port) in [("col", column), ("row", row)] {
+                let shared_t = shared.clone();
+                let stop_flag = stop.clone();
+                handles.push(thread(format!("fec-recv-{slot}-{axis}"), move || {
+                    fec_receive_loop(
+                        slot, axis, group, port, iface, source, socket_cfg, grace, &shared_t,
+                        &stop_flag,
+                    );
+                }));
+            }
         }
 
         // ── ts-demux-{slot} ─────────────────────────────────────────────
@@ -810,6 +938,72 @@ impl Drop for FeedPipeline {
             self.shutdown();
         }
     }
+}
+
+/// Loop de recepção de um dos grupos de FEC.
+///
+/// Três regras que este loop materializa:
+///
+/// - Falha de join **não** derruba o feed: loga, deixa `fec_present = false` e
+///   encerra a thread (SPEC-PROBE-IP-030a).
+/// - A interface é a do join principal (SPEC-PROBE-IP-030b · IP-051).
+/// - Sem tráfego em `grace`, o join extra é liberado (SPEC-PROBE-IP-030) — não
+///   faz sentido segurar uma associação IGMP num grupo que não existe.
+#[allow(clippy::too_many_arguments)]
+fn fec_receive_loop(
+    slot: usize,
+    axis: &str,
+    group: std::net::Ipv4Addr,
+    port: u16,
+    iface: Option<std::net::Ipv4Addr>,
+    source: Option<std::net::Ipv4Addr>,
+    cfg: SocketSourceConfig,
+    grace: Duration,
+    shared: &FeedShared,
+    stop: &AtomicBool,
+) {
+    let mut socket = match SocketSource::join(group, port, iface, source, cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                slot, axis, %group, port, error = %e,
+                "fec-recv: join falhou — a FEC fica ausente, a recepção do feed segue intacta"
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        slot, axis, %group, port,
+        iface = %socket.binding().iface_label(),
+        "fec-recv: escutando"
+    );
+
+    let mut buf = vec![0u8; 65_536];
+    let deadline = Instant::now() + grace;
+    let mut seen = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        match socket.recv(&mut buf) {
+            Ok(Some(datagram)) => {
+                seen = true;
+                shared.on_fec_datagram(&datagram);
+            }
+            Ok(None) => {
+                if !seen && Instant::now() >= deadline {
+                    tracing::info!(
+                        slot, axis, %group, port,
+                        "fec-recv: sem tráfego na janela de detecção — liberando o join"
+                    );
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(slot, axis, error = %e, "fec-recv: erro de recepção — encerrando");
+                break;
+            }
+        }
+    }
+    socket.leave();
 }
 
 /// Regra de disponibilidade, isolada para ser testável sem esperar 2 s de
@@ -1092,6 +1286,11 @@ mod tests {
     use super::*;
     use probe::FeedConfig;
 
+    /// Camada IP de bancada: os defaults do perfil, com feed declarado RTP.
+    fn test_ip_config() -> IpAnalyzerConfig {
+        IpAnalyzerConfig::from_config(&ProbeConfig::default(), FecMode::Auto, Encapsulation::Rtp)
+    }
+
     fn cfg_with(urls: &[&str]) -> ProbeConfig {
         ProbeConfig {
             feeds: urls
@@ -1105,6 +1304,75 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// SPEC-PROBE-IP-030 · SPEC-PROBE-IP-051 — os grupos de FEC saem da porta
+    /// do próprio feed (`base+2` coluna, `base+4` linha) e herdam a interface
+    /// do join principal.
+    ///
+    /// A regressão que este teste evita é cara: com os joins de FEC caindo na
+    /// interface default enquanto o principal está fixado em `?iface=`, a FEC
+    /// aparece como ausente por motivo de **rota**, não de stream — e o
+    /// diagnóstico aponta para o lugar errado.
+    #[test]
+    fn spec_probe_ip_051_fec_joins_inherit_port_and_interface_from_the_feed() {
+        let cfg = ProbeConfig::default();
+        let feeds = resolve_feeds(&cfg_with(&["rtp://@239.15.0.183:50000?iface=10.0.0.7"]))
+            .expect("feed válido");
+        let spec = &feeds[0];
+
+        let (group, port) = spec.group_port();
+        assert_eq!(port, 50_000);
+        assert_eq!(
+            spec.fec.ports(port, cfg.fec.port_offsets),
+            Some((50_002, 50_004)),
+            "convenção do ST 2022-1 confirmada com a operação"
+        );
+
+        let iface = match spec.url {
+            StreamUrl::UdpMulticast { iface, .. } | StreamUrl::RtpMulticast { iface, .. } => iface,
+        };
+        assert_eq!(iface, Some("10.0.0.7".parse().expect("iface")));
+        assert_eq!(group, "239.15.0.183".parse::<std::net::Ipv4Addr>().expect("grupo"));
+
+        // `fec = off` não abre join nenhum.
+        let mut off = spec.clone();
+        off.fec = FecMode::Off;
+        assert_eq!(off.fec.ports(port, cfg.fec.port_offsets), None);
+    }
+
+    /// SPEC-PROBE-IP-030a — falha no join de FEC não derruba a recepção do
+    /// feed: o loop encerra sozinho, sem panic, e a camada IP segue sem FEC.
+    #[test]
+    fn spec_probe_ip_030a_fec_join_failure_does_not_stop_the_feed() {
+        let shared = FeedShared::new(test_ip_config());
+        let stop = AtomicBool::new(false);
+        // Interface que não existe na máquina: o join falha na hora.
+        let bogus: std::net::Ipv4Addr = "203.0.113.9".parse().expect("iface");
+
+        let started = Instant::now();
+        fec_receive_loop(
+            0,
+            "col",
+            "239.255.31.1".parse().expect("grupo"),
+            56_502,
+            Some(bogus),
+            None,
+            SocketSourceConfig {
+                buf_size: 65_536,
+                timeout: Duration::from_millis(50),
+            },
+            Duration::from_millis(100),
+            &shared,
+            &stop,
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a falha de join precisa ser imediata, não travar o slot"
+        );
+        let tick = shared.ip.lock().expect("mutex").take_tick(Instant::now(), 15_000.0);
+        assert!(!tick.fec.present, "sem join não há FEC a reportar");
     }
 
     /// SPEC-PROBE-017 — feeds válidos viram slots 0..n na ordem do TOML.
@@ -1230,7 +1498,7 @@ fec  = "off"
     #[test]
     fn spec_probe_005_psi_registers_demux_routing_for_elementary_pids() {
         let (tx, rx) = bounded::<DemuxRoute>(64);
-        let shared = FeedShared::new();
+        let shared = FeedShared::new(test_ip_config());
         let mut tables = FeedTables::default();
 
         // PAT: programa 1 → PMT no PID 0x0100; programa 0 → NIT no PID 0x0010.
@@ -1294,7 +1562,7 @@ fec  = "off"
     #[test]
     fn spec_probe_021_psi_builds_the_service_inventory() {
         let (tx, rx) = bounded::<DemuxRoute>(64);
-        let shared = FeedShared::new();
+        let shared = FeedShared::new(test_ip_config());
         let mut tables = FeedTables::default();
 
         // PAT: NIT no 0x0010, programa 1 → PMT 0x0100, programa 2 → PMT 0x0101.
@@ -1408,7 +1676,7 @@ fec  = "off"
     #[test]
     fn spec_probe_021_service_removed_from_pat_leaves_the_inventory() {
         let (tx, _rx) = bounded::<DemuxRoute>(64);
-        let shared = FeedShared::new();
+        let shared = FeedShared::new(test_ip_config());
         let mut tables = FeedTables::default();
 
         let pat_two = [
@@ -1445,7 +1713,7 @@ fec  = "off"
     /// keyframe não apaga o badge `HD` que já estava correto.
     #[test]
     fn spec_probe_024_visual_keeps_known_height_across_a_missed_tick() {
-        let shared = FeedShared::new();
+        let shared = FeedShared::new(test_ip_config());
         assert!(shared.visuals().is_empty());
 
         shared.set_visual(
@@ -1510,7 +1778,7 @@ fec  = "off"
         assert!(!is_connected(1, 10_000, 10_000 + limit * 10));
 
         // E o caminho real, ligado ao relógio, concorda.
-        let shared = FeedShared::new();
+        let shared = FeedShared::new(test_ip_config());
         assert!(!shared.connected());
         shared.mark_packet();
         assert!(shared.connected());
@@ -1519,7 +1787,7 @@ fec  = "off"
     /// SPEC-PROBE-013 — descartes locais são contabilizados, nunca silenciosos.
     #[test]
     fn spec_probe_013_local_drops_are_counted() {
-        let shared = FeedShared::new();
+        let shared = FeedShared::new(test_ip_config());
         assert_eq!(shared.local_drops(), 0);
         shared.add_local_drops(3);
         shared.add_local_drops(1);

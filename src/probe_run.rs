@@ -159,9 +159,9 @@ impl ProbeRunner {
                 &self.cfg,
             );
             meta.so_rcvbuf_bytes = pipeline.shared.so_rcvbuf();
-            meta.interface = self
-                .receiver_cfg_iface()
-                .unwrap_or_else(|| "default".to_string());
+            // Interface **declarada** na URL; a efetiva do join sobrescreve isto
+            // assim que o socket entra no grupo (SPEC-PROBE-IP-051).
+            meta.interface = declared_interface(&spec.url);
             if let Err(e) = probe::session::write_session_meta(&dir, &meta) {
                 tracing::warn!(slot, error = %e, "probe: falha ao gravar session.toml");
             }
@@ -251,9 +251,6 @@ impl ProbeRunner {
         Ok(())
     }
 
-    fn receiver_cfg_iface(&self) -> Option<String> {
-        None
-    }
 
     /// Fecha o run, gravando o resumo de cada sessão.
     ///
@@ -360,6 +357,19 @@ impl Drop for ProbeRunner {
     }
 }
 
+/// Interface declarada na URL do feed, ou `default`.
+///
+/// SPEC-PROBE-IP-051 — o valor inicial do `session.toml`, trocado pelo efetivo
+/// assim que o join acontece.
+fn declared_interface(url: &net::StreamUrl) -> String {
+    let iface = match url {
+        net::StreamUrl::UdpMulticast { iface, .. } | net::StreamUrl::RtpMulticast { iface, .. } => {
+            *iface
+        }
+    };
+    iface.map_or_else(|| "default".to_string(), |a| a.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Thread de engine (uma por feed)
 // ---------------------------------------------------------------------------
@@ -391,6 +401,10 @@ fn spawn_engine_thread(mut t: EngineThread) -> Result<std::thread::JoinHandle<()
         .name(name.clone())
         .spawn(move || {
             let mut was_connected = false;
+            // SPEC-PROBE-IP-051 — a interface efetiva vale como diagnóstico
+            // **durante** a sessão, não só no resumo final: se o processo cair,
+            // o `session.toml` já precisa dizer por onde o multicast entrou.
+            let mut binding_persisted = false;
 
             while !t.stop.load(Ordering::Relaxed) {
                 // Dorme até o instante agendado; o desvio vira `sched_jitter_ms`
@@ -417,8 +431,25 @@ fn spawn_engine_thread(mut t: EngineThread) -> Result<std::thread::JoinHandle<()
                 }
                 was_connected = connected;
 
+                if !binding_persisted {
+                    if let Some(binding) = t.shared.binding() {
+                        t.meta.interface = binding.iface_label();
+                        t.meta.so_rcvbuf_bytes = binding.so_rcvbuf_bytes;
+                        if let Err(e) = probe::session::write_session_meta(&t.session_dir, &t.meta) {
+                            tracing::warn!(slot = t.slot, error = %e, "probe: falha ao gravar o join efetivo");
+                        }
+                        binding_persisted = true;
+                    }
+                }
+
+                // SPEC-PROBE-IP-027 — o inter-arrival esperado sai do bitrate
+                // medido pela camada de transporte; derivá-lo do próprio
+                // inter-arrival tornaria a conta circular.
+                let metrics = t.snapshot_rx.borrow();
+                let ip = t.shared.take_ip_tick(metrics.total_bitrate_kbps);
                 let events = t.engine.tick(probe::TickInput {
-                    metrics: Some(t.snapshot_rx.borrow()),
+                    ip,
+                    metrics: Some(metrics),
                     connected,
                     local_drops_total: t.shared.local_drops(),
                     dropped_events_total: 0,
@@ -471,6 +502,16 @@ fn spawn_engine_thread(mut t: EngineThread) -> Result<std::thread::JoinHandle<()
             // Encerramento: fecha os eventos abertos e grava o resumo.
             let summary = t.engine.finish();
             t.meta.encapsulation = t.shared.encapsulation();
+            // SPEC-PROBE-IP-013 · SPEC-PROBE-IP-051 — o `session.toml` carrega a
+            // interface e o `SO_RCVBUF` **efetivos** do join, e o piso de ruído
+            // que a própria probe mediu (SPEC-PROBE-IP-005).  São as três linhas
+            // que transformam "o multicast sumiu" num diagnóstico em vez de uma
+            // sessão inteira procurando regressão no código.
+            if let Some(binding) = t.shared.binding() {
+                t.meta.interface = binding.iface_label();
+                t.meta.so_rcvbuf_bytes = binding.so_rcvbuf_bytes;
+            }
+            t.meta.noise_floor_us = t.shared.noise_floor_us().unwrap_or(0.0);
             t.meta.summary = summary;
             if let Err(e) = probe::session::write_session_meta(&t.session_dir, &t.meta) {
                 tracing::warn!(slot = t.slot, error = %e, "probe: falha ao gravar resumo da sessão");

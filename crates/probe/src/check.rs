@@ -3,13 +3,14 @@
 //! SPEC-PROBE-007 · SPEC-PROBE-008
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
 use crate::config::{CheckOverride, ProbeConfig};
 use crate::event::{EventContext, EventIdGen, EventPhase, ProbeEvent};
-use crate::severity::{Layer, LayerHealth, Severity};
+use crate::severity::{HealthRow, Layer, LayerHealth, Severity};
 
 /// Sentido da comparação com o limiar.
 ///
@@ -123,6 +124,61 @@ pub const CHECK_LOCAL_DROPS: &str = "probe_local_drops";
 pub const CHECK_SCHED_JITTER: &str = "probe_sched_jitter";
 /// Degradação deliberada sob sobrecarga (SPEC-PROBE-013b).
 pub const CHECK_DEGRADED: &str = "probe_degraded";
+
+// ── Camada IP / UDP (spec-14 §5.1 e §5.4) ───────────────────────────────────
+
+/// Mais de uma fonte no mesmo grupo/porta (SPEC-PROBE-IP-010).
+pub const CHECK_MULTI_SOURCE: &str = "multi_source";
+/// Encapsulamento declarado no TOML difere do observado (SPEC-PROBE-IP-045).
+pub const CHECK_ENCAPSULATION_MISMATCH: &str = "encapsulation_mismatch";
+/// Pico de inter-arrival acima do perfil (SPEC-PROBE-IP-025 · IP-006).
+pub const CHECK_IAT_MAX: &str = "iat_max";
+
+// ── Camada RTP (spec-14 §5.2 e §5.3) ────────────────────────────────────────
+
+/// Perda RTP confirmada após a janela de reconciliação (SPEC-PROBE-IP-021).
+pub const CHECK_RTP_MISSING: &str = "rtp_missing";
+/// Razão de perda RTP na janela longa (SPEC-PROBE-IP-021).
+pub const CHECK_RTP_LOSS_RATIO: &str = "rtp_loss_ratio";
+/// Reordenação reconciliada dentro da janela (SPEC-PROBE-IP-020).
+pub const CHECK_RTP_REORDER: &str = "rtp_reorder";
+/// Pacote RTP duplicado (SPEC-PROBE-IP-022).
+pub const CHECK_RTP_DUPLICATE: &str = "rtp_duplicate";
+/// Pacote RTP abaixo da janela de reordenação (SPEC-PROBE-IP-023).
+pub const CHECK_RTP_TOO_OLD: &str = "rtp_too_old";
+/// Reinício da fonte RTP (SPEC-PROBE-IP-024).
+pub const CHECK_RTP_SOURCE_RESTART: &str = "rtp_source_restart";
+/// Troca de SSRC (SPEC-PROBE-IP-019).
+pub const CHECK_RTP_SSRC_CHANGED: &str = "rtp_ssrc_changed";
+/// Payload type fora do perfil (SPEC-PROBE-IP-015).
+pub const CHECK_RTP_INVALID_PT: &str = "rtp_invalid_pt";
+/// Bit de padding presente — proibido pelo perfil ST 2022-2 (SPEC-PROBE-IP-016).
+pub const CHECK_RTP_PADDING: &str = "rtp_padding";
+/// Header de extensão presente — proibido pelo perfil (SPEC-PROBE-IP-016).
+pub const CHECK_RTP_EXTENSION: &str = "rtp_extension";
+/// Bit marker presente — proibido pelo perfil (SPEC-PROBE-IP-016).
+pub const CHECK_RTP_MARKER: &str = "rtp_marker";
+/// Payload não múltiplo de 188 ou sem sync byte (SPEC-PROBE-IP-017).
+pub const CHECK_BAD_PAYLOAD_SIZE: &str = "bad_payload_size";
+/// Pacotes TS por datagrama fora do perfil (SPEC-PROBE-IP-018).
+pub const CHECK_TS_PER_DATAGRAM: &str = "ts_per_datagram";
+
+// ── FEC ST 2022-1 (spec-14 §5.5) ────────────────────────────────────────────
+
+/// L fora da faixa do perfil (SPEC-PROBE-IP-033).
+pub const CHECK_FEC_L_RANGE: &str = "fec_l_range";
+/// D fora da faixa do perfil (SPEC-PROBE-IP-033).
+pub const CHECK_FEC_D_RANGE: &str = "fec_d_range";
+/// L×D acima do teto do perfil (SPEC-PROBE-IP-034).
+pub const CHECK_FEC_LXD: &str = "fec_lxd";
+/// Um único fluxo de FEC onde o perfil espera dois (SPEC-PROBE-IP-035).
+pub const CHECK_FEC_DUAL_STREAM: &str = "fec_dual_stream";
+/// SSRC do fluxo de FEC divergente do principal (SPEC-PROBE-IP-036).
+pub const CHECK_FEC_SSRC_MISMATCH: &str = "fec_ssrc_mismatch";
+/// FEC ausente onde o perfil a declara obrigatória (SPEC-PROBE-IP-037).
+pub const CHECK_FEC_MISSING: &str = "fec_missing";
+/// FEC presente sem o perfil pedir (SPEC-PROBE-IP-037).
+pub const CHECK_FEC_UNEXPECTED: &str = "fec_unexpected";
 
 /// Atalho para as durações do perfil embutido.
 ///
@@ -298,6 +354,328 @@ pub fn default_checks() -> Vec<CheckDef> {
             comparison: Comparison::Above,
             aggregation: Aggregation::Gauge,
         },
+        // ── Camada IP / UDP ─────────────────────────────────────────────
+        CheckDef {
+            id: CHECK_MULTI_SOURCE,
+            layer: Layer::Ip,
+            threshold: 1.0,
+            unit: "fontes",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_ENCAPSULATION_MISMATCH,
+            layer: Layer::Ip,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        // §8 — 50 ms é "Major" na referência; 5 ms já é rajada num CBR cujo
+        // inter-arrival nominal é 700 µs.  O piso de ruído medido pela própria
+        // probe levanta este limiar quando for o caso (SPEC-PROBE-IP-006).
+        CheckDef {
+            id: CHECK_IAT_MAX,
+            layer: Layer::Ip,
+            threshold: 5_000.0,
+            unit: "us",
+            window: secs(1),
+            min_duration: secs(10),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        // ── Camada RTP ──────────────────────────────────────────────────
+        // Perda é pontual: abre imediatamente, mas agrega por minuto no
+        // `summary_window` do motor (§8).
+        CheckDef {
+            id: CHECK_RTP_MISSING,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(60),
+            severity: Severity::Error,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        // 1e-4 é ~2× a razão observada na referência (5,6e-5 em 3 h 34 min);
+        // acima disso é degradação, não o ruído normal de um multicast real.
+        CheckDef {
+            id: CHECK_RTP_LOSS_RATIO,
+            layer: Layer::Rtp,
+            threshold: 1e-4,
+            unit: "ratio",
+            window: secs(300),
+            min_duration: secs(60),
+            clear_duration: secs(60),
+            severity: Severity::Error,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_RTP_REORDER,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(60),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
+            id: CHECK_RTP_DUPLICATE,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(60),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
+            id: CHECK_RTP_TOO_OLD,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(60),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
+            id: CHECK_RTP_SOURCE_RESTART,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "events",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        // Troca de SSRC é mudança de estado observável, não degradação: Info
+        // (mesma classe de PAT/PMT/codec no §5.1 da spec-13).
+        CheckDef {
+            id: CHECK_RTP_SSRC_CHANGED,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "events",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Info,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        // Warning, e não Error, porque a questão 10.2 #6 — se o PT dinâmico da
+        // FEC é 96 fixo na casa — ainda está aberta.
+        CheckDef {
+            id: CHECK_RTP_INVALID_PT,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        // Os três bits proibidos são checks independentes e desligáveis um a um
+        // (SPEC-PROBE-IP-016).  Ficam ligados em `warning`: a questão 10.2 #3 —
+        // se o perfil da casa é ST 2022-2 declarado — está aberta, e observar
+        // primeiro é mais barato do que decidir no escuro.
+        CheckDef {
+            id: CHECK_RTP_PADDING,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
+            id: CHECK_RTP_EXTENSION,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
+            id: CHECK_RTP_MARKER,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
+            id: CHECK_BAD_PAYLOAD_SIZE,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Error,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
+            id: CHECK_TS_PER_DATAGRAM,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "pkts",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        // ── FEC ST 2022-1 ───────────────────────────────────────────────
+        // Severidade máxima `warning` em todo o bloco: os offsets do header e a
+        // regra dos dois fluxos vêm do RFC 2733 e ainda precisam ser conferidos
+        // contra o ST 2022-1 antes de virarem alarme operacional (§5.5).
+        CheckDef {
+            id: CHECK_FEC_L_RANGE,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_FEC_D_RANGE,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_FEC_LXD,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_FEC_DUAL_STREAM,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(10),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_FEC_SSRC_MISMATCH,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        // Debounce de 10 s nos dois: a FEC leva alguns segundos para aparecer
+        // depois do join, e abrir alarme nesse intervalo seria ruído (§5.5).
+        CheckDef {
+            id: CHECK_FEC_MISSING,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(10),
+            clear_duration: secs(30),
+            severity: Severity::Warning,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_FEC_UNEXPECTED,
+            layer: Layer::Rtp,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(10),
+            clear_duration: secs(30),
+            severity: Severity::Info,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
     ]
 }
 
@@ -310,10 +688,22 @@ pub fn default_checks() -> Vec<CheckDef> {
 ///
 /// SPEC-PROBE-023 · SPEC-PROBE-025
 pub fn layer_of(check_id: &str) -> Option<Layer> {
-    default_checks()
-        .into_iter()
-        .find(|d| d.id == check_id)
-        .map(|d| d.layer)
+    // O event log da UI resolve a camada de cada linha a cada repintura; com o
+    // perfil da spec-14 são dezenas de checks e milhares de linhas, e
+    // reconstruir a tabela em cada consulta seria desperdício puro.
+    static INDEX: OnceLock<BTreeMap<&'static str, Layer>> = OnceLock::new();
+    INDEX
+        .get_or_init(|| default_checks().into_iter().map(|d| (d.id, d.layer)).collect())
+        .get(check_id)
+        .copied()
+}
+
+/// Linha da grade em que os eventos de um check aparecem.
+///
+/// SPEC-PROBE-IP-050 — atalho de `layer_of` + [`Layer::health_row`], usado pela
+/// UI e pelo teste de cobertura.
+pub fn health_row_of(check_id: &str) -> Option<HealthRow> {
+    layer_of(check_id).map(Layer::health_row)
 }
 
 /// Perfil resolvido: defaults embutidos + overrides do TOML.
@@ -1086,6 +1476,90 @@ enabled = false
             &[Measurement::counter(CHECK_TS_SYNC_LOSS, 1.0)],
         );
         assert_eq!(eng.worst_open_severity(), Some(Severity::Critical));
+    }
+
+    /// SPEC-PROBE-IP-050 — todo check declarado resolve para uma camada, e
+    /// toda camada com check cai numa superfície visível.
+    ///
+    /// É a falha silenciosa que a spec manda cobrir: um check novo que não
+    /// entre em `default_checks()` produz evento no `events.jsonl` e **nunca**
+    /// aparece na grade — invisível justamente no artefato que se olha depois
+    /// de 12 h de sessão.
+    #[test]
+    fn spec_probe_ip_050_every_check_resolves_to_a_visible_row() {
+        let defs = default_checks();
+        assert!(!defs.is_empty());
+
+        let mut ids = std::collections::HashSet::new();
+        for def in &defs {
+            assert!(ids.insert(def.id), "id duplicado em default_checks: {}", def.id);
+            assert_eq!(
+                layer_of(def.id),
+                Some(def.layer),
+                "{} não resolve para a própria camada",
+                def.id
+            );
+            let row = health_row_of(def.id).expect("todo check tem uma linha");
+            assert!(
+                row.layers().contains(&def.layer),
+                "{} cai na linha {:?}, que não representa {}",
+                def.id,
+                row,
+                def.layer.label()
+            );
+        }
+
+        // Id desconhecido continua devolvendo `None` em vez de inventar linha.
+        assert_eq!(layer_of("check_que_nao_existe"), None);
+        assert_eq!(health_row_of("check_que_nao_existe"), None);
+    }
+
+    /// SPEC-PROBE-IP-043 — os checks de RTP e de FEC vivem todos na camada
+    /// `Rtp`: é isso que permite um feed UDP puro deixá-los `n/a` de uma vez,
+    /// sem lista paralela de exceções.
+    #[test]
+    fn spec_probe_ip_043_rtp_and_fec_checks_share_one_layer() {
+        for id in [
+            CHECK_RTP_MISSING,
+            CHECK_RTP_LOSS_RATIO,
+            CHECK_RTP_REORDER,
+            CHECK_RTP_DUPLICATE,
+            CHECK_RTP_TOO_OLD,
+            CHECK_RTP_SOURCE_RESTART,
+            CHECK_RTP_SSRC_CHANGED,
+            CHECK_RTP_INVALID_PT,
+            CHECK_RTP_PADDING,
+            CHECK_RTP_EXTENSION,
+            CHECK_RTP_MARKER,
+            CHECK_BAD_PAYLOAD_SIZE,
+            CHECK_TS_PER_DATAGRAM,
+            CHECK_FEC_L_RANGE,
+            CHECK_FEC_D_RANGE,
+            CHECK_FEC_LXD,
+            CHECK_FEC_DUAL_STREAM,
+            CHECK_FEC_SSRC_MISMATCH,
+            CHECK_FEC_MISSING,
+            CHECK_FEC_UNEXPECTED,
+        ] {
+            assert_eq!(layer_of(id), Some(Layer::Rtp), "{id}");
+        }
+        for id in [CHECK_MULTI_SOURCE, CHECK_ENCAPSULATION_MISMATCH, CHECK_IAT_MAX] {
+            assert_eq!(layer_of(id), Some(Layer::Ip), "{id}");
+        }
+    }
+
+    /// §5.5 — enquanto os offsets do header FEC não forem conferidos contra o
+    /// ST 2022-1, nenhum check de FEC pode passar de `warning`.
+    #[test]
+    fn spec_probe_ip_035_fec_checks_are_capped_at_warning() {
+        for def in default_checks().iter().filter(|d| d.id.starts_with("fec_")) {
+            assert!(
+                def.severity <= Severity::Warning,
+                "{} está em {:?}, acima do teto do §5.5",
+                def.id,
+                def.severity
+            );
+        }
     }
 
     /// SPEC-PROBE-004 — encerrar a sessão fecha todos os eventos abertos.

@@ -22,14 +22,14 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use slint::{Color, ModelRc, SharedString, VecModel};
 
 use probe::{
-    DegradationStage, EventRow, FeedSnapshot, Layer, MetricId, ProbeSnapshot, SeriesPoints,
-    SeriesWindow, ServiceSnapshot, Severity, StreamKind, TimelineBucket,
+    DegradationStage, Encapsulation, EventRow, FeedSnapshot, IpTick, Layer, MetricId, ProbeSnapshot,
+    SeriesPoints, SeriesWindow, ServiceSnapshot, Severity, StreamKind, TimelineBucket,
 };
 
 use crate::state::{AppCommand, SharedThumbnails, ThumbnailKey};
 use crate::{
     line_path, ProbeAlertRow, ProbeChart, ProbeEventRow, ProbeGridCell, ProbeGridRow, ProbeGridTick,
-    ProbeInfoRow, ProbeServiceTile, ProbeTile,
+    ProbeHistBar, ProbeInfoRow, ProbeServiceTile, ProbeTile,
 };
 
 /// Estado compartilhado do modo Probe, publicado pelo backend a 1 Hz.
@@ -115,8 +115,14 @@ impl ProbeLevel {
 /// "quais eventos pertencem a ela" (SPEC-PROBE-023).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GridScope {
-    /// Camada de rede do feed (IP + RTP).
-    Network,
+    /// Camada IP/UDP do feed.
+    ///
+    /// `merged` = a linha também absorve a camada RTP, que é o caso do feed
+    /// UDP puro: ali nada de RTP é avaliado, e uma faixa separada ficaria
+    /// permanentemente cinza (SPEC-PROBE-IP-048).
+    Network { merged: bool },
+    /// Camada RTP/FEC do feed; só existe quando há RTP.
+    Rtp,
     /// Camada de transporte do feed.
     Transport,
     Service(u16),
@@ -127,10 +133,12 @@ impl GridScope {
     /// `true` se o evento pertence a este escopo.
     fn accepts(self, row: &EventRow, services: &[ServiceSnapshot]) -> bool {
         match self {
-            Self::Network => matches!(
-                probe::layer_of(&row.check_id),
-                Some(Layer::Ip) | Some(Layer::Rtp)
-            ),
+            Self::Network { merged } => match probe::layer_of(&row.check_id) {
+                Some(Layer::Ip) => true,
+                Some(Layer::Rtp) => merged,
+                _ => false,
+            },
+            Self::Rtp => probe::layer_of(&row.check_id) == Some(Layer::Rtp),
             Self::Transport => probe::layer_of(&row.check_id) == Some(Layer::Ts),
             Self::Pid(pid) => row.pid == Some(pid),
             Self::Service(id) => services
@@ -199,9 +207,14 @@ pub(crate) struct ProbeView {
     health: Rc<VecModel<ProbeInfoRow>>,
     streams: Rc<VecModel<ProbeInfoRow>>,
     alerts: Rc<VecModel<ProbeAlertRow>>,
+    /// Modelos da aba `Rede` (SPEC-PROBE-IP-047).
+    net_input: Rc<VecModel<ProbeInfoRow>>,
+    net_rtp: Rc<VecModel<ProbeInfoRow>>,
+    net_fec: Rc<VecModel<ProbeInfoRow>>,
+    net_histogram: Rc<VecModel<ProbeHistBar>>,
 
     level: ProbeLevel,
-    /// Aba do nível 1: 0 Resumo · 1 Serviços.
+    /// Aba do nível 1: 0 Resumo · 1 Serviços · 2 Rede.
     feed_tab: i32,
     window: SeriesWindow,
     /// Célula selecionada na grade: `(linha, coluna)`.
@@ -240,6 +253,15 @@ impl ProbeView {
         let health: Rc<VecModel<ProbeInfoRow>> = Rc::new(VecModel::default());
         let streams: Rc<VecModel<ProbeInfoRow>> = Rc::new(VecModel::default());
         let alerts: Rc<VecModel<ProbeAlertRow>> = Rc::new(VecModel::default());
+        let net_input: Rc<VecModel<ProbeInfoRow>> = Rc::new(VecModel::default());
+        let net_rtp: Rc<VecModel<ProbeInfoRow>> = Rc::new(VecModel::default());
+        let net_fec: Rc<VecModel<ProbeInfoRow>> = Rc::new(VecModel::default());
+        let net_histogram: Rc<VecModel<ProbeHistBar>> = Rc::new(VecModel::default());
+
+        window.set_probe_net_input(ModelRc::from(net_input.clone()));
+        window.set_probe_net_rtp(ModelRc::from(net_rtp.clone()));
+        window.set_probe_net_fec(ModelRc::from(net_fec.clone()));
+        window.set_probe_net_histogram(ModelRc::from(net_histogram.clone()));
 
         window.set_probe_tiles(ModelRc::from(tiles.clone()));
         window.set_probe_services(ModelRc::from(services.clone()));
@@ -268,6 +290,10 @@ impl ProbeView {
             health,
             streams,
             alerts,
+            net_input,
+            net_rtp,
+            net_fec,
+            net_histogram,
             level: ProbeLevel::Feeds,
             feed_tab: 0,
             window: SeriesWindow::OneHour,
@@ -338,9 +364,11 @@ impl ProbeView {
         self.clear_selection();
     }
 
-    /// Troca a aba do nível 1 (0 Resumo · 1 Serviços).
+    /// Troca a aba do nível 1 (0 Resumo · 1 Serviços · 2 Rede).
+    ///
+    /// SPEC-PROBE-IP-047
     pub(crate) fn set_feed_tab(&mut self, tab: i32) {
-        self.feed_tab = tab.clamp(0, 1);
+        self.feed_tab = tab.clamp(0, 2);
         self.clear_selection();
     }
 
@@ -623,6 +651,12 @@ impl ProbeView {
         self.services.set_vec(service_tiles);
 
         // Grade do MPTS: transporte, rede e uma linha por serviço.
+        //
+        // SPEC-PROBE-IP-048 — a linha de rede se divide em `IP / UDP` e
+        // `RTP / FEC` quando o feed tem RTP.  Sem RTP, a linha fundida do
+        // spec-13 §8.2 continua valendo: uma faixa que nunca é avaliada seria
+        // uma afirmação não verificada ocupando espaço na tela.
+        let split = feed.encapsulation.has_rtp();
         let mut rows: Vec<(GridScope, ProbeGridRow, &[TimelineBucket])> = vec![
             (
                 GridScope::Transport,
@@ -630,11 +664,22 @@ impl ProbeView {
                 feed.ts_timeline.as_slice(),
             ),
             (
-                GridScope::Network,
-                grid_row("IP / RTP", feed.encapsulation.badge(), true),
+                GridScope::Network { merged: !split },
+                grid_row(
+                    if split { "IP / UDP" } else { "IP" },
+                    feed.encapsulation.badge(),
+                    true,
+                ),
                 feed.ip_timeline.as_slice(),
             ),
         ];
+        if split {
+            rows.push((
+                GridScope::Rtp,
+                grid_row("RTP / FEC", &rtp_row_subtitle(feed), true),
+                feed.rtp_timeline.as_slice(),
+            ));
+        }
         for svc in &feed.services {
             rows.push((
                 GridScope::Service(svc.service_id),
@@ -665,11 +710,64 @@ impl ProbeView {
         self.events.set_vec(rows);
 
         // ── Resumo e saúde da probe (SPEC-PROBE-013) ────────────────────
+        //
+        // SPEC-PROBE-IP-047a — a barra lateral **não** cresce com a camada IP:
+        // o Resumo continua respondendo "o transporte está bom?" em uma tela, e
+        // o detalhe de rede fica a um clique de distância, na aba `Rede`.
         self.summary.set_vec(feed_summary(feed));
         self.health.set_vec(feed_health(feed));
         self.streams.set_vec(Vec::new());
 
+        self.refresh_network(win, feed);
         self.refresh_alerts(win, feed, None);
+    }
+
+    // ── Nível 1, aba Rede ───────────────────────────────────────────────
+
+    /// Preenche a aba `Rede` a partir da camada IP do último tick.
+    ///
+    /// SPEC-PROBE-IP-047
+    fn refresh_network(&mut self, win: &crate::AppWindow, feed: &FeedSnapshot) {
+        let Some(ip) = feed.ip.as_ref() else {
+            self.net_input.set_vec(vec![kv(
+                "estado",
+                "aguardando o primeiro datagrama…".to_string(),
+            )]);
+            self.net_rtp.set_vec(Vec::new());
+            self.net_fec.set_vec(Vec::new());
+            self.net_histogram.set_vec(Vec::new());
+            win.set_probe_net_rtp_applicable(false);
+            win.set_probe_net_fec_applicable(false);
+            win.set_probe_net_rtp_hint(SharedString::from(RTP_NA_HINT));
+            win.set_probe_net_fec_hint(SharedString::from(FEC_NA_HINT));
+            win.set_probe_net_help(SharedString::from(""));
+            win.set_probe_net_histogram_caption(SharedString::from(""));
+            return;
+        };
+
+        self.net_input.set_vec(network_input_rows(feed, ip));
+        self.net_rtp.set_vec(network_rtp_rows(ip));
+        self.net_fec.set_vec(network_fec_rows(ip));
+
+        let (bars, caption) = histogram_bars(ip);
+        self.net_histogram.set_vec(bars);
+        win.set_probe_net_histogram_caption(SharedString::from(caption));
+
+        win.set_probe_net_rtp_applicable(ip.rtp_applicable());
+        win.set_probe_net_fec_applicable(ip.fec.listening);
+        win.set_probe_net_rtp_hint(SharedString::from(RTP_NA_HINT));
+        win.set_probe_net_fec_hint(SharedString::from(if ip.rtp_applicable() {
+            FEC_OFF_HINT
+        } else {
+            FEC_NA_HINT
+        }));
+        // SPEC-PROBE-IP-044 — num feed UDP puro a ajuda diz explicitamente por
+        // que a perda não é observável ali.
+        win.set_probe_net_help(SharedString::from(if ip.rtp_applicable() {
+            ""
+        } else {
+            UDP_HELP
+        }));
     }
 
     // ── Nível 2: serviço ────────────────────────────────────────────────
@@ -880,7 +978,8 @@ impl ProbeView {
             .collect();
 
         let title = match scope {
-            GridScope::Network => format!("Alertas de rede · {}", feed.display_name()),
+            GridScope::Network { .. } => format!("Alertas de IP · {}", feed.display_name()),
+            GridScope::Rtp => format!("Alertas de RTP / FEC · {}", feed.display_name()),
             GridScope::Transport => format!("Alertas de transporte · {}", feed.display_name()),
             GridScope::Service(id) => format!(
                 "Alertas · {}",
@@ -1031,6 +1130,250 @@ fn feed_summary(feed: &FeedSnapshot) -> Vec<ProbeInfoRow> {
     ]
 }
 
+/// Texto do bloco RTP quando o feed é UDP puro.
+///
+/// SPEC-PROBE-IP-002 · SPEC-PROBE-IP-043 — `n/a` com o motivo, nunca verde.
+const RTP_NA_HINT: &str =
+    "n/a — feed sem RTP. Perda, reordenação, duplicata e SSRC dependem do \
+     sequence number, que só o encapsulamento RTP carrega.";
+
+/// Texto do bloco FEC quando não há RTP.
+const FEC_NA_HINT: &str = "n/a — a FEC ST 2022-1 protege um fluxo RTP; sem RTP não há o que medir.";
+
+/// Texto do bloco FEC quando a escuta está desligada no perfil.
+const FEC_OFF_HINT: &str =
+    "n/a — `fec = off` neste feed: a probe não entra nos grupos de correção, \
+     então não afirma nada sobre eles.";
+
+/// Ajuda da aba `Rede` num feed UDP puro.
+///
+/// SPEC-PROBE-IP-044 — o texto é literal na spec.
+const UDP_HELP: &str = "Feed UDP puro: sem RTP não há como distinguir perda de rede de erro de \
+                        origem. A perda só é observável pelo continuity counter do TS, que não \
+                        diz onde ela aconteceu.";
+
+/// Formata um `Option<f64>` em µs; ausente vira `n/a`, nunca `0`.
+fn us(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.1} µs").replace('.', ","))
+}
+
+/// Linhas do bloco `ENTRADA` da aba `Rede`.
+///
+/// SPEC-PROBE-IP-011 · SPEC-PROBE-IP-013 · SPEC-PROBE-IP-051
+fn network_input_rows(feed: &FeedSnapshot, ip: &IpTick) -> Vec<ProbeInfoRow> {
+    let sources = if ip.sources.is_empty() {
+        "—".to_string()
+    } else {
+        ip.sources
+            .iter()
+            .map(|a| a.ip().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut rows = vec![
+        kv("encapsulamento", ip.encapsulation.badge().to_string()),
+        kv("source ip(s)", sources),
+        kv("fontes distintas", ip.sources.len().to_string()),
+        kv("datagramas (1 s)", ip.datagrams.to_string()),
+        kv("datagramas (sessão)", ip.total_datagrams.to_string()),
+        kv("taxa IP", format!("{:.2} Mbps", ip.mbps).replace('.', ",")),
+        kv(
+            "TS/datagrama",
+            ip.ts_per_datagram
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}").replace('.', ",")),
+        ),
+        kv("inter-arrival médio", us(ip.iat.avg_us)),
+        kv("inter-arrival p99", us(ip.iat.p99_us)),
+        kv("inter-arrival máx", us(ip.iat.max_us)),
+        kv("desvio-padrão", us(ip.iat.sd_us)),
+        kv("esperado (CBR)", us(ip.iat_expected_us)),
+        kv(
+            "burstiness",
+            ip.burstiness.map_or_else(
+                || "n/a".to_string(),
+                |v| format!("{:.0} %", v * 100.0),
+            ),
+        ),
+        // SPEC-PROBE-IP-005 — o piso de ruído da própria probe fica visível ao
+        // lado das medidas que ele condiciona; sem isso, um jitter de 2 ms
+        // parece do stream quando é do agendamento do notebook.
+        kv("piso de ruído", us(ip.noise_floor_us)),
+        kv("bytes no último s", ip.bytes.to_string()),
+    ];
+    // SPEC-PROBE-IP-045 — o declarado e o observado divergiram; vale o
+    // observado, e a linha existe para que o operador corrija a configuração.
+    if ip.encapsulation_mismatch {
+        rows.push(kv(
+            "declarado × observado",
+            format!(
+                "divergente ({} declarado)",
+                declared_badge(feed.encapsulation, ip.encapsulation)
+            ),
+        ));
+    }
+    rows
+}
+
+/// Badge do encapsulamento declarado, quando ele diverge do observado.
+fn declared_badge(feed_enc: Encapsulation, observed: Encapsulation) -> &'static str {
+    if feed_enc == observed {
+        // O snapshot já publica o observado; o declarado é o "outro".
+        if observed.has_rtp() {
+            Encapsulation::Udp.badge()
+        } else {
+            Encapsulation::Rtp.badge()
+        }
+    } else {
+        feed_enc.badge()
+    }
+}
+
+/// Linhas do bloco `RTP` da aba `Rede`.
+///
+/// SPEC-PROBE-IP-019 … SPEC-PROBE-IP-028
+fn network_rtp_rows(ip: &IpTick) -> Vec<ProbeInfoRow> {
+    let Some(rtp) = ip.rtp else {
+        return Vec::new();
+    };
+    let v = &ip.violations;
+    vec![
+        kv(
+            "ssrc",
+            ip.ssrc
+                .map_or_else(|| "—".to_string(), |s| format!("0x{s:08X}")),
+        ),
+        kv("recebidos (1 s)", rtp.received.to_string()),
+        kv("perdidos (1 s)", rtp.missing.to_string()),
+        kv("fora de ordem", rtp.reorder.to_string()),
+        kv("duplicados", rtp.dup.to_string()),
+        kv("too old", rtp.too_old.to_string()),
+        kv("reinícios de fonte", rtp.source_restarts.to_string()),
+        kv("trocas de SSRC", rtp.ssrc_changes.to_string()),
+        kv(
+            "razão de perda",
+            ip.loss_ratio
+                .map_or_else(|| "n/a".to_string(), |r| format!("{r:.2e}")),
+        ),
+        kv("jitter RFC 3550", us(ip.jitter_us)),
+        kv("payload type inválido", v.invalid_pt.to_string()),
+        kv("padding / extension / marker", {
+            format!("{} / {} / {}", v.padding, v.extension, v.marker)
+        }),
+        kv("payload malformado", v.bad_payload_size.to_string()),
+        kv("TS/datagrama fora do perfil", v.ts_per_datagram.to_string()),
+        kv(
+            "conformidade",
+            if v.is_empty() {
+                "ok".to_string()
+            } else {
+                "violações no último segundo".to_string()
+            },
+        ),
+    ]
+}
+
+/// Linhas do bloco `FEC` da aba `Rede`.
+///
+/// SPEC-PROBE-IP-030 … SPEC-PROBE-IP-036
+fn network_fec_rows(ip: &IpTick) -> Vec<ProbeInfoRow> {
+    if !ip.fec.listening {
+        return Vec::new();
+    }
+    let fec = &ip.fec;
+    vec![
+        kv("presente", if fec.present { "sim" } else { "não" }.to_string()),
+        kv("matriz L×D", fec.matrix_label()),
+        kv(
+            "L×D",
+            fec.lxd()
+                .map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+        ),
+        kv(
+            "fluxos",
+            match fec.streams {
+                0 => "nenhum".to_string(),
+                1 => "1 (coluna ou linha)".to_string(),
+                _ => "2 (coluna e linha)".to_string(),
+            },
+        ),
+        kv(
+            "overhead",
+            fec.overhead_pct.map_or_else(
+                || "n/a".to_string(),
+                |v| format!("{v:.1} %").replace('.', ","),
+            ),
+        ),
+        kv("datagramas (1 s)", fec.datagrams.to_string()),
+        kv(
+            "ssrc coerente",
+            if fec.present {
+                if fec.ssrc_mismatch {
+                    "não — diverge do principal".to_string()
+                } else {
+                    "sim".to_string()
+                }
+            } else {
+                "n/a".to_string()
+            },
+        ),
+        // §5.5 — enquanto os offsets do header não forem conferidos contra o
+        // ST 2022-1, o painel diz de onde a leitura veio.
+        kv("referência", "RFC 2733 (a validar vs ST 2022-1)".to_string()),
+    ]
+}
+
+/// Barras normalizadas do histograma de inter-arrival, e a legenda do eixo.
+///
+/// SPEC-PROBE-IP-026 — o histograma é log-espaçado e tem 64 buckets; a aba
+/// mostra só a faixa onde há amostra, senão 60 das 64 barras seriam vazias.
+fn histogram_bars(ip: &IpTick) -> (Vec<ProbeHistBar>, String) {
+    let buckets = &ip.iat.histogram;
+    let Some((first, last)) = occupied_range(buckets) else {
+        return (Vec::new(), String::new());
+    };
+    let peak = buckets[first..=last].iter().copied().max().unwrap_or(1).max(1);
+    let p99_bucket = ip.iat.p99_us.map(probe::iat_bucket_of);
+
+    let bars = (first..=last)
+        .map(|i| ProbeHistBar {
+            frac: (f64::from(buckets[i]) / f64::from(peak)) as f32,
+            label: SharedString::from(if i == first || i == last || Some(i) == p99_bucket {
+                format!("{:.0}", probe::iat_bucket_upper_us(i))
+            } else {
+                String::new()
+            }),
+            highlight: Some(i) == p99_bucket,
+        })
+        .collect();
+
+    let caption = format!(
+        "{} amostras · p50 {} · p95 {} · p99 {}",
+        ip.iat.count,
+        us(ip.iat.p50_us),
+        us(ip.iat.p95_us),
+        us(ip.iat.p99_us),
+    );
+    (bars, caption)
+}
+
+/// Primeiro e último bucket com amostra.
+fn occupied_range(buckets: &[u32]) -> Option<(usize, usize)> {
+    let first = buckets.iter().position(|n| *n > 0)?;
+    let last = buckets.iter().rposition(|n| *n > 0)?;
+    Some((first, last))
+}
+
+/// Subtítulo da linha `RTP / FEC` da grade.
+///
+/// SPEC-PROBE-IP-048
+fn rtp_row_subtitle(feed: &FeedSnapshot) -> String {
+    match feed.ip.as_ref() {
+        Some(ip) if ip.fec.present => ip.fec.matrix_label(),
+        Some(ip) if ip.fec.listening => "sem FEC".to_string(),
+        _ => String::new(),
+    }
+}
+
 fn feed_health(feed: &FeedSnapshot) -> Vec<ProbeInfoRow> {
     vec![
         kv("descartes locais", feed.health.local_drops.to_string()),
@@ -1140,7 +1483,9 @@ fn event_row(e: &EventRow) -> ProbeEventRow {
 fn build_chart(metric: MetricId, points: &SeriesPoints) -> ProbeChart {
     let color = match metric {
         MetricId::BitrateKbps => probe::severity::RGB_OK,
-        MetricId::SchedJitterMs => 0x5a_a0_d0,
+        // Jitter de tick e inter-arrival são **medida**, não erro: pintá-los de
+        // amarelo sugeriria alarme numa série que passa a vida inteira normal.
+        MetricId::SchedJitterMs | MetricId::IatP99Us => 0x5a_a0_d0,
         _ => Severity::Warning.rgb(),
     };
 
@@ -1148,6 +1493,7 @@ fn build_chart(metric: MetricId, points: &SeriesPoints) -> ProbeChart {
     let big = match metric {
         MetricId::BitrateKbps => mbps(points.last),
         MetricId::SchedJitterMs => format!("{:.1}", points.last).replace('.', ","),
+        MetricId::IatP99Us => format!("{:.0}", points.last),
         _ => format!("{:.0}", points.last),
     };
 
@@ -1220,6 +1566,7 @@ mod tests {
             pid,
             service_id: service,
             local: false,
+            caused_by: None,
         }
     }
 
@@ -1292,9 +1639,112 @@ mod tests {
         // `cc_error` é da camada TS; `feed_unavailable` é IP.
         assert!(GridScope::Transport.accepts(&cc_a, &services));
         assert!(!GridScope::Transport.accepts(&outage, &services));
-        assert!(GridScope::Network.accepts(&outage, &services));
-        assert!(GridScope::Network.accepts(&rtp, &services));
-        assert!(!GridScope::Network.accepts(&cc_a, &services));
+        assert!(GridScope::Network { merged: true }.accepts(&outage, &services));
+        assert!(GridScope::Network { merged: true }.accepts(&rtp, &services));
+        assert!(!GridScope::Network { merged: true }.accepts(&cc_a, &services));
+    }
+
+    /// SPEC-PROBE-IP-048 — com a linha de RTP separada, um alarme de RTP
+    /// aparece **só** nela; num feed UDP puro, a linha fundida continua
+    /// absorvendo os dois, porque ali nada de RTP é avaliado.
+    #[test]
+    fn spec_probe_ip_048_rtp_alerts_land_on_the_rtp_row_when_it_exists() {
+        let services = vec![service(100, &[6100])];
+        let loss = event("rtp_missing", 10, None, None);
+        let outage = event("feed_unavailable", 11, None, None);
+        let cc = event("cc_error", 12, Some(6100), Some(100));
+
+        // Feed com RTP: duas linhas, cada alarme na sua.
+        let ip_row = GridScope::Network { merged: false };
+        assert!(!ip_row.accepts(&loss, &services), "perda RTP não é da linha IP");
+        assert!(ip_row.accepts(&outage, &services));
+        assert!(GridScope::Rtp.accepts(&loss, &services));
+        assert!(!GridScope::Rtp.accepts(&outage, &services));
+        assert!(!GridScope::Rtp.accepts(&cc, &services));
+
+        // Feed UDP puro: uma linha só, que absorve as duas camadas.
+        let merged = GridScope::Network { merged: true };
+        assert!(merged.accepts(&loss, &services));
+        assert!(merged.accepts(&outage, &services));
+        assert!(!merged.accepts(&cc, &services));
+    }
+
+    /// SPEC-PROBE-IP-047 — a aba `Rede` existe e é a terceira do nível 1; o
+    /// índice é saturado para não apontar para uma aba inexistente.
+    #[test]
+    fn spec_probe_ip_047_feed_level_has_a_third_tab() {
+        let ui = crate::AppWindow::new().expect("janela");
+        let (tx, _rx) = crossbeam_channel::bounded(4);
+        let mut view = ProbeView::new(
+            &ui,
+            Arc::new(RwLock::new(ProbeSnapshot::default())),
+            Arc::new(RwLock::new(Default::default())),
+            tx,
+        );
+
+        view.set_feed_tab(2);
+        assert_eq!(view.feed_tab, 2, "Rede é a aba 2");
+        view.set_feed_tab(9);
+        assert_eq!(view.feed_tab, 2, "índice fora da faixa satura na última");
+        view.set_feed_tab(-1);
+        assert_eq!(view.feed_tab, 0);
+    }
+
+    /// SPEC-PROBE-IP-044 — num feed UDP puro a aba `Rede` diz, com todas as
+    /// letras, por que a perda não é observável ali; e os blocos de RTP e FEC
+    /// ficam `n/a`, não vazios sem explicação.
+    #[test]
+    fn spec_probe_ip_044_udp_feed_explains_why_loss_is_not_observable() {
+        assert!(UDP_HELP.contains("sem RTP não há como distinguir perda de rede de erro de origem"));
+        assert!(RTP_NA_HINT.starts_with("n/a"));
+        assert!(FEC_NA_HINT.starts_with("n/a"));
+        assert!(FEC_OFF_HINT.starts_with("n/a"));
+    }
+
+    /// SPEC-PROBE-IP-026 · SPEC-PROBE-IP-047 — o histograma mostra só a faixa
+    /// com amostra e realça o bucket do p99.
+    #[test]
+    fn spec_probe_ip_047_histogram_shows_the_occupied_range_only() {
+        let mut ip = IpTick {
+            iat: probe::IatSummary {
+                count: 1_000,
+                p50_us: Some(700.0),
+                p95_us: Some(720.0),
+                p99_us: Some(5_000.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ip.iat.histogram[probe::iat_bucket_of(700.0)] = 985;
+        ip.iat.histogram[probe::iat_bucket_of(5_000.0)] = 15;
+
+        let (bars, caption) = histogram_bars(&ip);
+        assert!(!bars.is_empty());
+        assert!(
+            bars.len() < probe::IAT_HIST_BUCKETS,
+            "64 barras com 62 vazias não é um gráfico"
+        );
+        assert_eq!(
+            bars.iter().filter(|b| b.highlight).count(),
+            1,
+            "exatamente uma barra é a do p99"
+        );
+        assert!((bars.iter().map(|b| b.frac).fold(0.0f32, f32::max) - 1.0).abs() < 1e-6);
+        assert!(caption.contains("1000 amostras"), "{caption}");
+
+        // Sem amostra, sem gráfico — e sem divisão por zero.
+        assert!(histogram_bars(&IpTick::default()).0.is_empty());
+    }
+
+    /// SPEC-PROBE-IP-002 — "sem dado", "n/a" e "ok" são três cores distintas.
+    #[test]
+    fn spec_probe_ip_049_three_distinct_greys_in_the_grid() {
+        let na = rgb(probe::LayerHealth::NotApplicable.rgb());
+        let no_data = rgb(probe::severity::RGB_NO_DATA);
+        let ok = rgb(probe::severity::RGB_OK);
+        assert_ne!(na, no_data, "inaplicável ≠ sem dado");
+        assert_ne!(na, ok);
+        assert_ne!(no_data, ok);
     }
 
     /// SPEC-PROBE-023 — a régua distribui os rótulos sem estourar o eixo nem

@@ -18,15 +18,130 @@ pub const MAX_FEEDS: usize = 2;
 
 /// Detecção/uso de FEC (ST 2022-1) num feed.
 ///
-/// SPEC-PROBE-018a
+/// Serializado como texto para caber na sintaxe que a spec fixa:
+/// `fec = "auto" | "off" | "ports:50002,50004"`.
+///
+/// SPEC-PROBE-018a · SPEC-PROBE-IP-030
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "String", into = "String")]
 pub enum FecMode {
     /// Escuta `base+2` e `base+4`; o badge vira `RTP+FEC` se houver tráfego.
     #[default]
     Auto,
     /// Não abre as portas de FEC; checks de FEC ficam `n/a`.
     Off,
+    /// Portas explícitas: coluna e linha, nessa ordem.
+    Ports { column: u16, row: u16 },
+}
+
+impl FecMode {
+    /// `true` quando a probe deve entrar nos grupos de FEC.
+    ///
+    /// SPEC-PROBE-IP-030 — em `off`, os checks de FEC ficam `n/a` e nenhum join
+    /// extra é feito.
+    pub fn listens(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Portas de FEC deste feed, dadas a porta base e os offsets do perfil.
+    ///
+    /// SPEC-PROBE-IP-030 — `auto` deriva de `base+2` (coluna) e `base+4`
+    /// (linha), que é a convenção do ST 2022-1 e o que a operação usa.
+    pub fn ports(self, base: u16, offsets: [u16; 2]) -> Option<(u16, u16)> {
+        match self {
+            Self::Off => None,
+            Self::Auto => net::fec_ports(base, offsets),
+            Self::Ports { column, row } => Some((column, row)),
+        }
+    }
+}
+
+impl std::fmt::Display for FecMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Off => write!(f, "off"),
+            Self::Ports { column, row } => write!(f, "ports:{column},{row}"),
+        }
+    }
+}
+
+impl From<FecMode> for String {
+    fn from(value: FecMode) -> Self {
+        value.to_string()
+    }
+}
+
+impl TryFrom<String> for FecMode {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let text = value.trim();
+        if text.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+        if text.eq_ignore_ascii_case("off") {
+            return Ok(Self::Off);
+        }
+        let ports = text
+            .strip_prefix("ports:")
+            .or_else(|| text.strip_prefix("PORTS:"))
+            .ok_or_else(|| format!("fec inválido: {value:?} — use auto, off ou ports:a,b"))?;
+        let (a, b) = ports
+            .split_once(',')
+            .ok_or_else(|| format!("fec inválido: {value:?} — ports:a,b exige duas portas"))?;
+        let parse = |s: &str| {
+            s.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("porta de FEC inválida: {s:?}"))
+        };
+        Ok(Self::Ports {
+            column: parse(a)?,
+            row: parse(b)?,
+        })
+    }
+}
+
+/// Parâmetros da validação de FEC (`[probe.fec]`).
+///
+/// A spec desenha estes campos dentro de `[probe.checks.fec]`; aqui eles vivem
+/// numa seção própria porque `[probe.checks.*]` é um mapa homogêneo de
+/// [`CheckOverride`] — limiar, janela, severidade — e enfiar faixa de L, offsets
+/// de porta e teto de L×D nele obrigaria todo check do perfil a carregar campos
+/// que só a FEC entende.  A semântica e os defaults são exatamente os do §8.
+///
+/// SPEC-PROBE-IP-030 · SPEC-PROBE-IP-033 · SPEC-PROBE-IP-034
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FecProfile {
+    /// Offsets de porta usados por `fec = auto`.
+    pub port_offsets: [u16; 2],
+    /// Faixa aceita de L (coluna).
+    pub l_range: [u32; 2],
+    /// Faixa aceita de D (linha).
+    pub d_range: [u32; 2],
+    /// Teto de L×D.
+    pub max_lxd: u32,
+    /// A partir de qual L o perfil espera **dois** fluxos de FEC.
+    ///
+    /// SPEC-PROBE-IP-035 — regra marcada como "a validar" contra o ST 2022-1;
+    /// até lá a severidade máxima é `warning`.
+    pub dual_stream_min_l: u32,
+    /// O perfil exige FEC neste feed (SPEC-PROBE-IP-037).
+    pub required: bool,
+}
+
+impl Default for FecProfile {
+    fn default() -> Self {
+        Self {
+            port_offsets: [2, 4],
+            l_range: [1, 20],
+            d_range: [4, 20],
+            max_lxd: 100,
+            dual_stream_min_l: 4,
+            required: false,
+        }
+    }
 }
 
 /// Um feed do mosaico (`[[probe.feeds]]`).
@@ -117,6 +232,43 @@ pub struct ProbeConfig {
     ///
     /// Default `false`: Broadcast não deve pagar o custo de escrita em disco (§3.1).
     pub enabled_in_broadcast: bool,
+
+    // ── Camada IP (spec-14 §8) ──────────────────────────────────────────
+    /// Janela de reconciliação de lacunas RTP, em ms.
+    ///
+    /// SPEC-PROBE-IP-020 — estado **sub-tick** dentro do pipeline do feed, onde
+    /// cada pacote tem `Instant` próprio.  Não confundir com
+    /// [`ProbeConfig::correlation_window_ms`], que opera no motor de checks.
+    pub reorder_window_ms: u64,
+    /// Janela de correlação IP→TS, em ms.
+    ///
+    /// SPEC-PROBE-IP-039 · SPEC-PROBE-IP-039a — o motor amostra contadores
+    /// cumulativos a 1 Hz, então valores abaixo de 1000 ms não são
+    /// implementáveis e são rejeitados na carga do perfil.
+    pub correlation_window_ms: u64,
+    /// Duração da calibração do piso de ruído, em s (SPEC-PROBE-IP-005).
+    pub calib_secs: u64,
+    /// Janela de detecção de encapsulamento, em s (SPEC-PROBE-IP-042).
+    pub detect_secs: u64,
+    /// Variação de bitrate acima da qual a burstiness vira `n/a`, em %.
+    ///
+    /// SPEC-PROBE-IP-027 — num VBR o inter-arrival esperado não é constante, e
+    /// afirmar rajada em cima disso seria inventar defeito.
+    pub vbr_tolerance_pct: f64,
+    /// Multiplicador do piso de ruído nos alarmes de temporização.
+    ///
+    /// SPEC-PROBE-IP-006 — `max(threshold, k × noise_floor_us)`.
+    pub noise_k: f64,
+    /// Pacotes TS por datagrama esperados pelo perfil (SPEC-PROBE-IP-018).
+    pub ts_per_datagram: u32,
+    /// Payload types RTP aceitos (SPEC-PROBE-IP-015).
+    ///
+    /// Default: 33 (MPEG-TS) e 96 (PT dinâmico da FEC na casa — questão 10.2 #6
+    /// ainda em aberto, por isso o check é `warning` e não `error`).
+    pub rtp_payload_types: Vec<u8>,
+
+    /// Parâmetros de FEC (`[probe.fec]`).
+    pub fec: FecProfile,
     /// Feeds do mosaico, na ordem dos slots.
     pub feeds: Vec<FeedConfig>,
     /// Overrides de check por id (`[probe.checks.<id>]`).
@@ -142,6 +294,15 @@ impl Default for ProbeConfig {
             retention_days: 14,
             max_disk_mb: 4096,
             enabled_in_broadcast: false,
+            reorder_window_ms: 200,
+            correlation_window_ms: 1000,
+            calib_secs: 30,
+            detect_secs: 3,
+            vbr_tolerance_pct: 5.0,
+            noise_k: 3.0,
+            ts_per_datagram: 7,
+            rtp_payload_types: vec![33, 96],
+            fec: FecProfile::default(),
             feeds: Vec::new(),
             checks: BTreeMap::new(),
         }
@@ -207,6 +368,59 @@ impl ProbeConfig {
         Duration::from_millis(ms.max(100))
     }
 
+    /// Janela de reconciliação de lacunas RTP, com piso de 10 ms.
+    ///
+    /// SPEC-PROBE-IP-020
+    pub fn reorder_window(&self) -> Duration {
+        Duration::from_millis(self.reorder_window_ms.max(10))
+    }
+
+    /// Janela de correlação IP→TS **efetiva**, com piso de um tick.
+    ///
+    /// SPEC-PROBE-IP-039a — o motor de checks só vê deltas por segundo; uma
+    /// janela de 200 ms exigiria timestamp por ocorrência e é fase 2.  Em vez
+    /// de fingir que 200 ms funciona, o valor é elevado a 1 s e a sessão
+    /// continua, com aviso.
+    pub fn correlation_window(&self) -> Duration {
+        let tick = self.sample_interval();
+        let asked = Duration::from_millis(self.correlation_window_ms);
+        if asked < tick {
+            tracing::warn!(
+                requested_ms = self.correlation_window_ms,
+                effective_ms = tick.as_millis() as u64,
+                "probe: correlation_window_ms abaixo de um tick não é implementável \
+                 com contadores amostrados a 1 Hz (SPEC-PROBE-IP-039a) — usando o tick"
+            );
+            tick
+        } else {
+            asked
+        }
+    }
+
+    /// Duração da calibração do piso de ruído, com piso de 1 s.
+    ///
+    /// SPEC-PROBE-IP-005
+    pub fn calibration_window(&self) -> Duration {
+        Duration::from_secs(self.calib_secs.max(1))
+    }
+
+    /// Janela de detecção de encapsulamento, com piso de 1 s.
+    ///
+    /// SPEC-PROBE-IP-042
+    pub fn detect_window(&self) -> Duration {
+        Duration::from_secs(self.detect_secs.max(1))
+    }
+
+    /// `true` se `pt` é um payload type aceito pelo perfil.
+    ///
+    /// Lista vazia significa "aceita qualquer um": desligar o check pelo TOML é
+    /// `[probe.checks.rtp_invalid_pt] enabled = false`, não esvaziar a lista.
+    ///
+    /// SPEC-PROBE-IP-015
+    pub fn accepts_payload_type(&self, pt: u8) -> bool {
+        self.rtp_payload_types.is_empty() || self.rtp_payload_types.contains(&pt)
+    }
+
     /// Feeds efetivamente instanciáveis: descarta entradas sem URL e trunca em
     /// `min(max_feeds, MAX_FEEDS)`.
     ///
@@ -246,6 +460,113 @@ mod tests {
         assert_eq!(c.retention_days, 14);
         assert_eq!(c.max_disk_mb, 4096);
         assert!(!c.enabled_in_broadcast);
+    }
+
+    /// §8 da spec-14 — os limiares default da camada IP são os documentados,
+    /// derivados da medição de referência e não de zero-tolerância.
+    #[test]
+    fn spec_probe_ip_030_ip_layer_defaults_match_spec() {
+        let c = ProbeConfig::default();
+        assert_eq!(c.reorder_window_ms, 200);
+        assert_eq!(c.correlation_window_ms, 1000);
+        assert_eq!(c.calib_secs, 30);
+        assert_eq!(c.detect_secs, 3);
+        assert!((c.vbr_tolerance_pct - 5.0).abs() < f64::EPSILON);
+        assert!((c.noise_k - 3.0).abs() < f64::EPSILON);
+        assert_eq!(c.ts_per_datagram, 7);
+        assert_eq!(c.rtp_payload_types, vec![33, 96]);
+        assert_eq!(c.fec.port_offsets, [2, 4]);
+        assert_eq!(c.fec.l_range, [1, 20]);
+        assert_eq!(c.fec.d_range, [4, 20]);
+        assert_eq!(c.fec.max_lxd, 100);
+        assert!(!c.fec.required);
+    }
+
+    /// SPEC-PROBE-IP-030 — `auto` deriva 50002/50004 de um feed em 50000;
+    /// `off` não abre porta nenhuma; `ports:a,b` manda.
+    #[test]
+    fn spec_probe_ip_030_fec_ports_follow_the_mode() {
+        let offsets = ProbeConfig::default().fec.port_offsets;
+        assert_eq!(FecMode::Auto.ports(50_000, offsets), Some((50_002, 50_004)));
+        assert_eq!(FecMode::Off.ports(50_000, offsets), None);
+        assert!(!FecMode::Off.listens());
+        assert!(FecMode::Auto.listens());
+        assert_eq!(
+            FecMode::Ports {
+                column: 6000,
+                row: 6002
+            }
+            .ports(50_000, offsets),
+            Some((6000, 6002))
+        );
+    }
+
+    /// SPEC-PROBE-IP-030 — a sintaxe `auto | off | ports:a,b` da spec atravessa
+    /// serde nos dois sentidos, e texto inválido vira erro, não um default
+    /// silencioso.
+    #[test]
+    fn spec_probe_ip_030_fec_mode_parses_the_spec_syntax() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Wrap {
+            fec: FecMode,
+        }
+        let parse = |text: &str| toml::from_str::<Wrap>(text).map(|w| w.fec);
+
+        assert_eq!(parse(r#"fec = "auto""#), Ok(FecMode::Auto));
+        assert_eq!(parse(r#"fec = "off""#), Ok(FecMode::Off));
+        assert_eq!(
+            parse(r#"fec = "ports:50002,50004""#),
+            Ok(FecMode::Ports {
+                column: 50_002,
+                row: 50_004
+            })
+        );
+        assert!(parse(r#"fec = "ports:50002""#).is_err());
+        assert!(parse(r#"fec = "talvez""#).is_err());
+
+        let text = toml::to_string(&Wrap {
+            fec: FecMode::Ports {
+                column: 50_002,
+                row: 50_004,
+            },
+        })
+        .expect("serializa");
+        assert!(text.contains("ports:50002,50004"), "{text}");
+    }
+
+    /// SPEC-PROBE-IP-039a — uma janela de correlação abaixo de um tick não é
+    /// implementável com contadores a 1 Hz: o valor efetivo vira o tick e a
+    /// sessão continua, em vez de prometer uma resolução que não existe.
+    #[test]
+    fn spec_probe_ip_039a_sub_tick_correlation_window_is_rejected() {
+        let c = ProbeConfig {
+            correlation_window_ms: 200,
+            ..Default::default()
+        };
+        assert_eq!(c.correlation_window(), Duration::from_secs(1));
+
+        // Uma janela maior que o tick é respeitada.
+        let wide = ProbeConfig {
+            correlation_window_ms: 5_000,
+            ..Default::default()
+        };
+        assert_eq!(wide.correlation_window(), Duration::from_secs(5));
+    }
+
+    /// SPEC-PROBE-IP-015 — o perfil aceita 33 e o PT dinâmico da FEC; 97 não.
+    #[test]
+    fn spec_probe_ip_015_profile_payload_types() {
+        let c = ProbeConfig::default();
+        assert!(c.accepts_payload_type(33));
+        assert!(c.accepts_payload_type(96));
+        assert!(!c.accepts_payload_type(97));
+
+        // Lista vazia = sem restrição (desligar é pelo `enabled` do check).
+        let any = ProbeConfig {
+            rtp_payload_types: Vec::new(),
+            ..Default::default()
+        };
+        assert!(any.accepts_payload_type(97));
     }
 
     /// SPEC-PROBE-015 — a seção reserializa para TOML válido (escalares antes
@@ -326,8 +647,14 @@ severity = "warning"
             flush_interval_secs: 0,
             snapshot_interval_secs: 0,
             reconnect_backoff_ms: vec![],
+            reorder_window_ms: 0,
+            calib_secs: 0,
+            detect_secs: 0,
             ..Default::default()
         };
+        assert_eq!(c.reorder_window(), Duration::from_millis(10));
+        assert_eq!(c.calibration_window(), Duration::from_secs(1));
+        assert_eq!(c.detect_window(), Duration::from_secs(1));
         assert_eq!(c.sample_interval(), Duration::from_millis(100));
         assert_eq!(c.rollup_window(), Duration::from_secs(1));
         assert_eq!(c.timeline_bucket(), Duration::from_secs(1));

@@ -511,8 +511,25 @@ fn main() -> anyhow::Result<()> {
                             // TODO: quando net::NetEvent::UdpBufferOverflow for adicionado:
                             // net::NetEvent::UdpBufferOverflow { .. } =>
                             //     let _ = _agg_net_tx_bridge.try_send(AggregatorNetEvent::UdpBufferOverflow),
+                            // O join efetivo (interface, `SO_RCVBUF`) e o ciclo
+                            // multicast interessam ao modo Probe, que os grava
+                            // no `session.toml`; no player só o log basta.
+                            net::NetEvent::Joined(binding) => tracing::info!(
+                                group = %binding.group,
+                                port = binding.port,
+                                iface = %binding.iface_label(),
+                                so_rcvbuf = binding.so_rcvbuf_bytes,
+                                "net-recv: join efetivo"
+                            ),
+                            net::NetEvent::JoinFailed { reason } => {
+                                tracing::warn!(%reason, "net-recv: falha de join")
+                            }
+                            net::NetEvent::SourceSeen(addr) => {
+                                tracing::info!(source = %addr, "net-recv: nova fonte no grupo")
+                            }
                             net::NetEvent::Started
                             | net::NetEvent::Timeout
+                            | net::NetEvent::Left
                             | net::NetEvent::Stopped => {}
                         }
                     }

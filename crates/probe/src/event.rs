@@ -42,6 +42,7 @@ pub enum EventOrigin {
 ///
 /// SPEC-PROBE-008
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EventContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u16>,
@@ -50,6 +51,15 @@ pub struct EventContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssrc: Option<String>,
     pub origin: EventOrigin,
+    /// Check que **causou** esta ocorrência, quando a correlação é conclusiva.
+    ///
+    /// SPEC-PROBE-IP-039 · SPEC-PROBE-IP-040a — a correlação atravessa escopos:
+    /// a perda RTP é do feed, os CC errors são de PID/serviço.  O evento raiz é
+    /// do feed e cada CC error correlacionado carrega o `caused_by`,
+    /// **preservando** `pid` e `service_id` — sem isso a grade do nível 2 não
+    /// saberia qual célula pintar de vermelho.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caused_by: Option<String>,
 }
 
 impl EventContext {
@@ -87,11 +97,31 @@ impl EventContext {
         self
     }
 
+    /// Identifica o fluxo RTP de origem.
+    ///
+    /// SPEC-PROBE-IP-019
+    pub fn with_ssrc(mut self, ssrc: u32) -> Self {
+        self.ssrc = Some(format!("0x{ssrc:08X}"));
+        self
+    }
+
+    /// Marca a ocorrência como consequência de outro check.
+    ///
+    /// SPEC-PROBE-IP-039 · SPEC-PROBE-IP-041 — a ausência do carimbo é
+    /// informação tanto quanto a presença: um CC error **sem** perda RTP
+    /// correspondente é erro que já chegou no stream, não perda na rede local.
+    pub fn caused_by(mut self, check_id: &str) -> Self {
+        self.caused_by = Some(check_id.to_string());
+        self
+    }
+
     /// Chave estável usada na deduplicação de eventos.
     ///
-    /// **Não inclui `origin`**: a origem pode ser reclassificada de `network`
-    /// para `local` no meio de uma rajada, e se ela entrasse na chave isso
-    /// abriria um segundo evento para o mesmo problema — exatamente o que
+    /// **Não inclui `origin` nem `caused_by`**: os dois podem ser
+    /// reclassificados no meio de uma rajada — a origem de `network` para
+    /// `local` (SPEC-PROBE-013), a causa quando a perda RTP aparece só no
+    /// segundo seguinte (SPEC-PROBE-IP-039) — e se entrassem na chave abririam
+    /// um segundo evento para o mesmo problema, exatamente o que
     /// SPEC-PROBE-008 proíbe.
     pub fn dedupe_key(&self) -> String {
         let mut key = String::with_capacity(24);
@@ -130,6 +160,9 @@ impl EventContext {
         }
         if self.origin == EventOrigin::Local {
             parts.push("origin=local".to_string());
+        }
+        if let Some(cause) = &self.caused_by {
+            parts.push(format!("causa: {cause}"));
         }
         parts.join(" · ")
     }
@@ -241,6 +274,29 @@ mod tests {
             EventContext::pid(6100).dedupe_key(),
             EventContext::pid(6102).dedupe_key()
         );
+    }
+
+    /// SPEC-PROBE-IP-040a — a correlação atravessa escopos sem apagá-los: o CC
+    /// error correlacionado continua sendo do seu PID e do seu serviço, e a
+    /// causa não abre um segundo evento para o mesmo problema.
+    #[test]
+    fn spec_probe_ip_040a_caused_by_preserves_pid_and_service() {
+        let plain = EventContext::pid(6100).with_service(100);
+        let correlated = plain.clone().caused_by("rtp_missing");
+
+        assert_eq!(correlated.pid, Some(6100));
+        assert_eq!(correlated.service_id, Some(100));
+        assert_eq!(correlated.caused_by.as_deref(), Some("rtp_missing"));
+        assert_eq!(
+            plain.dedupe_key(),
+            correlated.dedupe_key(),
+            "a causa não pode abrir um segundo evento"
+        );
+        assert!(correlated.describe().contains("causa: rtp_missing"));
+
+        // SPEC-PROBE-IP-041 — sem correlação não há carimbo, e essa ausência é
+        // que classifica o erro como originado no TS.
+        assert_eq!(plain.caused_by, None);
     }
 
     /// SPEC-PROBE-008 — ids são únicos e ordenáveis lexicograficamente.

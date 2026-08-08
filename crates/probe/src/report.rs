@@ -168,6 +168,16 @@ uptime {up} s · disponibilidade {av:.3} %</p>",
         deg = feed.health.degradation.label(),
     );
 
+    // Camada IP (spec-14 §5.7 · §8).
+    render_ip_section(html, feed);
+
+    // Quantas vezes cada check disparou.
+    //
+    // spec-14 §8 — os limiares default são "propostas para calibrar na primeira
+    // sessão de 12 h, não normativos".  Sem esta tabela, a segunda rodada de
+    // ajuste seria feita no escuro.
+    render_check_tally(html, feed);
+
     // Top-10 eventos (SPEC-PROBE-014).
     html.push_str("<h3>Top eventos</h3>");
     let top = top_events(feed);
@@ -196,6 +206,129 @@ uptime {up} s · disponibilidade {av:.3} %</p>",
     }
 
     html.push_str("</section>");
+}
+
+/// Bloco da camada IP do feed.
+///
+/// SPEC-PROBE-IP-047 — o relatório é o artefato que sai da probe para quem
+/// opera o sinal; se a aba `Rede` responde a pergunta na tela, o relatório
+/// precisa respondê-la em disco.
+/// SPEC-PROBE-IP-043 — num feed UDP puro a faixa de RTP/FEC **não** aparece,
+/// em vez de aparecer zerada como se tivesse sido verificada.
+fn render_ip_section(html: &mut String, feed: &FeedSnapshot) {
+    let Some(ip) = feed.ip.as_ref() else {
+        return;
+    };
+    let opt = |v: Option<f64>, unit: &str| {
+        v.map_or_else(
+            || "n/a".to_string(),
+            |x| format!("{x:.1} {unit}"),
+        )
+    };
+
+    html.push_str("<h3>Rede</h3><ul class=\"health\">");
+    let _ = write!(
+        html,
+        "<li>encapsulamento: <b>{enc}</b></li>\
+<li>fontes: <b>{sources}</b></li>\
+<li>taxa IP: <b>{mbps:.2} Mbps</b></li>\
+<li>TS/datagrama: <b>{tspd}</b></li>\
+<li>inter-arrival médio: <b>{avg}</b> · p99 <b>{p99}</b> · esperado <b>{exp}</b></li>\
+<li>piso de ruído da probe: <b>{floor}</b></li>",
+        enc = ip.encapsulation.badge(),
+        sources = if ip.sources.is_empty() {
+            "—".to_string()
+        } else {
+            escape(
+                &ip.sources
+                    .iter()
+                    .map(|a| a.ip().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        },
+        mbps = ip.mbps,
+        tspd = ip
+            .ts_per_datagram
+            .map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}")),
+        avg = opt(ip.iat.avg_us, "µs"),
+        p99 = opt(ip.iat.p99_us, "µs"),
+        exp = opt(ip.iat_expected_us, "µs"),
+        floor = opt(ip.noise_floor_us, "µs"),
+    );
+
+    if let Some(rtp) = ip.rtp {
+        let _ = write!(
+            html,
+            "<li>RTP: recebidos <b>{r}</b> · perdidos <b>{m}</b> · fora de ordem <b>{o}</b> · \
+duplicados <b>{d}</b> · too old <b>{t}</b></li>\
+<li>razão de perda: <b>{ratio}</b> · jitter RFC 3550: <b>{jit}</b></li>",
+            r = rtp.received,
+            m = rtp.missing,
+            o = rtp.reorder,
+            d = rtp.dup,
+            t = rtp.too_old,
+            ratio = ip
+                .loss_ratio
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.2e}")),
+            jit = opt(ip.jitter_us, "µs"),
+        );
+    }
+    if ip.fec.listening {
+        let _ = write!(
+            html,
+            "<li>FEC: <b>{present}</b> · matriz <b>{matrix}</b> · fluxos <b>{streams}</b> · \
+overhead <b>{over}</b></li>",
+            present = if ip.fec.present { "presente" } else { "ausente" },
+            matrix = ip.fec.matrix_label(),
+            streams = ip.fec.streams,
+            over = ip
+                .fec
+                .overhead_pct
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.1} %")),
+        );
+    }
+    html.push_str("</ul>");
+}
+
+/// Tabela "quantas vezes cada check disparou nesta sessão".
+///
+/// spec-14 §8
+fn render_check_tally(html: &mut String, feed: &FeedSnapshot) {
+    let mut tally: std::collections::BTreeMap<(&str, Severity), (u64, u64)> =
+        std::collections::BTreeMap::new();
+    for ev in &feed.events {
+        if ev.phase != crate::event::EventPhase::Open {
+            continue;
+        }
+        let entry = tally
+            .entry((ev.check_id.as_str(), ev.severity))
+            .or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += ev.count;
+    }
+    if tally.is_empty() {
+        return;
+    }
+
+    html.push_str(
+        "<h3>Checks disparados</h3><table class=\"events\"><thead><tr><th>Check</th>\
+<th>Nível</th><th>Eventos</th><th>Ocorrências</th></tr></thead><tbody>",
+    );
+    let mut rows: Vec<_> = tally.into_iter().collect();
+    rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(b.0 .1.cmp(&a.0 .1)));
+    for ((check_id, severity), (events, occurrences)) in rows {
+        let _ = write!(
+            html,
+            "<tr><td><code>{id}</code></td><td>{sev}</td><td class=\"num\">{e}</td>\
+<td class=\"num\">{o}</td></tr>",
+            id = escape(check_id),
+            sev = badge(severity),
+            e = events,
+            o = occurrences,
+        );
+    }
+    html.push_str("</tbody></table>");
 }
 
 /// Os eventos mais relevantes: severidade primeiro, depois contagem.
@@ -369,6 +502,7 @@ footer{margin-top:40px;padding-top:12px;border-top:1px solid #20262e;color:#5f6b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Encapsulation;
     use crate::event::EventPhase;
     use crate::series::SeriesPoints;
     use crate::snapshot::EventRow;
@@ -428,6 +562,7 @@ mod tests {
                     pid: Some(6100),
                     service_id: None,
                     local: false,
+                    caused_by: None,
                 },
                 EventRow {
                     event_id: "e2".into(),
@@ -442,6 +577,7 @@ mod tests {
                     pid: None,
                     service_id: None,
                     local: false,
+                    caused_by: None,
                 },
             ],
             ..Default::default()
@@ -522,6 +658,85 @@ mod tests {
         assert!(html.ends_with("</html>"));
     }
 
+    /// SPEC-PROBE-IP-047 · §8 — o relatório carrega a camada de rede e a
+    /// contagem por check, que é o insumo do ajuste de limiares na segunda
+    /// rodada de 12 h.
+    #[test]
+    fn spec_probe_ip_047_report_carries_the_network_layer_and_check_tally() {
+        let mut f = feed(0, "0084_CANAL_A");
+        f.ip = Some(crate::ip::IpTick {
+            encapsulation: Encapsulation::RtpFec,
+            datagrams: 1_400,
+            mbps: 15.0,
+            ts_per_datagram: Some(7.0),
+            sources: vec!["10.0.0.9:50000".parse().expect("addr")],
+            rtp: Some(crate::ip::RtpDelta {
+                received: 1_400,
+                missing: 3,
+                ..Default::default()
+            }),
+            loss_ratio: Some(2.1e-3),
+            iat: crate::IatSummary {
+                avg_us: Some(701.9),
+                p99_us: Some(1_200.0),
+                ..Default::default()
+            },
+            iat_expected_us: Some(701.9),
+            noise_floor_us: Some(120.0),
+            fec: crate::ip::FecStatus {
+                present: true,
+                listening: true,
+                l: Some(8),
+                d: Some(5),
+                streams: 2,
+                overhead_pct: Some(12.5),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let snapshot = ProbeSnapshot {
+            feeds: vec![f],
+            ..run()
+        };
+        let html = render_run_report(&snapshot);
+
+        assert!(html.contains("<h3>Rede</h3>"), "o relatório precisa da camada IP");
+        assert!(html.contains("RTP+FEC"));
+        assert!(html.contains("10.0.0.9"));
+        assert!(html.contains("701.9 µs"));
+        assert!(html.contains("8×5"), "a matriz FEC observada");
+        assert!(html.contains("piso de ruído"));
+
+        assert!(html.contains("<h3>Checks disparados</h3>"));
+        assert!(html.contains("<code>cc_error</code>"));
+    }
+
+    /// SPEC-PROBE-IP-043 — num feed UDP puro o relatório **não** mostra faixa
+    /// de RTP nem de FEC: uma linha zerada seria uma afirmação que ninguém
+    /// verificou.
+    #[test]
+    fn spec_probe_ip_043_report_omits_rtp_block_for_a_udp_feed() {
+        let mut f = feed(0, "PLAYOUT_LOCAL");
+        f.encapsulation = Encapsulation::Udp;
+        f.ip = Some(crate::ip::IpTick {
+            encapsulation: Encapsulation::Udp,
+            datagrams: 1_400,
+            mbps: 15.0,
+            rtp: None,
+            ..Default::default()
+        });
+        let snapshot = ProbeSnapshot {
+            feeds: vec![f],
+            ..run()
+        };
+        let html = render_run_report(&snapshot);
+
+        assert!(html.contains("<h3>Rede</h3>"));
+        assert!(!html.contains("razão de perda"), "sem RTP, sem razão de perda");
+        assert!(!html.contains("FEC:"), "sem RTP, sem bloco de FEC");
+    }
+
     /// SPEC-PROBE-014 — o top é limitado a 10 e ordenado por severidade.
     #[test]
     fn spec_probe_014_top_events_are_capped_and_ranked() {
@@ -545,6 +760,7 @@ mod tests {
                 pid: None,
                 service_id: None,
                 local: false,
+                caused_by: None,
             });
         }
         let top = top_events(&f);

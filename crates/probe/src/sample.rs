@@ -15,22 +15,33 @@ use chrono::{DateTime, Utc};
 use ts::metrics::{MetricsSnapshot, PidType};
 use ts::Pid;
 
+use crate::ip::{csv_opt, csv_opt_f64, IpTick};
+use crate::session::Encapsulation;
 use crate::severity::Severity;
 
 /// Versão do layout de colunas de `metrics.csv`.
 ///
-/// Gravada em `session.toml`; a camada IP (spec-14) anexa colunas à mesma
-/// linha e **incrementa** este número.
+/// Versão 2 acrescenta as colunas da camada IP (spec-14 §6).  As colunas da
+/// camada base **não** mudam de posição nem de nome, então uma planilha da
+/// versão 1 continua legível; a versão existe para que quem lê o CSV saiba se
+/// pode esperar as colunas `rtp_*`/`fec_*`.
 ///
-/// §6.1
-pub const CSV_SCHEMA_VERSION: u32 = 1;
+/// §6.1 · spec-14 §6
+pub const CSV_SCHEMA_VERSION: u32 = 2;
 
 /// Cabeçalho de `metrics.csv` — a ordem das colunas é fixa e versionada.
 ///
-/// §6.1
+/// §6.1 · spec-14 §6
 pub const CSV_HEADER: &str = "ts_utc,uptime_s,connected,bitrate_kbps,null_ratio,\
 cc_errors_delta,crc_errors_delta,sync_loss_delta,pcr_jitter_delta,pcr_disc_delta,\
-local_drops_delta,sched_jitter_ms,worst_severity";
+local_drops_delta,sched_jitter_ms,worst_severity,\
+encapsulation,ip_datagrams,ip_bytes,ip_mbps,ts_per_datagram,\
+rtp_received,rtp_missing_delta,rtp_dup_delta,rtp_reorder_delta,rtp_too_old_delta,\
+rtp_loss_ratio,ssrc,\
+iat_min_us,iat_avg_us,iat_max_us,iat_sd_us,iat_p99_us,iat_expected_us,\
+rfc3550_jitter_us,\
+fec_present,fec_l,fec_d,fec_overhead_pct,\
+source_ip,source_count";
 
 /// Contadores brutos que a probe amostra a cada tick.
 ///
@@ -286,6 +297,10 @@ pub struct ProbeSample {
     pub sched_jitter_ms: f64,
     /// Pior severidade aberta no instante da amostra (SPEC-PROBE-009).
     pub worst_severity: Option<Severity>,
+    /// Camada IP do mesmo segundo; `None` antes do primeiro datagrama.
+    ///
+    /// spec-14 §6 — sai como colunas vazias, não como zeros.
+    pub ip: Option<IpTick>,
 }
 
 impl ProbeSample {
@@ -296,7 +311,7 @@ impl ProbeSample {
     ///
     /// SPEC-PROBE-006
     pub fn to_csv(&self) -> String {
-        format!(
+        let base = format!(
             "{},{},{},{:.1},{:.5},{},{},{},{},{},{},{:.1},{}",
             self.ts_utc.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
             self.uptime_s,
@@ -311,7 +326,78 @@ impl ProbeSample {
             self.local_drops_delta,
             self.sched_jitter_ms,
             self.worst_severity.map_or("", Severity::label),
-        )
+        );
+        format!("{base},{}", self.ip_columns())
+    }
+
+    /// As colunas da camada IP (spec-14 §6).
+    ///
+    /// Campo não observável ou não aplicável sai **vazio**, nunca como `0`:
+    /// zero significa "medido e deu zero".  Num feed `Udp` puro toda a faixa
+    /// `rtp_*`/`fec_*` sai vazia, e é isso que distingue "não medido" de
+    /// "medido e sem perda" quando a planilha for aberta 12 h depois.
+    fn ip_columns(&self) -> String {
+        let Some(ip) = &self.ip else {
+            // Colunas vazias: a aridade da linha não pode depender de haver ou
+            // não datagrama no segundo, senão a planilha desalinha.
+            return ",".repeat(IP_COLUMNS - 1);
+        };
+
+        let rtp = ip.rtp;
+        let fec = &ip.fec;
+        // `fec_present` só é afirmável quando a probe está de fato escutando as
+        // portas de FEC; com `fec = off` a coluna fica vazia.
+        let fec_present = if fec.listening {
+            u8::from(fec.present).to_string()
+        } else {
+            String::new()
+        };
+
+        [
+            encapsulation_label(ip.encapsulation).to_string(),
+            ip.datagrams.to_string(),
+            ip.bytes.to_string(),
+            format!("{:.4}", ip.mbps),
+            csv_opt_f64(ip.ts_per_datagram, 2),
+            csv_opt(rtp.map(|r| r.received)),
+            csv_opt(rtp.map(|r| r.missing)),
+            csv_opt(rtp.map(|r| r.dup)),
+            csv_opt(rtp.map(|r| r.reorder)),
+            csv_opt(rtp.map(|r| r.too_old)),
+            ip.loss_ratio.map_or(String::new(), |v| format!("{v:.9}")),
+            ip.ssrc.map_or(String::new(), |s| format!("0x{s:08X}")),
+            csv_opt_f64(ip.iat.min_us, 1),
+            csv_opt_f64(ip.iat.avg_us, 1),
+            csv_opt_f64(ip.iat.max_us, 1),
+            csv_opt_f64(ip.iat.sd_us, 2),
+            csv_opt_f64(ip.iat.p99_us, 1),
+            csv_opt_f64(ip.iat_expected_us, 1),
+            csv_opt_f64(ip.jitter_us, 2),
+            fec_present,
+            csv_opt(fec.l),
+            csv_opt(fec.d),
+            csv_opt_f64(fec.overhead_pct, 2),
+            // Uma coluna só: a fonte esperada é uma.  Duas fontes viram evento
+            // `multi_source`, e `source_count` é o que denuncia na planilha.
+            ip.sources
+                .first()
+                .map_or(String::new(), |a| a.ip().to_string()),
+            ip.sources.len().to_string(),
+        ]
+        .join(",")
+    }
+}
+
+/// Quantas colunas a camada IP acrescenta à linha.
+const IP_COLUMNS: usize = 25;
+
+/// Rótulo estável do encapsulamento no CSV.
+fn encapsulation_label(enc: Encapsulation) -> &'static str {
+    match enc {
+        Encapsulation::Unknown => "",
+        Encapsulation::Udp => "udp",
+        Encapsulation::Rtp => "rtp",
+        Encapsulation::RtpFec => "rtp+fec",
     }
 }
 
@@ -498,6 +584,7 @@ mod tests {
             local_drops_delta: 0,
             sched_jitter_ms: 2.4,
             worst_severity: Some(Severity::Error),
+            ip: None,
         };
 
         let row = s.to_csv();
@@ -507,9 +594,199 @@ mod tests {
             "linha e cabeçalho precisam ter a mesma aridade"
         );
         assert!(!row.contains('\n'));
-        assert!(row.ends_with(",error"));
+        assert!(row.contains(",error,"), "a severidade continua na 13ª coluna");
         assert!(row.contains(",15002.4,"), "bitrate sem notação científica");
         assert!(row.starts_with("2023-11-14T22:13:20.000Z,3661,1,"));
+    }
+
+    /// spec-14 §6 — a versão 2 acrescenta as colunas da camada IP **sem** mexer
+    /// nas da camada base: uma planilha da versão 1 continua legível porque as
+    /// 13 primeiras colunas não mudaram de nome nem de posição.
+    #[test]
+    fn spec_probe_ip_011_csv_v2_appends_without_moving_base_columns() {
+        assert_eq!(CSV_SCHEMA_VERSION, 2);
+        const V1_HEADER: &str = "ts_utc,uptime_s,connected,bitrate_kbps,null_ratio,\
+cc_errors_delta,crc_errors_delta,sync_loss_delta,pcr_jitter_delta,pcr_disc_delta,\
+local_drops_delta,sched_jitter_ms,worst_severity";
+        assert!(
+            CSV_HEADER.starts_with(V1_HEADER),
+            "as colunas da versão 1 precisam continuar no mesmo lugar"
+        );
+        let v1_cols = V1_HEADER.split(',').count();
+        assert_eq!(CSV_HEADER.split(',').count(), v1_cols + IP_COLUMNS);
+
+        // As colunas anexadas são exatamente as do §6 da spec-14.
+        let appended: Vec<&str> = CSV_HEADER.split(',').skip(v1_cols).collect();
+        assert_eq!(
+            appended,
+            [
+                "encapsulation",
+                "ip_datagrams",
+                "ip_bytes",
+                "ip_mbps",
+                "ts_per_datagram",
+                "rtp_received",
+                "rtp_missing_delta",
+                "rtp_dup_delta",
+                "rtp_reorder_delta",
+                "rtp_too_old_delta",
+                "rtp_loss_ratio",
+                "ssrc",
+                "iat_min_us",
+                "iat_avg_us",
+                "iat_max_us",
+                "iat_sd_us",
+                "iat_p99_us",
+                "iat_expected_us",
+                "rfc3550_jitter_us",
+                "fec_present",
+                "fec_l",
+                "fec_d",
+                "fec_overhead_pct",
+                "source_ip",
+                "source_count",
+            ]
+        );
+    }
+
+    /// spec-14 §6 — num feed UDP puro toda a faixa `rtp_*`/`fec_*` sai **vazia**,
+    /// e não zerada: zero significaria "medido e sem perda", que é uma
+    /// afirmação que ninguém verificou.
+    #[test]
+    fn spec_probe_ip_043_udp_row_leaves_rtp_and_fec_columns_empty() {
+        let ip = IpTick {
+            encapsulation: Encapsulation::Udp,
+            datagrams: 1_400,
+            bytes: 1_842_400,
+            mbps: 14.7392,
+            ts_per_datagram: Some(7.0),
+            sources: vec!["10.0.0.9:50000".parse().expect("addr")],
+            rtp: None,
+            iat: net::IatSummary {
+                count: 1_399,
+                min_us: Some(690.0),
+                avg_us: Some(701.9),
+                max_us: Some(715.0),
+                sd_us: Some(2.5),
+                p50_us: Some(700.0),
+                p95_us: Some(710.0),
+                p99_us: Some(712.0),
+                ..Default::default()
+            },
+            iat_expected_us: Some(701.9),
+            ..Default::default()
+        };
+        let row = sample_with(Some(ip)).to_csv();
+        let cols: Vec<&str> = row.split(',').collect();
+        assert_eq!(cols.len(), CSV_HEADER.split(',').count());
+
+        let col = |name: &str| {
+            let idx = CSV_HEADER
+                .split(',')
+                .position(|c| c == name)
+                .unwrap_or_else(|| panic!("coluna {name} não existe"));
+            cols[idx]
+        };
+
+        assert_eq!(col("encapsulation"), "udp");
+        assert_eq!(col("ip_datagrams"), "1400");
+        assert_eq!(col("ts_per_datagram"), "7.00");
+        assert_eq!(col("iat_avg_us"), "701.9");
+        assert_eq!(col("source_ip"), "10.0.0.9");
+        assert_eq!(col("source_count"), "1");
+        for empty in [
+            "rtp_received",
+            "rtp_missing_delta",
+            "rtp_dup_delta",
+            "rtp_reorder_delta",
+            "rtp_too_old_delta",
+            "rtp_loss_ratio",
+            "ssrc",
+            "rfc3550_jitter_us",
+            "fec_present",
+            "fec_l",
+            "fec_d",
+            "fec_overhead_pct",
+        ] {
+            assert_eq!(col(empty), "", "{empty} deveria sair vazia num feed UDP");
+        }
+    }
+
+    /// spec-14 §6 — num feed `RtpFec` as colunas de RTP e FEC saem preenchidas,
+    /// e um zero medido continua sendo `0`.
+    #[test]
+    fn spec_probe_ip_011_rtp_fec_row_carries_every_measured_value() {
+        let ip = IpTick {
+            encapsulation: Encapsulation::RtpFec,
+            datagrams: 1_400,
+            bytes: 1_859_200,
+            mbps: 14.8736,
+            ts_per_datagram: Some(7.0),
+            ssrc: Some(0x1A2B_3C4D),
+            rtp: Some(crate::ip::RtpDelta {
+                received: 1_400,
+                missing: 0,
+                dup: 0,
+                reorder: 2,
+                too_old: 0,
+                source_restarts: 0,
+                ssrc_changes: 0,
+            }),
+            loss_ratio: Some(0.0),
+            jitter_us: Some(38.5),
+            fec: crate::ip::FecStatus {
+                present: true,
+                listening: true,
+                l: Some(8),
+                d: Some(5),
+                streams: 2,
+                overhead_pct: Some(12.5),
+                ssrc_mismatch: false,
+                datagrams: 40,
+            },
+            ..Default::default()
+        };
+        let row = sample_with(Some(ip)).to_csv();
+        let cols: Vec<&str> = row.split(',').collect();
+        let col = |name: &str| {
+            let idx = CSV_HEADER
+                .split(',')
+                .position(|c| c == name)
+                .expect("coluna existe");
+            cols[idx]
+        };
+
+        assert_eq!(col("encapsulation"), "rtp+fec");
+        assert_eq!(col("rtp_received"), "1400");
+        assert_eq!(col("rtp_missing_delta"), "0", "zero medido é zero");
+        assert_eq!(col("rtp_reorder_delta"), "2");
+        assert_eq!(col("rtp_loss_ratio"), "0.000000000");
+        assert_eq!(col("ssrc"), "0x1A2B3C4D");
+        assert_eq!(col("rfc3550_jitter_us"), "38.50");
+        assert_eq!(col("fec_present"), "1");
+        assert_eq!(col("fec_l"), "8");
+        assert_eq!(col("fec_d"), "5");
+        assert_eq!(col("fec_overhead_pct"), "12.50");
+    }
+
+    /// Amostra da camada base com a camada IP anexada.
+    fn sample_with(ip: Option<IpTick>) -> ProbeSample {
+        ProbeSample {
+            ts_utc: Utc.timestamp_opt(1_700_000_000, 0).single().expect("ts"),
+            uptime_s: 10,
+            connected: true,
+            bitrate_kbps: 15_002.4,
+            null_ratio: 0.03,
+            cc_errors_delta: 0,
+            crc_errors_delta: 0,
+            sync_loss_delta: 0,
+            pcr_jitter_delta: 0,
+            pcr_disc_delta: 0,
+            local_drops_delta: 0,
+            sched_jitter_ms: 0.4,
+            worst_severity: None,
+            ip,
+        }
     }
 
     /// §6.1 — sem severidade aberta, a coluna fica vazia (não "none").
@@ -529,7 +806,10 @@ mod tests {
             local_drops_delta: 0,
             sched_jitter_ms: 0.0,
             worst_severity: None,
+            ip: None,
         };
-        assert!(s.to_csv().ends_with(",0.0,"));
+        let row = s.to_csv();
+        assert!(row.contains(",0.0,,"), "severidade vazia, não \"none\": {row}");
+        assert_eq!(row.split(',').count(), CSV_HEADER.split(',').count());
     }
 }

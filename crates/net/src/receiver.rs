@@ -1,16 +1,21 @@
 //! Loop de recepção UDP multicast.
 //!
-//! SPEC-NET-002
+//! O loop fala com um [`PacketSource`], não com um socket: é isso que permite
+//! trocar o backend (captura pcap, fase 4) sem tocar em nada acima
+//! (SPEC-PROBE-IP-001).
+//!
+//! SPEC-NET-002 · SPEC-PROBE-IP-004 · SPEC-PROBE-IP-009 · SPEC-PROBE-IP-012
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
 use bytes::Bytes;
 use crossbeam_channel::Sender;
-use socket2::{Domain, Protocol, Socket, Type};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{NetError, NetEvent};
+use crate::source::{Datagram, PacketSource, SocketSource, SocketSourceConfig};
 use crate::stop::StopToken;
 use crate::url::StreamUrl;
 
@@ -34,18 +39,47 @@ impl Default for ReceiverConfig {
     }
 }
 
+impl ReceiverConfig {
+    fn socket_config(&self) -> SocketSourceConfig {
+        SocketSourceConfig {
+            buf_size: self.buf_size,
+            timeout: Duration::from_millis(self.timeout_ms),
+        }
+    }
+}
+
+/// Para onde os datagramas recebidos vão.
+///
+/// O player só precisa dos bytes; a probe precisa do endereço de origem e do
+/// instante de chegada (SPEC-PROBE-IP-004 · SPEC-PROBE-IP-009).  Um `enum`
+/// evita duplicar o loop de recepção só por causa do tipo do canal.
+enum Sink {
+    Raw(Sender<Bytes>),
+    Full(Sender<Datagram>),
+}
+
+impl Sink {
+    /// `false` quando o canal está cheio — o chamador conta o descarte local.
+    fn send(&self, datagram: Datagram) -> bool {
+        match self {
+            Self::Raw(tx) => tx.try_send(datagram.data).is_ok(),
+            Self::Full(tx) => tx.try_send(datagram).is_ok(),
+        }
+    }
+}
+
 /// Receptor UDP multicast.
 ///
 /// SPEC-NET-002
 pub struct UdpReceiver {
     url: StreamUrl,
-    tx: Sender<Bytes>,
+    sink: Sink,
     events: Sender<NetEvent>,
     cfg: ReceiverConfig,
 }
 
 impl UdpReceiver {
-    /// Cria um novo `UdpReceiver`.
+    /// Cria um `UdpReceiver` que entrega apenas os bytes do payload.
     pub fn new(
         url: StreamUrl,
         tx: Sender<Bytes>,
@@ -54,7 +88,25 @@ impl UdpReceiver {
     ) -> Self {
         Self {
             url,
-            tx,
+            sink: Sink::Raw(tx),
+            events,
+            cfg,
+        }
+    }
+
+    /// Cria um `UdpReceiver` que entrega o datagrama completo.
+    ///
+    /// SPEC-PROBE-IP-004 · SPEC-PROBE-IP-009 — sem isto não há tempo de chegada
+    /// nem IP de origem, e metade dos checks da camada 1 deixa de existir.
+    pub fn with_datagrams(
+        url: StreamUrl,
+        tx: Sender<Datagram>,
+        events: Sender<NetEvent>,
+        cfg: ReceiverConfig,
+    ) -> Self {
+        Self {
+            url,
+            sink: Sink::Full(tx),
             events,
             cfg,
         }
@@ -70,146 +122,93 @@ impl UdpReceiver {
                 port,
                 iface,
                 source,
-            } => (*group, *port, *iface, *source),
-            StreamUrl::RtpMulticast {
+            }
+            | StreamUrl::RtpMulticast {
                 group,
                 port,
                 iface,
                 source,
             } => (*group, *port, *iface, *source),
         };
-        let iface_addr = iface.unwrap_or(Ipv4Addr::UNSPECIFIED);
 
-        // 1. Criar socket
-        let socket =
-            Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(NetError::Io)?;
-
-        // 2. SO_RCVBUF (SPEC-NET-002b)
-        socket
-            .set_recv_buffer_size(self.cfg.buf_size)
-            .map_err(NetError::Io)?;
-
-        // Verificar se o kernel truncou o tamanho solicitado
-        match socket.recv_buffer_size() {
-            Ok(actual) if actual < self.cfg.buf_size => {
-                warn!(
-                    requested = self.cfg.buf_size,
-                    actual = actual,
-                    "SO_RCVBUF truncado pelo kernel"
-                );
-            }
-            Ok(actual) => {
-                debug!(buf_size = actual, "SO_RCVBUF configurado");
-            }
+        let mut socket = match SocketSource::join(group, port, iface, source, self.cfg.socket_config())
+        {
+            Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "não foi possível verificar SO_RCVBUF");
+                // SPEC-PROBE-IP-012 — falha de bind/join/interface é uma
+                // transição registrada, não só um `Err` que some no log.
+                let _ = self.events.try_send(NetEvent::JoinFailed {
+                    reason: e.to_string(),
+                });
+                return Err(e);
             }
-        }
+        };
 
-        // Permitir múltiplos processos no mesmo endereço
-        socket.set_reuse_address(true).map_err(NetError::Io)?;
-
-        // 3. Bind em 0.0.0.0:port
-        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-        socket.bind(&bind_addr.into()).map_err(NetError::Io)?;
-
-        // 4. IP_ADD_MEMBERSHIP / IP_ADD_SOURCE_MEMBERSHIP
-        if let Some(source_addr) = source {
-            socket
-                .join_ssm_v4(&source_addr, &group, &iface_addr)
-                .map_err(NetError::JoinFailed)?;
-            info!(source = %source_addr, group = %group, port = port, iface = %iface_addr, "SSM multicast join OK");
-        } else {
-            socket
-                .join_multicast_v4(&group, &iface_addr)
-                .map_err(NetError::JoinFailed)?;
-            info!(group = %group, port = port, iface = %iface_addr, "multicast join OK");
-        }
-
-        // Configurar timeout de leitura (SPEC-NET-002c)
-        socket
-            .set_read_timeout(Some(Duration::from_millis(self.cfg.timeout_ms)))
-            .map_err(NetError::Io)?;
-
+        let _ = self.events.try_send(NetEvent::Joined(socket.binding()));
         let _ = self.events.try_send(NetEvent::Started);
-
-        // Converter para UdpSocket da stdlib para facilitar recv
-        let std_socket: std::net::UdpSocket = socket.into();
 
         // Buffer de recepção (maior que um pacote TS máximo: 7 × 188 = 1316)
         let mut buf = vec![0u8; 65_536];
+        // SPEC-PROBE-IP-010 — duas fontes no mesmo grupo/porta é um diagnóstico,
+        // não um detalhe: o conjunto é minúsculo e só cresce quando muda.
+        let mut sources: HashSet<SocketAddrV4> = HashSet::new();
 
-        // 5. Loop de recepção
         loop {
             if stop.is_stopped() {
                 break;
             }
 
-            match std_socket.recv(&mut buf) {
-                Ok(n) => {
-                    let data = Bytes::copy_from_slice(&buf[..n]);
+            match socket.recv(&mut buf) {
+                Ok(Some(datagram)) => {
+                    if sources.insert(datagram.from) {
+                        let _ = self.events.try_send(NetEvent::SourceSeen(datagram.from));
+                    }
                     // backpressure: descarta se canal cheio
-                    if let Err(e) = self.tx.try_send(data) {
-                        warn!(error = %e, "canal de dados cheio; pacote descartado");
+                    if !self.sink.send(datagram) {
+                        warn!(group = %group, port, "canal de dados cheio; pacote descartado");
                     }
                 }
-                Err(e) if is_timeout(&e) => {
+                Ok(None) => {
                     // SPEC-NET-002c: timeout não é erro fatal
                     debug!("timeout de recepção");
                     let _ = self.events.try_send(NetEvent::Timeout);
                 }
-                Err(e) if is_interrupted(&e) => {
-                    // EINTR: tentar novamente
-                    debug!("recv interrompido (EINTR); continuando");
-                }
                 Err(e) => {
                     error!(error = %e, "erro fatal no recv");
-                    // Tentar leave antes de propagar o erro
-                    let sock2 = Socket::from(std_socket);
-                    if let Some(source_addr) = source {
-                        let _ = sock2.leave_ssm_v4(&source_addr, &group, &iface_addr);
-                    } else {
-                        let _ = sock2.leave_multicast_v4(&group, &iface_addr);
-                    }
-                    return Err(NetError::Io(e));
+                    socket.leave();
+                    let _ = self.events.try_send(NetEvent::Left);
+                    return Err(e);
                 }
             }
         }
 
-        // 6. IP_DROP_MEMBERSHIP + fechar socket (SPEC-NET-002d)
-        let sock2 = Socket::from(std_socket);
-        let leave_result = if let Some(source_addr) = source {
-            sock2.leave_ssm_v4(&source_addr, &group, &iface_addr)
-        } else {
-            sock2.leave_multicast_v4(&group, &iface_addr)
-        };
-        if let Err(e) = leave_result {
-            warn!(error = %e, "falha ao sair do grupo multicast");
-        }
-        info!(group = %group, "multicast leave OK");
-
+        // SPEC-NET-002d — IP_DROP_MEMBERSHIP + fechar socket.
+        socket.leave();
+        let _ = self.events.try_send(NetEvent::Left);
         let _ = self.events.try_send(NetEvent::Stopped);
+        info!(group = %group, "recepção encerrada");
         Ok(())
     }
 }
 
-/// Retorna `true` se o erro é um timeout de I/O.
-fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
+/// Portas de FEC derivadas da porta do feed.
+///
+/// SPEC-PROBE-IP-030 — a convenção do ST 2022-1 é `base+2` (coluna) e `base+4`
+/// (linha); para um feed em 50000, 50002 e 50004.  Devolve `None` quando a soma
+/// estouraria o espaço de portas, em vez de dar a volta e entrar num grupo que
+/// não tem nada a ver com o feed.
+pub fn fec_ports(base: u16, offsets: [u16; 2]) -> Option<(u16, u16)> {
+    Some((base.checked_add(offsets[0])?, base.checked_add(offsets[1])?))
 }
 
-/// Retorna `true` se o erro é uma interrupção (EINTR).
-fn is_interrupted(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::Interrupted
-}
+/// Endereço não especificado, usado quando a origem não é conhecida.
+pub const UNSPECIFIED_SOURCE: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
+    use std::time::Instant;
 
     /// SPEC-NET-002: timeout emite NetEvent::Timeout sem panic e sem Err.
     ///
@@ -219,9 +218,9 @@ mod tests {
         use std::thread;
 
         let url = StreamUrl::UdpMulticast {
-            group: "239.255.0.1".parse().unwrap(),
+            group: "239.255.0.1".parse().expect("grupo"),
             port: 54320,
-            iface: Some("127.0.0.1".parse().unwrap()),
+            iface: Some("127.0.0.1".parse().expect("iface")),
             source: None,
         };
         let (tx, _rx) = bounded::<Bytes>(16);
@@ -256,9 +255,9 @@ mod tests {
 
         // Porta alta para reduzir conflito; 0.0.0.0 bind pode falhar em CI sem privilégios
         let url = StreamUrl::UdpMulticast {
-            group: "239.255.0.2".parse().unwrap(),
+            group: "239.255.0.2".parse().expect("grupo"),
             port: 54321,
-            iface: Some("127.0.0.1".parse().unwrap()),
+            iface: Some("127.0.0.1".parse().expect("iface")),
             source: None,
         };
         let (tx, _rx) = bounded::<Bytes>(16);
@@ -280,7 +279,7 @@ mod tests {
                     started = true;
                     break;
                 }
-                NetEvent::Timeout => {
+                NetEvent::Timeout | NetEvent::JoinFailed { .. } => {
                     // Se chegou aqui sem Started, provavelmente falhou o join — encerra
                     break;
                 }
@@ -309,57 +308,69 @@ mod tests {
         }
     }
 
-    /// SPEC-NET-002: eventos Started e Stopped são emitidos na sequência correta.
+    /// SPEC-PROBE-IP-012 — o ciclo multicast é observável: `Joined` carrega a
+    /// interface e o `SO_RCVBUF` efetivos, e `Left` fecha o ciclo.
     #[test]
-    fn spec_net_002_events_started_stopped() {
+    fn spec_probe_ip_012_multicast_cycle_is_reported() {
         use std::thread;
 
         let url = StreamUrl::UdpMulticast {
-            group: "239.255.0.3".parse().unwrap(),
+            group: "239.255.0.3".parse().expect("grupo"),
             port: 54322,
-            iface: Some("127.0.0.1".parse().unwrap()),
+            iface: Some("127.0.0.1".parse().expect("iface")),
             source: None,
         };
         let (tx, _rx) = bounded::<Bytes>(16);
-        let (ev_tx, ev_rx) = bounded::<NetEvent>(32);
+        let (ev_tx, ev_rx) = bounded::<NetEvent>(64);
         let (token, handle) = StopToken::new();
         let cfg = ReceiverConfig {
             buf_size: 65536,
-            timeout_ms: 200,
+            timeout_ms: 100,
         };
         let recv = UdpReceiver::new(url, tx, ev_tx, cfg);
-
         let jh = thread::spawn(move || recv.run(token));
 
-        // Coletar eventos por até ~600 ms
-        let deadline = std::time::Instant::now() + Duration::from_millis(600);
-        let mut events = Vec::new();
-        loop {
-            if std::time::Instant::now() > deadline {
-                handle.stop();
-                break;
-            }
-            match ev_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(ev) => {
-                    let is_started = matches!(ev, NetEvent::Started);
-                    events.push(ev);
-                    if is_started {
-                        handle.stop();
-                        break;
-                    }
-                }
-                Err(_) => {
-                    handle.stop();
+        let deadline = Instant::now() + Duration::from_millis(1_500);
+        let mut binding = None;
+        let mut failed = false;
+        while Instant::now() < deadline {
+            match ev_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(NetEvent::Joined(b)) => {
+                    binding = Some(b);
                     break;
                 }
+                Ok(NetEvent::JoinFailed { .. }) => {
+                    failed = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
-
+        handle.stop();
         let _ = jh.join();
 
-        // Se o ambiente suporta multicast, deve ter Started
-        // Em CI sem suporte, o teste apenas não deve ter panic
-        // (não afirmamos Started obrigatoriamente, pois requer privilégio de rede)
-        let _ = events; // eventos coletados sem assertions obrigatórias de ordem
+        if failed {
+            return; // ambiente sem multicast — nada a afirmar
+        }
+        let Some(b) = binding else {
+            return;
+        };
+        assert_eq!(b.port, 54322);
+        assert_eq!(b.iface_label(), "127.0.0.1");
+        assert!(b.so_rcvbuf_bytes > 0);
+        assert!(
+            ev_rx.try_iter().any(|e| matches!(e, NetEvent::Left)),
+            "o leave precisa fechar o ciclo"
+        );
+    }
+
+    /// SPEC-PROBE-IP-030 — as portas de FEC saem do próprio feed: 50000 ⇒
+    /// 50002 (coluna) e 50004 (linha).
+    #[test]
+    fn spec_probe_ip_030_fec_ports_derive_from_the_feed_port() {
+        assert_eq!(fec_ports(50_000, [2, 4]), Some((50_002, 50_004)));
+        // Perto do teto do espaço de portas, não dá a volta.
+        assert_eq!(fec_ports(65_534, [2, 4]), None);
     }
 }

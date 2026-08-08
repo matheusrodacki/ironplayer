@@ -59,6 +59,61 @@ pub const RGB_OK: u32 = 0x57_c0_8a;
 /// SPEC-PROBE-009 exige que "sem dado" não seja confundido com "sem erro".
 pub const RGB_NO_DATA: u32 = 0x3a_43_4d;
 
+/// Cor de um check **não aplicável** ao encapsulamento ou ao backend.
+///
+/// SPEC-PROBE-IP-049 — "não aplicável" e "sem dado" são coisas diferentes e
+/// precisam de tratamento visual distinto: uma célula de escopo que ainda não
+/// existia não é a mesma coisa que um check que nunca vai ser avaliado neste
+/// feed.  Antes da spec-14 as duas usavam [`RGB_NO_DATA`], e a grade dizia
+/// "cinza" para os dois casos sem meio de distingui-los.
+pub const RGB_NOT_APPLICABLE: u32 = 0x2a_2f_3a;
+
+/// Linha da grade de saúde (ou painel) em que os eventos de uma camada
+/// aparecem.
+///
+/// SPEC-PROBE-IP-050 — o mapa camada → superfície precisa ser **total**: um
+/// check cuja camada não caia em lugar nenhum existe no `events.jsonl` e nunca
+/// aparece na grade, ou seja, fica invisível justamente no artefato que se olha
+/// depois de 12 h.  É uma falha silenciosa, por isso tem teste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HealthRow {
+    /// `IP / UDP` — ou só `IP` num feed UDP puro (SPEC-PROBE-IP-048).
+    Network,
+    /// `RTP / FEC` — existe só quando o feed tem RTP.
+    Rtp,
+    /// `TRANSPORTE`.
+    Transport,
+    /// Linhas de serviço e de PID: presença de vídeo e de áudio.
+    Content,
+    /// Painel "Saúde da probe" (§8.2) — autodiagnóstico não é saúde do sinal e
+    /// não disputa espaço com ele na grade.
+    ProbeHealth,
+}
+
+impl HealthRow {
+    /// Rótulo da linha na grade.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Network => "IP / UDP",
+            Self::Rtp => "RTP / FEC",
+            Self::Transport => "TRANSPORTE",
+            Self::Content => "CONTEÚDO",
+            Self::ProbeHealth => "SAÚDE DA PROBE",
+        }
+    }
+
+    /// Camadas cujos eventos caem nesta linha.
+    pub fn layers(self) -> &'static [Layer] {
+        match self {
+            Self::Network => &[Layer::Ip],
+            Self::Rtp => &[Layer::Rtp],
+            Self::Transport => &[Layer::Ts],
+            Self::Content => &[Layer::Video, Layer::Audio],
+            Self::ProbeHealth => &[Layer::Probe],
+        }
+    }
+}
+
 /// Camada do pipeline à qual um check pertence.
 ///
 /// SPEC-PROBE-007 define `Ip | Ts`; as demais existem para alimentar os
@@ -113,6 +168,31 @@ impl Layer {
     /// SPEC-PROBE-018
     pub const TILE_ORDER: [Layer; 5] =
         [Layer::Ip, Layer::Rtp, Layer::Ts, Layer::Video, Layer::Audio];
+
+    /// Todas as camadas — usado pelo teste de cobertura da grade.
+    ///
+    /// SPEC-PROBE-IP-050
+    pub const ALL: [Layer; 6] = [
+        Layer::Ip,
+        Layer::Rtp,
+        Layer::Ts,
+        Layer::Video,
+        Layer::Audio,
+        Layer::Probe,
+    ];
+
+    /// Onde os eventos desta camada aparecem.
+    ///
+    /// SPEC-PROBE-IP-050
+    pub fn health_row(self) -> HealthRow {
+        match self {
+            Self::Ip => HealthRow::Network,
+            Self::Rtp => HealthRow::Rtp,
+            Self::Ts => HealthRow::Transport,
+            Self::Video | Self::Audio => HealthRow::Content,
+            Self::Probe => HealthRow::ProbeHealth,
+        }
+    }
 }
 
 /// Estado de saúde de uma camada num tile do mosaico.
@@ -137,9 +217,20 @@ impl LayerHealth {
     /// SPEC-PROBE-018
     pub fn rgb(self) -> u32 {
         match self {
-            Self::NotApplicable => RGB_NO_DATA,
+            Self::NotApplicable => RGB_NOT_APPLICABLE,
             Self::Ok => RGB_OK,
             Self::Degraded(sev) => sev.rgb(),
+        }
+    }
+
+    /// Rótulo do tooltip — é ele que diz qual cinza é qual.
+    ///
+    /// SPEC-PROBE-IP-049
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "n/a",
+            Self::Ok => "ok",
+            Self::Degraded(sev) => sev.label(),
         }
     }
 
@@ -173,11 +264,34 @@ mod tests {
         assert_ne!(RGB_NO_DATA, RGB_OK);
     }
 
-    /// SPEC-PROBE-018a — camada inaplicável não vira verde.
+    /// SPEC-PROBE-018a · SPEC-PROBE-IP-049 — inaplicável não é verde **nem**
+    /// "sem dado": são três estados distintos e a UI precisa poder separá-los.
     #[test]
-    fn spec_probe_018a_not_applicable_is_not_green() {
+    fn spec_probe_ip_049_not_applicable_differs_from_ok_and_from_no_data() {
         assert_ne!(LayerHealth::NotApplicable.rgb(), RGB_OK);
+        assert_ne!(LayerHealth::NotApplicable.rgb(), RGB_NO_DATA);
+        assert_ne!(RGB_NO_DATA, RGB_OK);
         assert_eq!(LayerHealth::Ok.rgb(), RGB_OK);
+        assert_eq!(LayerHealth::NotApplicable.label(), "n/a");
+        assert_eq!(
+            LayerHealth::Degraded(Severity::Error).label(),
+            Severity::Error.label()
+        );
+    }
+
+    /// SPEC-PROBE-IP-050 — o mapa camada → superfície é total: nenhuma camada
+    /// fica sem lugar onde aparecer.
+    #[test]
+    fn spec_probe_ip_050_every_layer_has_a_surface() {
+        for layer in Layer::ALL {
+            let row = layer.health_row();
+            assert!(
+                row.layers().contains(&layer),
+                "{} não aparece na linha que declara representá-lo",
+                layer.label()
+            );
+            assert!(!row.label().is_empty());
+        }
     }
 
     /// SPEC-PROBE-018 — `worsen` mantém a pior severidade observada.

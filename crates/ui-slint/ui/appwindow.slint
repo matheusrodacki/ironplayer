@@ -29,7 +29,7 @@ export { Theme }
 import {
     ProbeMosaic, ProbeFeedView, ProbeServiceView, ProbeAlerts,
     ProbeTile, ProbeServiceTile, ProbeGridRow, ProbeGridCell, ProbeGridTick,
-    ProbeEventRow, ProbeAlertRow, ProbeChart, ProbeInfoRow
+    ProbeEventRow, ProbeAlertRow, ProbeChart, ProbeInfoRow, ProbeHistBar
 } from "probe.slint";
 export {
     ProbeTile, ProbeServiceTile, ProbeGridRow, ProbeGridCell, ProbeGridTick,
@@ -581,6 +581,17 @@ export component AppWindow inherits Window {
     in property <[ProbeInfoRow]> probe-summary: [];
     in property <[ProbeInfoRow]> probe-health: [];
     in property <[ProbeInfoRow]> probe-streams: [];
+    // Aba `Rede` do nível 1 — toda a camada IP (SPEC-PROBE-IP-047).
+    in property <[ProbeInfoRow]> probe-net-input: [];
+    in property <[ProbeInfoRow]> probe-net-rtp: [];
+    in property <[ProbeInfoRow]> probe-net-fec: [];
+    in property <[ProbeHistBar]> probe-net-histogram: [];
+    in property <string> probe-net-histogram-caption: "";
+    in property <bool> probe-net-rtp-applicable: true;
+    in property <bool> probe-net-fec-applicable: true;
+    in property <string> probe-net-rtp-hint: "";
+    in property <string> probe-net-fec-hint: "";
+    in property <string> probe-net-help: "";
     in-out property <int> probe-window-index: 1;
     in property <string> probe-severity-filter: "todas";
     // Nível 3: alertas consolidados da célula selecionada (SPEC-PROBE-025).
@@ -1747,6 +1758,16 @@ export component AppWindow inherits Window {
             events: root.probe-events;
             summary: root.probe-summary;
             health: root.probe-health;
+            net-input: root.probe-net-input;
+            net-rtp: root.probe-net-rtp;
+            net-fec: root.probe-net-fec;
+            net-histogram: root.probe-net-histogram;
+            net-histogram-caption: root.probe-net-histogram-caption;
+            net-rtp-applicable: root.probe-net-rtp-applicable;
+            net-fec-applicable: root.probe-net-fec-applicable;
+            net-rtp-hint: root.probe-net-rtp-hint;
+            net-fec-hint: root.probe-net-fec-hint;
+            net-help: root.probe-net-help;
             window-index: root.probe-window-index;
             severity-filter: root.probe-severity-filter;
             back => { root.probe-back(true); }

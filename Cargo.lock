@@ -3922,11 +3922,13 @@ dependencies = [
 name = "probe"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "crossbeam-channel",
  "net",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tempfile",
  "toml 0.8.23",
  "tracing",

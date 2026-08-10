@@ -57,8 +57,13 @@
     │                          IMPLEMENTADA em `crates/probe`, `src/feed.rs`, `src/probe_run.rs`,
     │                          `crates/ui-slint/ui/probe.slint`
     │
-    └── spec-14-probe-ip/
+    ├── spec-14-probe-ip/
         └── spec.md         ← SPEC-PROBE-IP-001–046: camada IP/UDP/RTP/FEC
+    │
+    ├── spec-15-probe-ts/
+    │   ├── spec.md         ← SPEC-PROBE-TS-001–018: checks e medições MPEG-TS
+    │   ├── design.md       ← contrato de eventos TS, PSI e PCR para a Probe
+    │   └── tasks.md        ← promoção incremental, fixtures e gates
 
     ├── spec-16-probe-video/
     │   ├── spec.md         ← SPEC-PROBE-VID-001–016: checks de vídeo e metadados/HDR
@@ -87,7 +92,7 @@
 | 8     | `spec-06-ui` (completo)    | `spec-07-av`, `spec-03-ts-tables`      | Alpha v0.2 + Beta v0.3 |
 | 9     | `spec-13-probe-mode` ✅    | `spec-04-ts-metrics`, `spec-11-slint`  | v0.4 Probe             |
 | 10    | `spec-14-probe-ip`         | `spec-13-probe-mode`, `spec-02-net`    | v0.4 Probe             |
-| 11    | `spec-15-probe-ts` (futura)| `spec-13-probe-mode`, `ts`             | v0.4 Probe             |
+| 11    | `spec-15-probe-ts`         | `spec-13-probe-mode`, `ts`             | v0.4 Probe             |
 | 12    | `spec-16-probe-video`      | `spec-13-probe-mode`, `spec-15`, `av`  | v0.4 Probe             |
 | 13    | `spec-17-probe-audio`      | `spec-13-probe-mode`, `spec-15`, `av`  | v0.4 Probe             |
 

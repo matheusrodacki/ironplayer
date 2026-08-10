@@ -1163,6 +1163,23 @@ mod tests {
         }
     }
 
+    /// Entrada com a PMT já conhecida e os bitrates A/V que a Probe deve
+    /// vigiar.  A presença sai dos PIDs da PMT, não do `PidType` do snapshot.
+    fn av_input(video_kbps: f64, audio_kbps: f64) -> TickInput {
+        let mut snapshot = metrics(15_000.0, &[], 0);
+        snapshot.pid_table[0].bitrate_kbps = video_kbps;
+        snapshot.pid_table[1].bitrate_kbps = audio_kbps;
+        TickInput {
+            metrics: Some(snapshot),
+            connected: true,
+            encapsulation: Encapsulation::Rtp,
+            video_pids: vec![100],
+            audio_pids: vec![101],
+            snapshot_state: SnapshotState::Ok,
+            ..Default::default()
+        }
+    }
+
     /// SPEC-PROBE-005 — o tick alimenta a série e a linha do tempo a 1 Hz.
     #[test]
     fn spec_probe_005_tick_feeds_series_and_timeline() {
@@ -1331,6 +1348,55 @@ mod tests {
             snap.layer_health.get(&Layer::Rtp),
             Some(&crate::severity::LayerHealth::NotApplicable)
         );
+    }
+
+    /// SPEC-PROBE-018 — depois que a PMT identifica os PIDs, ausência de
+    /// bitrate abre os checks A/V e a retomada os fecha após a histerese.
+    #[test]
+    fn spec_probe_018_av_presence_checks_open_and_clear_after_pmt() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        // Sem PMT, zero bitrate ainda é "não verificado", não alarme.
+        let mut no_pmt = connected_input(metrics(0.0, &[], 0));
+        no_pmt
+            .metrics
+            .as_mut()
+            .expect("snapshot de teste")
+            .pid_table[1]
+            .bitrate_kbps = 0.0;
+        assert!(eng.tick(no_pmt).is_empty());
+        clock.advance(Duration::from_secs(1));
+
+        // A PMT confirmou os dois PIDs; após 5 s abaixo de 1 kbps ambos abrem.
+        let mut opened = Vec::new();
+        for _ in 0..=5 {
+            opened.extend(eng.tick(av_input(0.0, 0.0)));
+            clock.advance(Duration::from_secs(1));
+        }
+        let video = opened
+            .iter()
+            .find(|event| event.check_id == CHECK_VIDEO_MISSING && event.phase == EventPhase::Open)
+            .expect("ausência de vídeo deve abrir");
+        let audio = opened
+            .iter()
+            .find(|event| event.check_id == CHECK_AUDIO_MISSING && event.phase == EventPhase::Open)
+            .expect("ausência de áudio deve abrir");
+        assert_eq!(video.severity, Severity::Critical);
+        assert_eq!(audio.severity, Severity::Error);
+
+        // Cinco segundos estáveis acima do limiar fecham os dois eventos.
+        let mut closed = Vec::new();
+        for _ in 0..=5 {
+            closed.extend(eng.tick(av_input(13_500.0, 192.0)));
+            clock.advance(Duration::from_secs(1));
+        }
+        assert!(closed.iter().any(|event| {
+            event.check_id == CHECK_VIDEO_MISSING && event.phase == EventPhase::Close
+        }));
+        assert!(closed.iter().any(|event| {
+            event.check_id == CHECK_AUDIO_MISSING && event.phase == EventPhase::Close
+        }));
     }
 
     /// SPEC-PROBE-013a — sob sobrecarga sustentada a probe degrada até o 3º

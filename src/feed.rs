@@ -710,6 +710,13 @@ impl FeedPipeline {
             handles.push(thread(format!("net-events-{slot}"), move || {
                 for evt in net_events_rx.iter() {
                     match evt {
+                        // SPEC-PROBE-IP-007 — fila `net_raw` cheia é perda
+                        // local observável; o engine a marca como tal no
+                        // evento correlacionado do mesmo tick.
+                        NetEvent::UdpBufferOverflow => {
+                            shared_t.add_local_drops(1);
+                            tracing::warn!(slot, "net-recv: canal de dados cheio; pacote descartado");
+                        }
                         NetEvent::Timeout => {
                             tracing::debug!(slot, "net-recv: timeout de recepção");
                         }

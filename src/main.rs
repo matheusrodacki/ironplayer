@@ -496,21 +496,21 @@ fn main() -> anyhow::Result<()> {
 
     // Thread: net-events — converte NetEvent → AggregatorNetEvent e repassa ao MetricsAggregator.
     //
-    // O canal `ch.net_events_rx` recebe eventos do UdpReceiver (Started, Timeout, Stopped).
-    // Este bridge drena o canal para evitar backpressure; quando NetEvent::UdpBufferOverflow
-    // for implementado no crate `net`, adicioná-lo aqui como `AggregatorNetEvent::UdpBufferOverflow`.
+    // O canal `ch.net_events_rx` recebe eventos do UdpReceiver e este bridge
+    // os repassa ao MetricsAggregator sem adicionar backpressure ao receiver.
     {
         let net_events_rx = ch.net_events_rx;
-        let _agg_net_tx_bridge = agg_net_tx.clone();
+        let agg_net_tx_bridge = agg_net_tx.clone();
         handles.push(
             std::thread::Builder::new()
                 .name("net-events".into())
                 .spawn(move || {
                     for evt in net_events_rx.iter() {
                         match evt {
-                            // TODO: quando net::NetEvent::UdpBufferOverflow for adicionado:
-                            // net::NetEvent::UdpBufferOverflow { .. } =>
-                            //     let _ = _agg_net_tx_bridge.try_send(AggregatorNetEvent::UdpBufferOverflow),
+                            net::NetEvent::UdpBufferOverflow => {
+                                let _ = agg_net_tx_bridge
+                                    .try_send(AggregatorNetEvent::UdpBufferOverflow);
+                            }
                             // O join efetivo (interface, `SO_RCVBUF`) e o ciclo
                             // multicast interessam ao modo Probe, que os grava
                             // no `session.toml`; no player só o log basta.

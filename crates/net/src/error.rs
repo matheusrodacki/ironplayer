@@ -33,6 +33,12 @@ pub enum NetError {
 /// SPEC-NET-002 · SPEC-PROBE-IP-009 · SPEC-PROBE-IP-012
 #[derive(Debug, Clone)]
 pub enum NetEvent {
+    /// Um datagrama foi descartado porque o canal bounded de saída estava
+    /// cheio. É uma perda local observável pela aplicação; não afirma que o
+    /// kernel descartou o pacote antes de `recv_from`.
+    ///
+    /// SPEC-METRICS-002c · SPEC-PROBE-IP-007
+    UdpBufferOverflow,
     /// Timeout sem pacotes recebidos.
     Timeout,
     /// Recepção iniciada com sucesso.

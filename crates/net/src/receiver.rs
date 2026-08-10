@@ -112,6 +112,13 @@ impl UdpReceiver {
         }
     }
 
+    /// Publica um descarte da fila de saída, sem confundi-lo com perda na
+    /// rede. O envio é não bloqueante: sob sobrecarga, o receiver continua
+    /// priorizando `recv_from`.
+    fn report_local_drop(&self) {
+        let _ = self.events.try_send(NetEvent::UdpBufferOverflow);
+    }
+
     /// Executa o loop de recepção na thread atual (bloqueante).
     ///
     /// SPEC-NET-002
@@ -166,6 +173,7 @@ impl UdpReceiver {
                     // backpressure: descarta se canal cheio
                     if !self.sink.send(datagram) {
                         warn!(group = %group, port, "canal de dados cheio; pacote descartado");
+                        self.report_local_drop();
                     }
                 }
                 Ok(None) => {
@@ -208,6 +216,36 @@ pub const UNSPECIFIED_SOURCE: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECI
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
+
+    /// SPEC-METRICS-002c · SPEC-PROBE-IP-007 — quando a fila bounded de
+    /// dados está cheia, o descarte local chega ao consumidor de métricas.
+    #[test]
+    fn spec_metrics_002c_full_output_channel_emits_udp_overflow() {
+        let (data_tx, _data_rx) = bounded::<Bytes>(0);
+        let (events_tx, events_rx) = bounded::<NetEvent>(1);
+        let receiver = UdpReceiver::new(
+            StreamUrl::parse("udp://@239.15.0.183:50000").expect("URL de teste"),
+            data_tx,
+            events_tx,
+            ReceiverConfig::default(),
+        );
+
+        let datagram = Datagram {
+            data: Bytes::from_static(b"payload"),
+            from: UNSPECIFIED_SOURCE,
+            at: std::time::Instant::now(),
+        };
+        assert!(
+            !receiver.sink.send(datagram),
+            "canal sem receptor está cheio"
+        );
+        receiver.report_local_drop();
+
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(NetEvent::UdpBufferOverflow)
+        ));
+    }
     use std::time::Instant;
 
     /// SPEC-NET-002: timeout emite NetEvent::Timeout sem panic e sem Err.

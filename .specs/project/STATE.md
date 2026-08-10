@@ -37,7 +37,7 @@ anti-suspensão, retenção e relatório HTML.
 | Portas de FEC `base+2`/`base+4` não são abertas (`net-fec-{slot}` não existe) | `Encapsulation::RtpFec` nunca é atingido; um feed com FEC exibe o badge `RTP` | spec-14 |
 | Sem PDV/inter-arrival/jitter de IP | `MetricId` não tem as séries de IP; o gráfico "PDV / inter-arrival" do §8.2 não aparece | spec-14 |
 | `metrics.csv` tem só as colunas da camada base (`csv_schema_version = 1`) | As colunas de IP do spec-14 §6 ainda não são anexadas | spec-14 |
-| `udp_overflows` nunca incrementa | `net::NetEvent` ainda não reporta overflow de buffer; o descarte local cobre canal cheio, não socket | crate `net` |
+| Overflow do **buffer do kernel** ainda não é observável pelo `SocketSource` | `NetEvent::UdpBufferOverflow` já contabiliza fila bounded de saída cheia e alimenta `udp_overflows`/`local_drops`; socket UDP comum no Windows não expõe o contador de drops | backend pcap/Npcap ou contador nativo futuro |
 
 **Débito de lint pré-existente** (fora dos arquivos do spec-13, não tocado):
 `crates/ts/tests/gen_fixtures.rs`, `src/table_dispatcher.rs` e

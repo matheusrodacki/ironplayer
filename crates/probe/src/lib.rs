@@ -35,13 +35,17 @@ pub mod service;
 pub mod session;
 pub mod severity;
 pub mod snapshot;
+pub mod video;
 pub mod writer;
 
 pub use check::{
     health_row_of, layer_of, CheckDef, CheckEngine, CheckProfile, Measurement, OpenCheck,
 };
 pub use clock::{ProbeClock, SystemClock, TestClock};
-pub use config::{FecMode, FecProfile, FeedConfig, ProbeConfig, TransportProfile, MAX_FEEDS};
+pub use config::{
+    FecMode, FecProfile, FeedConfig, ProbeConfig, TransportProfile, VideoProfileConfig,
+    VideoServiceProfile, MAX_FEEDS,
+};
 pub use degrade::{DegradeController, DegradePolicy, OverloadSignals};
 pub use engine::{FeedIdentity, ProbeEngine, PsiObservation, TickInput, AVAILABILITY_WINDOW_SECS};
 pub use event::{EventContext, EventOrigin, EventPhase, ProbeEvent};
@@ -65,5 +69,12 @@ pub use severity::{HealthRow, Layer, LayerHealth, Severity};
 pub use snapshot::{
     DegradationStage, EventRow, FeedSnapshot, ProbeHealth, ProbeSnapshot, ServiceSnapshot,
     SnapshotState, StreamSnapshot,
+};
+pub use video::{
+    validate_elementary_stream, video_observation_channel, ActiveFormat, AspectRatio,
+    DetectorResult, ElementaryStreamError, ElementaryStreamErrorKind, GopStats, HdrMetadata,
+    HdrValue, MetadataChange, Rate, ScanType, VideoAnalysis, VideoAnalyzer, VideoAvailability,
+    VideoCodec, VideoFrameObservation, VideoMetadataObservation, VideoObservationError,
+    VideoObservationSender, VideoProfile,
 };
 pub use writer::{writer_channel, ProbeWriter, WriteJob, WriterHandle};

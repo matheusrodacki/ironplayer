@@ -2043,9 +2043,10 @@ pub fn find_ffmpeg_dll_dir() -> Option<std::path::PathBuf> {
     // 1. Variável de ambiente explícita (útil em testes CI)
     if let Ok(dir) = std::env::var("FFMPEG_DLL_DIR") {
         let p = std::path::PathBuf::from(dir);
-        if p.join(DLL_AVCODEC).exists() {
-            return Some(p);
-        }
+        // Uma configuração explícita é um contrato, não uma sugestão. Cair
+        // silenciosamente no bundle local após um caminho inválido mascara
+        // deploy/configuração quebrada e torna impossível testá-la.
+        return p.join(DLL_AVCODEC).exists().then_some(p);
     }
 
     // 2. Diretório do executável atual

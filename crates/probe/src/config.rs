@@ -185,6 +185,86 @@ pub struct CheckOverride {
     pub severity: Option<Severity>,
 }
 
+/// Override de análise de vídeo para um serviço específico.
+///
+/// Campos ausentes herdam o bloco `[probe.video]`; um serviço desligado não
+/// deve instanciar decoder ou analisador secundário.
+///
+/// SPEC-PROBE-VID-001
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VideoServiceProfile {
+    pub enabled: Option<bool>,
+    pub sample_fps: Option<u16>,
+}
+
+/// Perfil auditável dos observadores e detectores de vídeo.
+///
+/// Os checks perceptuais começam desabilitados: seus limiares são política
+/// operacional, não valores intrínsecos do decoder.
+///
+/// SPEC-PROBE-VID-001 · SPEC-PROBE-VID-006 · SPEC-PROBE-VID-008
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VideoProfileConfig {
+    pub enabled: bool,
+    pub sample_fps: u16,
+    pub luma_max_width: u16,
+    pub luma_max_height: u16,
+    pub observation_capacity: usize,
+    pub freeze_enabled: bool,
+    pub freeze_similarity: u8,
+    pub freeze_duration_secs: f64,
+    pub black_enabled: bool,
+    pub black_luma_threshold: u8,
+    pub black_coverage_pct: u8,
+    pub black_duration_secs: f64,
+    pub blockiness_enabled: bool,
+    pub blockiness_threshold: f64,
+    /// Chave TOML: `[probe.video.services.<service_id>]`.
+    pub services: BTreeMap<u16, VideoServiceProfile>,
+}
+
+impl Default for VideoProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_fps: 1,
+            luma_max_width: 160,
+            luma_max_height: 90,
+            observation_capacity: 8,
+            freeze_enabled: false,
+            freeze_similarity: 2,
+            freeze_duration_secs: 3.0,
+            black_enabled: false,
+            black_luma_threshold: 16,
+            black_coverage_pct: 95,
+            black_duration_secs: 1.0,
+            blockiness_enabled: false,
+            blockiness_threshold: 20.0,
+            services: BTreeMap::new(),
+        }
+    }
+}
+
+impl VideoProfileConfig {
+    /// Resolve os valores do perfil para um serviço sem criar estado de análise.
+    ///
+    /// SPEC-PROBE-VID-001
+    pub fn effective_for_service(&self, service_id: u16) -> VideoProfileConfig {
+        let mut effective = self.clone();
+        if let Some(service) = self.services.get(&service_id) {
+            if let Some(enabled) = service.enabled {
+                effective.enabled = enabled;
+            }
+            if let Some(sample_fps) = service.sample_fps {
+                effective.sample_fps = sample_fps.max(1);
+            }
+        }
+        effective
+    }
+}
+
 /// Perfil operacional dos checks MPEG-TS.
 ///
 /// O parser TS continua funcionando para o player quando este bloco está
@@ -279,6 +359,9 @@ pub struct ProbeConfig {
     /// Default `false`: Broadcast não deve pagar o custo de escrita em disco (§3.1).
     pub enabled_in_broadcast: bool,
 
+    /// Perfil dos observadores compactos e detectores de vídeo (spec-16).
+    pub video: VideoProfileConfig,
+
     /// Perfil da camada de transporte MPEG-TS (spec-15).
     pub transport: TransportProfile,
 
@@ -343,6 +426,7 @@ impl Default for ProbeConfig {
             retention_days: 14,
             max_disk_mb: 4096,
             enabled_in_broadcast: false,
+            video: VideoProfileConfig::default(),
             transport: TransportProfile::default(),
             reorder_window_ms: 200,
             correlation_window_ms: 1000,
@@ -572,6 +656,10 @@ mod tests {
         assert_eq!(c.retention_days, 14);
         assert_eq!(c.max_disk_mb, 4096);
         assert!(!c.enabled_in_broadcast);
+        assert!(c.video.enabled);
+        assert!(!c.video.freeze_enabled);
+        assert!(!c.video.black_enabled);
+        assert!(!c.video.blockiness_enabled);
         assert!(c.transport.enabled);
         assert!(!c.transport.tstd_enabled);
         assert!(!c.transport.mgf_mgb_enabled);
@@ -736,6 +824,23 @@ severity = "warning"
         assert_eq!(o.severity, Some(Severity::Warning));
         // Campos ausentes continuam None — o default embutido prevalece.
         assert_eq!(o.enabled, None);
+    }
+
+    /// SPEC-PROBE-VID-001 — o serviço pode ser desligado sem afetar os demais.
+    #[test]
+    fn spec_probe_vid_001_service_profile_overrides_without_global_mutation() {
+        let mut video = VideoProfileConfig::default();
+        video.services.insert(
+            42,
+            VideoServiceProfile {
+                enabled: Some(false),
+                sample_fps: Some(4),
+            },
+        );
+        let service = video.effective_for_service(42);
+        assert!(!service.enabled);
+        assert_eq!(service.sample_fps, 4);
+        assert!(video.effective_for_service(7).enabled);
     }
 
     /// SPEC-PROBE-017 — feeds sem URL são descartados e a lista é truncada.

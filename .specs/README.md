@@ -59,6 +59,16 @@
     │
     └── spec-14-probe-ip/
         └── spec.md         ← SPEC-PROBE-IP-001–046: camada IP/UDP/RTP/FEC
+
+    ├── spec-16-probe-video/
+    │   ├── spec.md         ← SPEC-PROBE-VID-001–016: checks de vídeo e metadados/HDR
+    │   ├── design.md       ← contrato de observações de frame e análise por serviço
+    │   └── tasks.md        ← entrega incremental e fixtures determinísticas
+    │
+    └── spec-17-probe-audio/
+        ├── spec.md         ← SPEC-PROBE-AUD-001–014: checks PCM e metadados de áudio
+        ├── design.md       ← contrato de amostras PCM, medidores e estado por canal
+        └── tasks.md        ← entrega incremental e fixtures determinísticas
 ```
 
 ---
@@ -77,6 +87,9 @@
 | 8     | `spec-06-ui` (completo)    | `spec-07-av`, `spec-03-ts-tables`      | Alpha v0.2 + Beta v0.3 |
 | 9     | `spec-13-probe-mode` ✅    | `spec-04-ts-metrics`, `spec-11-slint`  | v0.4 Probe             |
 | 10    | `spec-14-probe-ip`         | `spec-13-probe-mode`, `spec-02-net`    | v0.4 Probe             |
+| 11    | `spec-15-probe-ts` (futura)| `spec-13-probe-mode`, `ts`             | v0.4 Probe             |
+| 12    | `spec-16-probe-video`      | `spec-13-probe-mode`, `spec-15`, `av`  | v0.4 Probe             |
+| 13    | `spec-17-probe-audio`      | `spec-13-probe-mode`, `spec-15`, `av`  | v0.4 Probe             |
 
 ---
 

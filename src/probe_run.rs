@@ -251,7 +251,6 @@ impl ProbeRunner {
         Ok(())
     }
 
-
     /// Fecha o run, gravando o resumo de cada sessão.
     ///
     /// SPEC-PROBE-004 — "parar/fechar grava o resumo de cada uma".
@@ -466,6 +465,7 @@ fn spawn_engine_thread(mut t: EngineThread) -> Result<std::thread::JoinHandle<()
                     reconnect_attempts: t.shared.reconnect_attempts(),
                     services: (*t.shared.services()).clone(),
                     visuals: t.shared.visuals(),
+                    psi: t.shared.psi(),
                 });
                 for ev in &events {
                     tracing::debug!(

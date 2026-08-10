@@ -469,7 +469,9 @@ impl IpAnalyzer {
         let Some(header) = RtpHeader::parse(&datagram.data) else {
             return;
         };
-        let body = datagram.data.slice(header.header_len.min(datagram.data.len())..);
+        let body = datagram
+            .data
+            .slice(header.header_len.min(datagram.data.len())..);
         let Some(fec) = FecHeader::parse(&body) else {
             return;
         };
@@ -516,8 +518,8 @@ impl IpAnalyzer {
         let iat = self.iat.summary();
         let avg_payload = (self.window_datagrams > 0)
             .then(|| self.window_bytes as f64 / self.window_datagrams as f64);
-        let iat_expected_us = avg_payload
-            .and_then(|bytes| net::expected_iat_us(bytes, bitrate_kbps * 1000.0));
+        let iat_expected_us =
+            avg_payload.and_then(|bytes| net::expected_iat_us(bytes, bitrate_kbps * 1000.0));
 
         // SPEC-PROBE-IP-027 — em VBR o esperado não é constante, e afirmar
         // rajada em cima de uma referência que muda seria inventar defeito.
@@ -536,16 +538,15 @@ impl IpAnalyzer {
         let rtp_applicable = self.observed.has_rtp();
         let rtp = rtp_applicable.then_some(self.rtp_window);
         if rtp_applicable {
-            self.loss_history.push_back((
-                now,
-                self.rtp_window.received,
-                self.rtp_window.missing,
-            ));
+            self.loss_history
+                .push_back((now, self.rtp_window.received, self.rtp_window.missing));
         }
-        let cutoff = now
-            .checked_sub(self.cfg.loss_ratio_window)
-            .unwrap_or(now);
-        while self.loss_history.front().is_some_and(|(t, _, _)| *t < cutoff) {
+        let cutoff = now.checked_sub(self.cfg.loss_ratio_window).unwrap_or(now);
+        while self
+            .loss_history
+            .front()
+            .is_some_and(|(t, _, _)| *t < cutoff)
+        {
             self.loss_history.pop_front();
         }
         let (received, missing) = self
@@ -1081,7 +1082,11 @@ mod tests {
         let t0 = Instant::now();
         let mut a = analyzer(Encapsulation::Rtp);
         for i in 0..50u64 {
-            a.on_datagram(&rtp(60_000 + i as u16, 0xAAAA, t0 + Duration::from_millis(i)));
+            a.on_datagram(&rtp(
+                60_000 + i as u16,
+                0xAAAA,
+                t0 + Duration::from_millis(i),
+            ));
         }
         a.take_tick(t0 + Duration::from_secs(4), 15_000.0);
 
@@ -1199,11 +1204,7 @@ mod tests {
         // 1 s de CBR real: 1316 bytes de payload a cada 701,9 µs.
         let step_ns = 701_870u64;
         for i in 0..1_400u64 {
-            a.on_datagram(&rtp(
-                i as u16,
-                1,
-                t0 + Duration::from_nanos(i * step_ns),
-            ));
+            a.on_datagram(&rtp(i as u16, 1, t0 + Duration::from_nanos(i * step_ns)));
         }
         let tick = a.take_tick(t0 + Duration::from_secs(1), 15_002.4);
 
@@ -1285,7 +1286,13 @@ mod tests {
         }
         a.take_tick(t0 + Duration::from_secs(4), 15_000.0);
 
-        a.on_fec_datagram(&fec_datagram(false, 20, 8, 0xDEAD, t0 + Duration::from_secs(4)));
+        a.on_fec_datagram(&fec_datagram(
+            false,
+            20,
+            8,
+            0xDEAD,
+            t0 + Duration::from_secs(4),
+        ));
         let tick = a.take_tick(t0 + Duration::from_secs(5), 15_000.0);
         assert_eq!(tick.fec.lxd(), Some(160));
         assert!(tick.fec.ssrc_mismatch);
@@ -1363,6 +1370,10 @@ mod tests {
         assert_eq!(csv_opt(None::<u32>), "");
         assert_eq!(csv_opt_f64(Some(701.87), 1), "701.9");
         assert_eq!(csv_opt_f64(None, 1), "");
-        assert_eq!(csv_opt_f64(Some(0.0), 1), "0.0", "zero medido continua zero");
+        assert_eq!(
+            csv_opt_f64(Some(0.0), 1),
+            "0.0",
+            "zero medido continua zero"
+        );
     }
 }

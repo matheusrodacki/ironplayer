@@ -104,10 +104,26 @@ fn secs_to_duration(secs: f64) -> Duration {
 pub const CHECK_FEED_UNAVAILABLE: &str = "feed_unavailable";
 /// Perda de sincronismo TS.
 pub const CHECK_TS_SYNC_LOSS: &str = "ts_sync_loss";
+/// Byte de sincronização inválido antes da ressincronização.
+pub const CHECK_SYNC_BYTE_ERROR: &str = "sync_byte_error";
 /// Continuity counter error por PID.
 pub const CHECK_CC_ERROR: &str = "cc_error";
+/// Pacote com `transport_error_indicator`.
+pub const CHECK_TRANSPORT_ERROR: &str = "transport_error";
 /// CRC inválido em seção PSI/SI.
 pub const CHECK_CRC_ERROR: &str = "crc_error";
+/// Seção PSI/SI truncada ou malformada, distinta de CRC inválido.
+pub const CHECK_PSI_MALFORMED: &str = "psi_malformed";
+/// Inventário de PID viola regra declarativa do perfil.
+pub const CHECK_PID_ERROR: &str = "pid_error";
+/// PAT ausente ou expirada após a grace window do perfil.
+pub const CHECK_PAT_ERROR: &str = "pat_error";
+/// PMT de serviço ausente ou expirada após a grace window do perfil.
+pub const CHECK_PMT_ERROR: &str = "pmt_error";
+/// CAT ausente quando o perfil exige acesso condicional.
+pub const CHECK_CAT_ERROR: &str = "cat_error";
+/// Regressão de PTS observada num início de PES de PID elementar.
+pub const CHECK_PTS_ERROR: &str = "pts_error";
 /// Jitter de PCR acima do perfil do analisador.
 pub const CHECK_PCR_ERROR: &str = "pcr_error";
 /// Descontinuidade de PCR sem `discontinuity_indicator`.
@@ -225,6 +241,19 @@ pub fn default_checks() -> Vec<CheckDef> {
             aggregation: Aggregation::Sum,
         },
         CheckDef {
+            id: CHECK_SYNC_BYTE_ERROR,
+            layer: Layer::Ts,
+            threshold: 0.0,
+            unit: "bytes",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(10),
+            severity: Severity::Critical,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
             id: CHECK_CC_ERROR,
             layer: Layer::Ts,
             threshold: 0.0,
@@ -238,10 +267,101 @@ pub fn default_checks() -> Vec<CheckDef> {
             aggregation: Aggregation::Sum,
         },
         CheckDef {
+            id: CHECK_TRANSPORT_ERROR,
+            layer: Layer::Ts,
+            threshold: 0.0,
+            unit: "packets",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(10),
+            severity: Severity::Error,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
             id: CHECK_CRC_ERROR,
             layer: Layer::Ts,
             threshold: 0.0,
             unit: "errors",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(10),
+            severity: Severity::Error,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
+            id: CHECK_PSI_MALFORMED,
+            layer: Layer::Ts,
+            threshold: 0.0,
+            unit: "sections",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(10),
+            severity: Severity::Error,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Sum,
+        },
+        CheckDef {
+            id: CHECK_PID_ERROR,
+            layer: Layer::Ts,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(10),
+            severity: Severity::Error,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_PAT_ERROR,
+            layer: Layer::Ts,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(10),
+            severity: Severity::Critical,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_PMT_ERROR,
+            layer: Layer::Ts,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(10),
+            severity: Severity::Critical,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_CAT_ERROR,
+            layer: Layer::Ts,
+            threshold: 0.0,
+            unit: "state",
+            window: secs(1),
+            min_duration: secs(0),
+            clear_duration: secs(10),
+            severity: Severity::Error,
+            enabled: true,
+            comparison: Comparison::Above,
+            aggregation: Aggregation::Gauge,
+        },
+        CheckDef {
+            id: CHECK_PTS_ERROR,
+            layer: Layer::Ts,
+            threshold: 0.0,
+            unit: "pes",
             window: secs(1),
             min_duration: secs(0),
             clear_duration: secs(10),
@@ -693,7 +813,12 @@ pub fn layer_of(check_id: &str) -> Option<Layer> {
     // reconstruir a tabela em cada consulta seria desperdício puro.
     static INDEX: OnceLock<BTreeMap<&'static str, Layer>> = OnceLock::new();
     INDEX
-        .get_or_init(|| default_checks().into_iter().map(|d| (d.id, d.layer)).collect())
+        .get_or_init(|| {
+            default_checks()
+                .into_iter()
+                .map(|d| (d.id, d.layer))
+                .collect()
+        })
         .get(check_id)
         .copied()
 }
@@ -1492,7 +1617,11 @@ enabled = false
 
         let mut ids = std::collections::HashSet::new();
         for def in &defs {
-            assert!(ids.insert(def.id), "id duplicado em default_checks: {}", def.id);
+            assert!(
+                ids.insert(def.id),
+                "id duplicado em default_checks: {}",
+                def.id
+            );
             assert_eq!(
                 layer_of(def.id),
                 Some(def.layer),
@@ -1543,7 +1672,11 @@ enabled = false
         ] {
             assert_eq!(layer_of(id), Some(Layer::Rtp), "{id}");
         }
-        for id in [CHECK_MULTI_SOURCE, CHECK_ENCAPSULATION_MISMATCH, CHECK_IAT_MAX] {
+        for id in [
+            CHECK_MULTI_SOURCE,
+            CHECK_ENCAPSULATION_MISMATCH,
+            CHECK_IAT_MAX,
+        ] {
             assert_eq!(layer_of(id), Some(Layer::Ip), "{id}");
         }
     }

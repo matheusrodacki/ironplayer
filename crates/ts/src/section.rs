@@ -163,6 +163,10 @@ impl SectionAssembler {
                     "payload insuficiente para header de seção; PID=0x{:04X}",
                     pid
                 );
+                let table_id = bytes.get(pos).copied();
+                let _ = self
+                    .event_tx
+                    .try_send(TsEvent::PsiMalformed { pid, table_id });
                 break;
             }
 
@@ -170,6 +174,10 @@ impl SectionAssembler {
             let section_length = ((bytes[pos + 1] as u16 & 0x0F) << 8) | bytes[pos + 2] as u16;
 
             if section_length > 4093 {
+                let _ = self.event_tx.try_send(TsEvent::PsiMalformed {
+                    pid,
+                    table_id: Some(table_id),
+                });
                 return Err(TsError::SectionTooLarge(section_length));
             }
 
@@ -524,7 +532,7 @@ mod tests {
     #[test]
     fn spec_ts_003_section_too_large() {
         let (tx, _rx) = bounded::<CompleteSection>(16);
-        let (evt_tx, _evt_rx) = bounded::<TsEvent>(16);
+        let (evt_tx, evt_rx) = bounded::<TsEvent>(16);
         let mut asm = SectionAssembler::new(tx, evt_tx);
 
         // Construir payload com section_length = 4094 (acima do limite).
@@ -546,5 +554,12 @@ mod tests {
             "esperado Err(SectionTooLarge(4094)), obtido {:?}",
             result
         );
+        assert!(evt_rx.try_iter().any(|event| matches!(
+            event,
+            TsEvent::PsiMalformed {
+                pid: 0x0010,
+                table_id: Some(0x02)
+            }
+        )));
     }
 }

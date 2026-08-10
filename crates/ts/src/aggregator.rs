@@ -101,6 +101,10 @@ impl SnapshotReceiver {
                     pcr_discontinuities: vec![],
                     crc_errors: std::collections::HashMap::new(),
                     sync_losses: 0,
+                    sync_byte_errors: 0,
+                    transport_errors: std::collections::HashMap::new(),
+                    psi_malformed: std::collections::HashMap::new(),
+                    pts_errors: std::collections::HashMap::new(),
                     rtp_out_of_order: 0,
                     udp_overflows: 0,
                 },
@@ -200,6 +204,10 @@ impl MetricsAggregator {
                 pcr_discontinuities: vec![],
                 crc_errors: HashMap::new(),
                 sync_losses: 0,
+                sync_byte_errors: 0,
+                transport_errors: HashMap::new(),
+                psi_malformed: HashMap::new(),
+                pts_errors: HashMap::new(),
                 rtp_out_of_order: 0,
                 udp_overflows: 0,
             },
@@ -289,6 +297,9 @@ impl MetricsAggregator {
 
     fn handle_ts_event(&mut self, event: TsEvent) {
         match event {
+            TsEvent::SyncByteError { .. } => {
+                self.errors.record_sync_byte_error();
+            }
             TsEvent::CcError { pid, .. } => {
                 self.errors.record_cc_error(pid);
             }
@@ -297,6 +308,15 @@ impl MetricsAggregator {
             }
             TsEvent::SyncLost { .. } => {
                 self.errors.record_sync_loss();
+            }
+            TsEvent::TransportError { pid } => {
+                self.errors.record_transport_error(pid);
+            }
+            TsEvent::PsiMalformed { pid, .. } => {
+                self.errors.record_psi_malformed(pid);
+            }
+            TsEvent::PtsError { pid, .. } => {
+                self.errors.record_pts_error(pid);
             }
             TsEvent::Packet { pid, bytes } => {
                 self.bitrate.update(pid, bytes);

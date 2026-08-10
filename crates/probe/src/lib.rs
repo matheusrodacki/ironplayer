@@ -41,17 +41,17 @@ pub use check::{
     health_row_of, layer_of, CheckDef, CheckEngine, CheckProfile, Measurement, OpenCheck,
 };
 pub use clock::{ProbeClock, SystemClock, TestClock};
-pub use config::{FecMode, FecProfile, FeedConfig, ProbeConfig, MAX_FEEDS};
+pub use config::{FecMode, FecProfile, FeedConfig, ProbeConfig, TransportProfile, MAX_FEEDS};
 pub use degrade::{DegradeController, DegradePolicy, OverloadSignals};
-pub use engine::{FeedIdentity, ProbeEngine, TickInput, AVAILABILITY_WINDOW_SECS};
+pub use engine::{FeedIdentity, ProbeEngine, PsiObservation, TickInput, AVAILABILITY_WINDOW_SECS};
 pub use event::{EventContext, EventOrigin, EventPhase, ProbeEvent};
 // Reexportado de `net` para que a UI monte o histograma sem depender do crate
 // de aquisição (SPEC-PROBE-IP-047).
-pub use net::IatSummary;
 pub use ip::{
     iat_bucket_of, iat_bucket_upper_us, FecStatus, IpAnalyzer, IpAnalyzerConfig, IpTick,
     IpViolations, RtpDelta, IAT_HIST_BUCKETS,
 };
+pub use net::IatSummary;
 pub use power::KeepAwake;
 pub use report::render_run_report;
 pub use sample::{ProbeSample, CSV_HEADER, CSV_SCHEMA_VERSION};
@@ -59,9 +59,7 @@ pub use series::{
     HealthScope, HealthTimeline, MetricId, SeriesPoints, SeriesWindow, TimelineBucket,
     MAX_PLOT_POINTS, MAX_TIMELINE_CELLS,
 };
-pub use service::{
-    ServiceInfo, ServiceInventory, ServiceStream, ServiceVisual, StreamKind,
-};
+pub use service::{ServiceInfo, ServiceInventory, ServiceStream, ServiceVisual, StreamKind};
 pub use session::{Encapsulation, ProbeRun, RunMeta, SessionMeta, SessionSummary, SESSIONS_DIR};
 pub use severity::{HealthRow, Layer, LayerHealth, Severity};
 pub use snapshot::{

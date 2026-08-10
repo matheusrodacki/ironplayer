@@ -29,8 +29,8 @@ use net::{
     SourceBinding, StopHandle as NetStopHandle, StopToken as NetStopToken, StreamUrl, UdpReceiver,
 };
 use probe::{
-    Encapsulation, FecMode, IpAnalyzer, IpAnalyzerConfig, IpTick, ProbeConfig, ServiceInfo,
-    ServiceStream, ServiceVisual, StreamKind,
+    Encapsulation, FecMode, IpAnalyzer, IpAnalyzerConfig, IpTick, ProbeConfig, PsiObservation,
+    ServiceInfo, ServiceStream, ServiceVisual, StreamKind,
 };
 use ts::aggregator::{
     AggregatorNetEvent, MetricsAggregator, SnapshotReceiver, StopHandle as MetricsStopHandle,
@@ -187,6 +187,11 @@ pub struct FeedShared {
     services: RwLock<Arc<Vec<ServiceInfo>>>,
     /// Último resultado do thumbnail, por serviço (SPEC-PROBE-024).
     visuals: RwLock<BTreeMap<u16, ServiceVisual>>,
+    /// Últimas tabelas PSI válidas, atualizadas pelo consumidor de seções e
+    /// lidas pelo motor de checks a 1 Hz.
+    ///
+    /// SPEC-PROBE-TS-007 · SPEC-PROBE-TS-008 · SPEC-PROBE-TS-013
+    psi: RwLock<PsiObservation>,
     /// Último resultado do tick de snapshot do feed, quando não há serviço
     /// algum para atribuir (PSI ainda não chegou) — SPEC-PROBE-003a.
     snapshot_state: AtomicU32,
@@ -253,6 +258,10 @@ impl FeedShared {
             service_name: RwLock::new(None),
             services: RwLock::new(Arc::new(Vec::new())),
             visuals: RwLock::new(BTreeMap::new()),
+            psi: RwLock::new(PsiObservation {
+                source_active: true,
+                ..Default::default()
+            }),
             snapshot_state: AtomicU32::new(0),
             snapshot_suspended: AtomicBool::new(false),
         }
@@ -341,6 +350,34 @@ impl FeedShared {
     /// SPEC-PROBE-024
     pub fn visuals(&self) -> BTreeMap<u16, ServiceVisual> {
         self.visuals.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Fotografia das últimas tabelas PSI válidas recebidas.
+    ///
+    /// SPEC-PROBE-TS-007 · SPEC-PROBE-TS-008 · SPEC-PROBE-TS-013
+    pub fn psi(&self) -> PsiObservation {
+        self.psi
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_default()
+    }
+
+    fn mark_pat(&self) {
+        if let Ok(mut psi) = self.psi.write() {
+            psi.pat_last_seen = Some(Instant::now());
+        }
+    }
+
+    fn mark_pmt(&self, service_id: u16) {
+        if let Ok(mut psi) = self.psi.write() {
+            psi.pmt_last_seen.insert(service_id, Instant::now());
+        }
+    }
+
+    fn mark_cat(&self) {
+        if let Ok(mut psi) = self.psi.write() {
+            psi.cat_last_seen = Some(Instant::now());
+        }
     }
 
     /// Publica o resultado do thumbnail de um serviço.
@@ -715,7 +752,10 @@ impl FeedPipeline {
                         // evento correlacionado do mesmo tick.
                         NetEvent::UdpBufferOverflow => {
                             shared_t.add_local_drops(1);
-                            tracing::warn!(slot, "net-recv: canal de dados cheio; pacote descartado");
+                            tracing::warn!(
+                                slot,
+                                "net-recv: canal de dados cheio; pacote descartado"
+                            );
                         }
                         NetEvent::Timeout => {
                             tracing::debug!(slot, "net-recv: timeout de recepção");
@@ -1121,6 +1161,7 @@ impl FeedTables {
             // PAT
             0x00 => {
                 if let Ok(pat) = ts::tables::Pat::from_section_body(body) {
+                    shared.mark_pat();
                     // `program_number == 0` aponta para a NIT, não para uma PMT.
                     self.pmt_pids = pat.pmt_pids().collect();
                     self.programs = pat
@@ -1149,6 +1190,7 @@ impl FeedTables {
             // PMT
             0x02 if self.pmt_pids.contains(&section.pid) => {
                 if let Ok(pmt) = ts::tables::Pmt::from_section_body(body) {
+                    shared.mark_pmt(pmt.program_number);
                     let mut streams = Vec::with_capacity(pmt.streams.len());
                     for stream in &pmt.streams {
                         // Todo PID listado numa PMT é elementar, seja ele
@@ -1166,6 +1208,15 @@ impl FeedTables {
                     self.pcr_pid.insert(pmt.program_number, pmt.pcr_pid);
                     self.streams.insert(pmt.program_number, streams);
                     self.publish(shared);
+                }
+            }
+            // CAT: a SectionAssembler já validou CRC; completar o CRC com
+            // zeros só recompõe o layout que o parser de tabela espera.
+            0x01 => {
+                let mut with_crc = section.data.to_vec();
+                with_crc.extend_from_slice(&[0, 0, 0, 0]);
+                if ts::tables::Cat::parse(&with_crc).is_ok() {
+                    shared.mark_cat();
                 }
             }
             // SDT atual
@@ -1220,10 +1271,7 @@ impl FeedTables {
         // presença do feed inteiro (SPEC-PROBE-018) — a visão por serviço é
         // adicional, não substituta.
         let collect_kind = |kind: StreamKind| {
-            let mut v: Vec<Pid> = services
-                .iter()
-                .flat_map(|s| s.pids_of(kind))
-                .collect();
+            let mut v: Vec<Pid> = services.iter().flat_map(|s| s.pids_of(kind)).collect();
             v.sort_unstable();
             v.dedup();
             v
@@ -1340,7 +1388,10 @@ mod tests {
             StreamUrl::UdpMulticast { iface, .. } | StreamUrl::RtpMulticast { iface, .. } => iface,
         };
         assert_eq!(iface, Some("10.0.0.7".parse().expect("iface")));
-        assert_eq!(group, "239.15.0.183".parse::<std::net::Ipv4Addr>().expect("grupo"));
+        assert_eq!(
+            group,
+            "239.15.0.183".parse::<std::net::Ipv4Addr>().expect("grupo")
+        );
 
         // `fec = off` não abre join nenhum.
         let mut off = spec.clone();
@@ -1378,7 +1429,11 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "a falha de join precisa ser imediata, não travar o slot"
         );
-        let tick = shared.ip.lock().expect("mutex").take_tick(Instant::now(), 15_000.0);
+        let tick = shared
+            .ip
+            .lock()
+            .expect("mutex")
+            .take_tick(Instant::now(), 15_000.0);
         assert!(!tick.fec.present, "sem join não há FEC a reportar");
     }
 
@@ -1742,10 +1797,7 @@ fec  = "off"
         let entry = v.get(&55).expect("serviço 55");
         assert_eq!(entry.video_height, Some(1080));
         assert_eq!(entry.state, probe::SnapshotState::NoKeyframe);
-        assert!(
-            !v.contains_key(&56),
-            "serviço sem captura não inventa dado"
-        );
+        assert!(!v.contains_key(&56), "serviço sem captura não inventa dado");
     }
 
     /// SPEC-PROBE-018 — o badge `SCR` sai de `transport_scrambling_control`.

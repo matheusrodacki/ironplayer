@@ -343,7 +343,17 @@ impl AppConfig {
                 AppConfig::default()
             }
             Ok(contents) => match toml::from_str::<AppConfig>(&contents) {
-                Ok(cfg) => cfg,
+                Ok(cfg) => match cfg.probe.validate_transport() {
+                    Ok(()) => cfg,
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "perfil de transporte inválido; usando configuração padrão"
+                        );
+                        AppConfig::default()
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(
                         path = %path.display(),

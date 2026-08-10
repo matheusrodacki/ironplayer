@@ -40,6 +40,14 @@ pub enum TsError {
 /// SPEC-TS-002 · SPEC-TS-003
 #[derive(Debug, Clone)]
 pub enum TsEvent {
+    /// Byte que deveria iniciar um pacote TS, mas não era `0x47`.
+    ///
+    /// Diferente de [`Self::SyncLost`]: este evento preserva o byte inválido;
+    /// a perda de sincronismo agrega os bytes descartados até o próximo sync.
+    ///
+    /// SPEC-PROBE-TS-003
+    SyncByteError { offset: usize, got: u8 },
+
     /// Erro de Continuity Counter detectado em um PID.
     ///
     /// SPEC-TS-002b
@@ -50,10 +58,32 @@ pub enum TsEvent {
     /// SPEC-TS-002c
     SyncLost { bytes_skipped: usize },
 
+    /// Pacote com `transport_error_indicator` sinalizado.
+    ///
+    /// O pacote continua no fluxo para que o demux mantenha a recuperação e a
+    /// Probe possa atribuir a evidência ao PID sem derrubar o player.
+    ///
+    /// SPEC-PROBE-TS-005
+    TransportError { pid: Pid },
+
     /// CRC-32 inválido em uma seção PSI/SI montada.
     ///
     /// SPEC-TS-003b
     CrcError { pid: Pid, table_id: u8 },
+
+    /// Seção PSI/SI inválida antes que haja CRC ou tabela completos.
+    ///
+    /// SPEC-PROBE-TS-006
+    PsiMalformed { pid: Pid, table_id: Option<u8> },
+
+    /// PTS de início de PES regrediu sem representar wrap de 33 bits.
+    ///
+    /// SPEC-PROBE-TS-012
+    PtsError {
+        pid: Pid,
+        previous: u64,
+        current: u64,
+    },
 
     /// Pacote processado; carrega pid e tamanho (188 bytes) para cálculo de bitrate.
     ///

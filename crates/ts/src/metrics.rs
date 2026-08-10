@@ -175,6 +175,22 @@ pub struct ErrorSnapshot {
     pub crc_errors: HashMap<(Pid, u8), u64>,
     /// Total de eventos de perda de sincronismo TS.
     pub sync_losses: u64,
+    /// Bytes de sincronização inválidos observados antes da ressincronização.
+    ///
+    /// SPEC-PROBE-TS-003
+    pub sync_byte_errors: u64,
+    /// Pacotes com `transport_error_indicator`, por PID.
+    ///
+    /// SPEC-PROBE-TS-005
+    pub transport_errors: HashMap<Pid, u64>,
+    /// Seções PSI/SI truncadas ou estruturalmente malformadas, por PID.
+    ///
+    /// SPEC-PROBE-TS-006
+    pub psi_malformed: HashMap<Pid, u64>,
+    /// Regressões de PTS em início de PES por PID.
+    ///
+    /// SPEC-PROBE-TS-012
+    pub pts_errors: HashMap<Pid, u64>,
     /// Total de pacotes RTP recebidos fora de ordem.
     pub rtp_out_of_order: u64,
     /// Total de overflows do buffer UDP.
@@ -549,6 +565,10 @@ pub struct ErrorTracker {
     crc_errors: HashMap<(Pid, u8), u64>,
     /// Total de eventos de perda de sincronismo TS.
     sync_losses: u64,
+    sync_byte_errors: u64,
+    transport_errors: HashMap<Pid, u64>,
+    psi_malformed: HashMap<Pid, u64>,
+    pts_errors: HashMap<Pid, u64>,
     /// Total de pacotes RTP recebidos fora de ordem.
     rtp_out_of_order: u64,
     /// Total de overflows do buffer UDP.
@@ -572,6 +592,10 @@ impl ErrorTracker {
             pcr_discontinuities: Vec::new(),
             crc_errors: HashMap::new(),
             sync_losses: 0,
+            sync_byte_errors: 0,
+            transport_errors: HashMap::new(),
+            psi_malformed: HashMap::new(),
+            pts_errors: HashMap::new(),
             rtp_out_of_order: 0,
             udp_overflows: 0,
             max_error_log_entries,
@@ -621,6 +645,34 @@ impl ErrorTracker {
         self.sync_losses += 1;
     }
 
+    /// Incrementa o contador de bytes de sync inválidos.
+    ///
+    /// SPEC-PROBE-TS-003
+    pub fn record_sync_byte_error(&mut self) {
+        self.sync_byte_errors = self.sync_byte_errors.saturating_add(1);
+    }
+
+    /// Incrementa o contador de TEI para um PID.
+    ///
+    /// SPEC-PROBE-TS-005
+    pub fn record_transport_error(&mut self, pid: Pid) {
+        *self.transport_errors.entry(pid).or_insert(0) += 1;
+    }
+
+    /// Incrementa o contador de PSI malformada para um PID.
+    ///
+    /// SPEC-PROBE-TS-006
+    pub fn record_psi_malformed(&mut self, pid: Pid) {
+        *self.psi_malformed.entry(pid).or_insert(0) += 1;
+    }
+
+    /// Incrementa o contador de regressões PTS para um PID.
+    ///
+    /// SPEC-PROBE-TS-012
+    pub fn record_pts_error(&mut self, pid: Pid) {
+        *self.pts_errors.entry(pid).or_insert(0) += 1;
+    }
+
     /// Incrementa o contador de pacotes RTP recebidos fora de ordem.
     ///
     /// SPEC-METRICS-002c
@@ -644,6 +696,10 @@ impl ErrorTracker {
         self.pcr_discontinuities.clear();
         self.crc_errors.clear();
         self.sync_losses = 0;
+        self.sync_byte_errors = 0;
+        self.transport_errors.clear();
+        self.psi_malformed.clear();
+        self.pts_errors.clear();
         self.rtp_out_of_order = 0;
         self.udp_overflows = 0;
     }
@@ -660,6 +716,10 @@ impl ErrorTracker {
             pcr_discontinuities: self.pcr_discontinuities.clone(),
             crc_errors: self.crc_errors.clone(),
             sync_losses: self.sync_losses,
+            sync_byte_errors: self.sync_byte_errors,
+            transport_errors: self.transport_errors.clone(),
+            psi_malformed: self.psi_malformed.clone(),
+            pts_errors: self.pts_errors.clone(),
             rtp_out_of_order: self.rtp_out_of_order,
             udp_overflows: self.udp_overflows,
         }
@@ -733,8 +793,7 @@ mod tests {
             pcr_discontinuities: vec![],
             crc_errors: HashMap::new(),
             sync_losses: 0,
-            rtp_out_of_order: 0,
-            udp_overflows: 0,
+            ..Default::default()
         };
         let mut snap2 = snap.clone();
         snap2.cc_errors.insert(0x100, 99);
@@ -751,8 +810,7 @@ mod tests {
             pcr_discontinuities: vec![],
             crc_errors: HashMap::new(),
             sync_losses: 0,
-            rtp_out_of_order: 0,
-            udp_overflows: 0,
+            ..Default::default()
         };
         assert_eq!(snap.total_cc_errors(), 10);
     }
@@ -770,8 +828,7 @@ mod tests {
                 pcr_discontinuities: vec![],
                 crc_errors: HashMap::new(),
                 sync_losses: 0,
-                rtp_out_of_order: 0,
-                udp_overflows: 0,
+                ..Default::default()
             },
             tdt_offset_secs: Some(1_716_000_000),
             timestamp: Instant::now(),
@@ -1041,6 +1098,22 @@ mod tests {
         tracker.record_sync_loss();
         tracker.record_sync_loss();
         assert_eq!(tracker.snapshot().sync_losses, 2);
+    }
+
+    /// SPEC-PROBE-TS-003/005/006 — fatos TS novos permanecem distintos no
+    /// snapshot e não são colapsados em CRC ou sync loss.
+    #[test]
+    fn spec_probe_ts_003_transport_fact_counters_remain_distinct() {
+        let mut tracker = ErrorTracker::new(100);
+        tracker.record_sync_byte_error();
+        tracker.record_transport_error(0x0100);
+        tracker.record_psi_malformed(0x0000);
+        let snap = tracker.snapshot();
+        assert_eq!(snap.sync_byte_errors, 1);
+        assert_eq!(snap.transport_errors.get(&0x0100), Some(&1));
+        assert_eq!(snap.psi_malformed.get(&0x0000), Some(&1));
+        assert_eq!(snap.sync_losses, 0);
+        assert!(snap.crc_errors.is_empty());
     }
 
     /// SPEC-METRICS-002c — `record_rtp_out_of_order` incrementa contador.

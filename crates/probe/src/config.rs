@@ -185,6 +185,52 @@ pub struct CheckOverride {
     pub severity: Option<Severity>,
 }
 
+/// Perfil operacional dos checks MPEG-TS.
+///
+/// O parser TS continua funcionando para o player quando este bloco está
+/// desligado; apenas a promoção de fatos para alarmes da Probe é suprimida.
+///
+/// SPEC-PROBE-TS-001 · SPEC-PROBE-TS-009 · SPEC-PROBE-TS-015
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransportProfile {
+    /// Habilita a avaliação dos checks da camada MPEG-TS.
+    pub enabled: bool,
+    /// Máximo entre PATs válidas consecutivas.
+    pub pat_max_interval_secs: f64,
+    /// Máximo entre PMTs válidas consecutivas.
+    pub pmt_max_interval_secs: f64,
+    /// Período inicial em que ausência de PSI é estado desconhecido.
+    pub psi_grace_secs: f64,
+    /// CAT passa a ser obrigatória apenas em perfis que exigem CA.
+    pub ca_required: bool,
+    /// PIDs que devem aparecer no inventário conhecido do multiplex.
+    pub required_pids: Vec<u16>,
+    /// PIDs cuja presença é proibida neste perfil.
+    pub forbidden_pids: Vec<u16>,
+    /// Buffer analysis/T-STD dependem de modelo e parâmetros ainda não
+    /// definidos; por padrão permanecem inativos e não viram falso `ok`.
+    pub tstd_enabled: bool,
+    /// MGF/MGB também são opt-in até existir definição operacional fechada.
+    pub mgf_mgb_enabled: bool,
+}
+
+impl Default for TransportProfile {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pat_max_interval_secs: 0.5,
+            pmt_max_interval_secs: 0.5,
+            psi_grace_secs: 2.0,
+            ca_required: false,
+            required_pids: Vec::new(),
+            forbidden_pids: Vec::new(),
+            tstd_enabled: false,
+            mgf_mgb_enabled: false,
+        }
+    }
+}
+
 /// Configuração do modo Probe.
 ///
 /// A ordem dos campos importa: o `AppConfig` é reserializado com
@@ -232,6 +278,9 @@ pub struct ProbeConfig {
     ///
     /// Default `false`: Broadcast não deve pagar o custo de escrita em disco (§3.1).
     pub enabled_in_broadcast: bool,
+
+    /// Perfil da camada de transporte MPEG-TS (spec-15).
+    pub transport: TransportProfile,
 
     // ── Camada IP (spec-14 §8) ──────────────────────────────────────────
     /// Janela de reconciliação de lacunas RTP, em ms.
@@ -294,6 +343,7 @@ impl Default for ProbeConfig {
             retention_days: 14,
             max_disk_mb: 4096,
             enabled_in_broadcast: false,
+            transport: TransportProfile::default(),
             reorder_window_ms: 200,
             correlation_window_ms: 1000,
             calib_secs: 30,
@@ -434,6 +484,68 @@ impl ProbeConfig {
             .cloned()
             .collect()
     }
+
+    /// Valida combinações que não admitem defaults implícitos.
+    ///
+    /// SPEC-PROBE-TS-015 — T-STD e MGF/MGB não podem ser "ativados" sem um
+    /// modelo operacional e limites que ainda não existem no perfil.
+    pub fn validate_transport(&self) -> Result<(), String> {
+        for (name, value) in [
+            (
+                "pat_max_interval_secs",
+                self.transport.pat_max_interval_secs,
+            ),
+            (
+                "pmt_max_interval_secs",
+                self.transport.pmt_max_interval_secs,
+            ),
+            ("psi_grace_secs", self.transport.psi_grace_secs),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "probe.transport.{name} deve ser finito e não negativo"
+                ));
+            }
+        }
+        if self.transport.tstd_enabled || self.transport.mgf_mgb_enabled {
+            return Err(
+                "probe.transport: T-STD/MGF/MGB exigem modelo e limites operacionais; mantenha-os desativados"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Janela inicial em que PAT/PMT/CAT ausentes ainda são desconhecidas.
+    ///
+    /// SPEC-PROBE-TS-007 · SPEC-PROBE-TS-008 · SPEC-PROBE-TS-013
+    pub fn psi_grace(&self) -> Duration {
+        duration_from_profile_secs(self.transport.psi_grace_secs)
+    }
+
+    /// Intervalo máximo de PAT válido antes de abrir `pat_error`.
+    ///
+    /// SPEC-PROBE-TS-007
+    pub fn pat_max_interval(&self) -> Duration {
+        duration_from_profile_secs(self.transport.pat_max_interval_secs)
+    }
+
+    /// Intervalo máximo de PMT válida antes de abrir `pmt_error`.
+    ///
+    /// SPEC-PROBE-TS-008
+    pub fn pmt_max_interval(&self) -> Duration {
+        duration_from_profile_secs(self.transport.pmt_max_interval_secs)
+    }
+}
+
+/// Converte segundos de configuração sem permitir que `NaN`/infinito vindos
+/// de um perfil montado programaticamente cheguem a `Duration::from_secs_f64`.
+fn duration_from_profile_secs(secs: f64) -> Duration {
+    if secs.is_finite() && secs >= 0.0 {
+        Duration::from_secs_f64(secs)
+    } else {
+        Duration::ZERO
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +572,9 @@ mod tests {
         assert_eq!(c.retention_days, 14);
         assert_eq!(c.max_disk_mb, 4096);
         assert!(!c.enabled_in_broadcast);
+        assert!(c.transport.enabled);
+        assert!(!c.transport.tstd_enabled);
+        assert!(!c.transport.mgf_mgb_enabled);
     }
 
     /// §8 da spec-14 — os limiares default da camada IP são os documentados,
@@ -590,6 +705,18 @@ mod tests {
         let text = toml::to_string_pretty(&c).expect("serializa");
         let back: ProbeConfig = toml::from_str(&text).expect("desserializa");
         assert_eq!(back, c);
+    }
+
+    /// SPEC-PROBE-TS-015 — modelos sem parâmetros operacionais não podem ser
+    /// habilitados por acidente no perfil.
+    #[test]
+    fn spec_probe_ts_015_advanced_transport_models_require_definition() {
+        let mut c = ProbeConfig::default();
+        c.transport.tstd_enabled = true;
+        assert!(c.validate_transport().is_err());
+        c.transport.tstd_enabled = false;
+        c.transport.mgf_mgb_enabled = true;
+        assert!(c.validate_transport().is_err());
     }
 
     /// SPEC-PROBE-007 — limiar vindo do TOML sobrescreve o embutido.

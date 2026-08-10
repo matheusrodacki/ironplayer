@@ -56,6 +56,14 @@ pub struct RawCounters {
     pub crc_by_pid: HashMap<Pid, u64>,
     pub crc_errors: u64,
     pub sync_losses: u64,
+    /// SPEC-PROBE-TS-003
+    pub sync_byte_errors: u64,
+    /// SPEC-PROBE-TS-005
+    pub transport_errors_by_pid: HashMap<Pid, u64>,
+    /// SPEC-PROBE-TS-006
+    pub psi_malformed_by_pid: HashMap<Pid, u64>,
+    /// SPEC-PROBE-TS-012
+    pub pts_errors_by_pid: HashMap<Pid, u64>,
     pub pcr_jitter_by_pid: HashMap<Pid, u64>,
     pub pcr_jitter_events: u64,
     pub pcr_disc_by_pid: HashMap<Pid, u64>,
@@ -93,6 +101,10 @@ impl RawCounters {
             crc_errors: crc_by_pid.values().sum(),
             crc_by_pid,
             sync_losses: m.errors.sync_losses,
+            sync_byte_errors: m.errors.sync_byte_errors,
+            transport_errors_by_pid: m.errors.transport_errors.clone(),
+            psi_malformed_by_pid: m.errors.psi_malformed.clone(),
+            pts_errors_by_pid: m.errors.pts_errors.clone(),
             pcr_jitter_events: pcr_jitter_by_pid.values().sum(),
             pcr_jitter_by_pid,
             pcr_discontinuities: pcr_disc_by_pid.values().sum(),
@@ -113,6 +125,14 @@ pub struct CounterDeltas {
     pub crc_by_pid: HashMap<Pid, u64>,
     pub crc: u64,
     pub sync_loss: u64,
+    /// SPEC-PROBE-TS-003
+    pub sync_byte_errors: u64,
+    /// SPEC-PROBE-TS-005
+    pub transport_errors_by_pid: HashMap<Pid, u64>,
+    /// SPEC-PROBE-TS-006
+    pub psi_malformed_by_pid: HashMap<Pid, u64>,
+    /// SPEC-PROBE-TS-012
+    pub pts_errors_by_pid: HashMap<Pid, u64>,
     /// Jitter de PCR novo por PID (SPEC-PROBE-021).
     pub pcr_jitter_by_pid: HashMap<Pid, u64>,
     pub pcr_jitter: u64,
@@ -167,6 +187,13 @@ impl CounterBaseline {
 
         let cc_by_pid = delta_by_pid(&now.cc_errors_by_pid, &self.prev.cc_errors_by_pid);
         let crc_by_pid = delta_by_pid(&now.crc_by_pid, &self.prev.crc_by_pid);
+        let transport_errors_by_pid = delta_by_pid(
+            &now.transport_errors_by_pid,
+            &self.prev.transport_errors_by_pid,
+        );
+        let psi_malformed_by_pid =
+            delta_by_pid(&now.psi_malformed_by_pid, &self.prev.psi_malformed_by_pid);
+        let pts_errors_by_pid = delta_by_pid(&now.pts_errors_by_pid, &self.prev.pts_errors_by_pid);
         let pcr_jitter_by_pid = delta_by_pid(&now.pcr_jitter_by_pid, &self.prev.pcr_jitter_by_pid);
         let pcr_disc_by_pid = delta_by_pid(&now.pcr_disc_by_pid, &self.prev.pcr_disc_by_pid);
 
@@ -176,6 +203,12 @@ impl CounterBaseline {
             crc: crc_by_pid.values().sum(),
             crc_by_pid,
             sync_loss: now.sync_losses.saturating_sub(self.prev.sync_losses),
+            sync_byte_errors: now
+                .sync_byte_errors
+                .saturating_sub(self.prev.sync_byte_errors),
+            transport_errors_by_pid,
+            psi_malformed_by_pid,
+            pts_errors_by_pid,
             pcr_jitter: pcr_jitter_by_pid.values().sum(),
             pcr_jitter_by_pid,
             pcr_disc: pcr_disc_by_pid.values().sum(),
@@ -594,7 +627,10 @@ mod tests {
             "linha e cabeçalho precisam ter a mesma aridade"
         );
         assert!(!row.contains('\n'));
-        assert!(row.contains(",error,"), "a severidade continua na 13ª coluna");
+        assert!(
+            row.contains(",error,"),
+            "a severidade continua na 13ª coluna"
+        );
         assert!(row.contains(",15002.4,"), "bitrate sem notação científica");
         assert!(row.starts_with("2023-11-14T22:13:20.000Z,3661,1,"));
     }
@@ -809,7 +845,10 @@ local_drops_delta,sched_jitter_ms,worst_severity";
             ip: None,
         };
         let row = s.to_csv();
-        assert!(row.contains(",0.0,,"), "severidade vazia, não \"none\": {row}");
+        assert!(
+            row.contains(",0.0,,"),
+            "severidade vazia, não \"none\": {row}"
+        );
         assert_eq!(row.split(',').count(), CSV_HEADER.split(',').count());
     }
 }

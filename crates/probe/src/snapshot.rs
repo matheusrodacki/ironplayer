@@ -199,10 +199,7 @@ impl EventRow {
     /// SPEC-PROBE-025
     pub fn describe(&self) -> String {
         let n = self.count;
-        let pid = self
-            .pid
-            .map(|p| format!(" no PID {p}"))
-            .unwrap_or_default();
+        let pid = self.pid.map(|p| format!(" no PID {p}")).unwrap_or_default();
         let mut text = match self.check_id.as_str() {
             CHECK_CC_ERROR => format!(
                 "TR 101 290 P1.4 Continuity Counter Error: {n} descontinuidade(s) de \
@@ -225,9 +222,9 @@ impl EventRow {
             CHECK_FEED_UNAVAILABLE => {
                 "Feed indisponível: nenhum datagrama recebido na janela de detecção.".to_string()
             }
-            CHECK_RTP_OUT_OF_ORDER => format!(
-                "RTP: {n} pacote(s) fora de ordem ou faltando na sequência."
-            ),
+            CHECK_RTP_OUT_OF_ORDER => {
+                format!("RTP: {n} pacote(s) fora de ordem ou faltando na sequência.")
+            }
             // ── Camada IP / UDP (spec-14) ───────────────────────────────
             CHECK_MULTI_SOURCE => format!(
                 "Mais de uma fonte transmitindo no mesmo grupo/porta ({:.0} endereços \
@@ -300,12 +297,8 @@ impl EventRow {
                  diferente do esperado pelo perfil."
             ),
             // ── FEC ST 2022-1 (spec-14) ─────────────────────────────────
-            CHECK_FEC_L_RANGE => {
-                "FEC: dimensão L da matriz fora da faixa do perfil.".to_string()
-            }
-            CHECK_FEC_D_RANGE => {
-                "FEC: dimensão D da matriz fora da faixa do perfil.".to_string()
-            }
+            CHECK_FEC_L_RANGE => "FEC: dimensão L da matriz fora da faixa do perfil.".to_string(),
+            CHECK_FEC_D_RANGE => "FEC: dimensão D da matriz fora da faixa do perfil.".to_string(),
             CHECK_FEC_LXD => {
                 "FEC: L×D acima do teto do perfil — matriz grande demais aumenta a latência \
                  de recuperação sem ganho proporcional de proteção."
@@ -606,9 +599,7 @@ impl FeedSnapshot {
     ///
     /// SPEC-PROBE-021
     pub fn service(&self, service_id: u16) -> Option<&ServiceSnapshot> {
-        self.services
-            .iter()
-            .find(|s| s.service_id == service_id)
+        self.services.iter().find(|s| s.service_id == service_id)
     }
 
     /// Serviço que o thumbnail do tile do feed representa.

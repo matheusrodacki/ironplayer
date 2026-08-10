@@ -70,6 +70,10 @@ pub struct TsDemuxer {
     event_tx: Sender<TsEvent>,
     /// Último CC observado por PID (para validação de sequência).
     cc_state: HashMap<Pid, u8>,
+    /// Último PTS de início de PES por PID elementar.
+    ///
+    /// SPEC-PROBE-TS-012
+    pts_state: HashMap<Pid, u64>,
     /// PIDs de PMT registrados dinamicamente ao parsear a PAT.
     pmt_pids: HashSet<Pid>,
     /// PID dinâmico da NIT (quando diferente do padrão 0x0010), registrado
@@ -109,6 +113,7 @@ impl TsDemuxer {
             pes_tx,
             event_tx,
             cc_state: HashMap::new(),
+            pts_state: HashMap::new(),
             pmt_pids: HashSet::new(),
             dynamic_nit_pid: None,
             av_pids: HashSet::new(),
@@ -185,6 +190,7 @@ impl TsDemuxer {
     pub fn deregister_av_pid(&mut self, pid: Pid) {
         self.av_pids.remove(&pid);
         self.cc_state.remove(&pid);
+        self.pts_state.remove(&pid);
     }
 
     /// Limpa registros dinâmicos ao trocar/reiniciar a fonte.
@@ -192,6 +198,7 @@ impl TsDemuxer {
     /// SPEC-TS-002a
     pub fn reset_dynamic_state(&mut self) {
         self.cc_state.clear();
+        self.pts_state.clear();
         self.pmt_pids.clear();
         self.dynamic_nit_pid = None;
         self.av_pids.clear();
@@ -212,6 +219,17 @@ impl TsDemuxer {
             // ── Recuperação de sync (SPEC-TS-002c) ──────────────────────────
             if raw[pos] != 0x47 {
                 let sync_start = pos;
+                let got = raw[pos];
+                if self
+                    .event_tx
+                    .try_send(TsEvent::SyncByteError {
+                        offset: sync_start,
+                        got,
+                    })
+                    .is_err()
+                {
+                    warn!("event_tx cheio; SyncByteError descartado (offset={sync_start})");
+                }
                 while pos < raw.len() && raw[pos] != 0x47 {
                     pos += 1;
                 }
@@ -273,6 +291,23 @@ impl TsDemuxer {
             return;
         }
 
+        // TEI invalida a confiabilidade do payload, mas não é motivo para
+        // parar o demux. A Probe recebe a evidência por PID e o restante do
+        // pipeline pode se recuperar no próximo pacote válido.
+        //
+        // SPEC-PROBE-TS-005
+        if pkt.tei
+            && self
+                .event_tx
+                .try_send(TsEvent::TransportError { pid })
+                .is_err()
+        {
+            warn!(
+                "event_tx cheio; TransportError(pid=0x{:04X}) descartado",
+                pid
+            );
+        }
+
         // ── Validação de Continuity Counter (SPEC-TS-002b) ───────────────────
         //
         // Ignorar CC se:
@@ -315,6 +350,14 @@ impl TsDemuxer {
             // Pacotes adaptation-only não carregam dados para montar seções/PES.
             return;
         };
+
+        // A observação acontece apenas em PUSI de PID já identificado como
+        // elementary stream. Não há parser ou decoder A/V nesta fronteira.
+        //
+        // SPEC-PROBE-TS-012
+        if pkt.pusi && self.av_pids.contains(&pid) {
+            self.observe_pts(pid, &payload);
+        }
 
         if self.is_section_pid(pid) {
             // PID de seção conhecida ou PMT → canal de seções.
@@ -392,6 +435,33 @@ impl TsDemuxer {
             || self.dynamic_nit_pid == Some(pid)
     }
 
+    /// Extrai e compara o PTS de um header PES completo no payload atual.
+    /// Headers truncados, PES sem PTS e dados que não são PES permanecem sem
+    /// classificação: ausência de evidência não é `pts_error`.
+    ///
+    /// SPEC-PROBE-TS-012
+    fn observe_pts(&mut self, pid: Pid, payload: &[u8]) {
+        let Some(pts) = pes_pts(payload) else {
+            return;
+        };
+        if let Some(previous) = self.pts_state.insert(pid, pts) {
+            const PTS_WRAP_GUARD: u64 = 1_u64 << 32;
+            if pts < previous
+                && previous - pts < PTS_WRAP_GUARD
+                && self
+                    .event_tx
+                    .try_send(TsEvent::PtsError {
+                        pid,
+                        previous,
+                        current: pts,
+                    })
+                    .is_err()
+            {
+                warn!("event_tx cheio; PtsError(pid=0x{:04X}) descartado", pid);
+            }
+        }
+    }
+
     fn should_warn_packet_event_full(&mut self) -> bool {
         const WARN_INTERVAL: Duration = Duration::from_secs(1);
         let now = Instant::now();
@@ -406,6 +476,38 @@ impl TsDemuxer {
             false
         }
     }
+}
+
+/// Lê o PTS de um header PES que cabe inteiro no payload TS atual.
+///
+/// Retorna `None` para qualquer header truncado/malformado, sem indexação não
+/// verificada sobre dados externos.
+///
+/// SPEC-PROBE-TS-012
+fn pes_pts(payload: &[u8]) -> Option<u64> {
+    let prefix = payload.get(..3)?;
+    if prefix != [0x00, 0x00, 0x01] {
+        return None;
+    }
+    let flags = *payload.get(7)?;
+    if (flags >> 6) & 0b11 == 0 {
+        return None;
+    }
+    let header_len = usize::from(*payload.get(8)?);
+    if header_len < 5 {
+        return None;
+    }
+    let pts = payload.get(9..14)?;
+    if (pts[0] & 1) == 0 || (pts[2] & 1) == 0 || (pts[4] & 1) == 0 {
+        return None;
+    }
+    Some(
+        (u64::from((pts[0] >> 1) & 0x07) << 30)
+            | (u64::from(pts[1]) << 22)
+            | (u64::from((pts[2] >> 1) & 0x7F) << 15)
+            | (u64::from(pts[3]) << 7)
+            | u64::from(pts[4] >> 1),
+    )
 }
 
 // ── Testes ────────────────────────────────────────────────────────────────────
@@ -426,6 +528,20 @@ mod tests {
         // AFC=0b01 (payload only) | CC
         pkt[3] = (0b01 << 4) | (cc & 0x0F);
         pkt
+    }
+
+    /// Constrói um início de PES com PTS que cabe inteiro no primeiro pacote.
+    fn build_pes_packet(pid: Pid, cc: u8, pts: u64) -> [u8; 188] {
+        let mut packet = build_payload_packet(pid, cc);
+        packet[1] |= 0x40; // PUSI
+        let payload = &mut packet[4..];
+        payload[..9].copy_from_slice(&[0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x80, 0x05]);
+        payload[9] = 0x20 | (((pts >> 30) as u8 & 0x07) << 1) | 1;
+        payload[10] = (pts >> 22) as u8;
+        payload[11] = (((pts >> 15) as u8 & 0x7F) << 1) | 1;
+        payload[12] = (pts >> 7) as u8;
+        payload[13] = ((pts as u8 & 0x7F) << 1) | 1;
+        packet
     }
 
     /// Constrói um pacote TS de 188 bytes com adaptation-only (AFC=0b10).
@@ -641,6 +757,77 @@ mod tests {
             "um pacote de seção esperado após re-sync"
         );
         assert_eq!(sections[0].pid, pid);
+    }
+
+    /// SPEC-PROBE-TS-003 — o byte inválido é preservado como evidência
+    /// separada da perda de alinhamento agregada.
+    #[test]
+    fn spec_probe_ts_003_sync_byte_error_is_distinct_from_sync_loss() {
+        let (sec_tx, _sec_rx) = bounded(64);
+        let (pes_tx, _pes_rx) = bounded(64);
+        let (evt_tx, evt_rx) = bounded(64);
+        let mut demuxer = TsDemuxer::new(sec_tx, pes_tx, evt_tx);
+
+        let mut chunk = vec![0xAA, 0xBB];
+        chunk.extend_from_slice(&build_payload_packet(PID_PAT, 0));
+        demuxer.process_chunk(&chunk);
+
+        let events: Vec<TsEvent> = evt_rx.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TsEvent::SyncByteError {
+                offset: 0,
+                got: 0xAA
+            }
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TsEvent::SyncLost { bytes_skipped: 2 })));
+    }
+
+    /// SPEC-PROBE-TS-005 — TEI vira evidência por PID sem interromper o
+    /// roteamento normal do pacote.
+    #[test]
+    fn spec_probe_ts_005_tei_emits_transport_error_and_keeps_demuxing() {
+        let (sec_tx, sec_rx) = bounded(64);
+        let (pes_tx, _pes_rx) = bounded(64);
+        let (evt_tx, evt_rx) = bounded(64);
+        let mut demuxer = TsDemuxer::new(sec_tx, pes_tx, evt_tx);
+        let mut packet = build_payload_packet(PID_PAT, 0);
+        packet[1] |= 0x80;
+
+        demuxer.process_chunk(&packet);
+
+        assert!(evt_rx
+            .try_iter()
+            .any(|event| matches!(event, TsEvent::TransportError { pid: PID_PAT })));
+        assert_eq!(sec_rx.try_iter().count(), 1, "TEI não derruba o roteamento");
+    }
+
+    /// SPEC-PROBE-TS-012 — apenas PES de PID elementar é observado; uma
+    /// regressão real de PTS abre evidência por PID sem decoder.
+    #[test]
+    fn spec_probe_ts_012_pts_regression_emits_event_for_elementary_pid() {
+        let (sec_tx, _sec_rx) = bounded(64);
+        let (pes_tx, _pes_rx) = bounded(64);
+        let (evt_tx, evt_rx) = bounded(64);
+        let mut demuxer = TsDemuxer::new(sec_tx, pes_tx, evt_tx);
+        let pid = 0x0120;
+        demuxer.register_av_pid(pid);
+
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&build_pes_packet(pid, 0, 90_000));
+        chunk.extend_from_slice(&build_pes_packet(pid, 1, 45_000));
+        demuxer.process_chunk(&chunk);
+
+        assert!(evt_rx.try_iter().any(|event| matches!(
+            event,
+            TsEvent::PtsError {
+                pid: 0x0120,
+                previous: 90_000,
+                current: 45_000
+            }
+        )));
     }
 
     /// Chunk sem nenhum sync byte válido emite SyncLost e não trava o demuxer.

@@ -18,14 +18,16 @@ use ts::Pid;
 
 use crate::check::{
     CheckEngine, CheckProfile, Measurement, CHECK_AUDIO_MISSING, CHECK_BAD_PAYLOAD_SIZE,
-    CHECK_CC_ERROR, CHECK_CRC_ERROR, CHECK_DEGRADED, CHECK_ENCAPSULATION_MISMATCH,
+    CHECK_CAT_ERROR, CHECK_CC_ERROR, CHECK_CRC_ERROR, CHECK_DEGRADED, CHECK_ENCAPSULATION_MISMATCH,
     CHECK_FEC_DUAL_STREAM, CHECK_FEC_D_RANGE, CHECK_FEC_LXD, CHECK_FEC_L_RANGE, CHECK_FEC_MISSING,
     CHECK_FEC_SSRC_MISMATCH, CHECK_FEC_UNEXPECTED, CHECK_FEED_UNAVAILABLE, CHECK_IAT_MAX,
-    CHECK_LOCAL_DROPS, CHECK_MULTI_SOURCE, CHECK_PCR_DISCONTINUITY, CHECK_PCR_ERROR,
+    CHECK_LOCAL_DROPS, CHECK_MULTI_SOURCE, CHECK_PAT_ERROR, CHECK_PCR_DISCONTINUITY,
+    CHECK_PCR_ERROR, CHECK_PID_ERROR, CHECK_PMT_ERROR, CHECK_PSI_MALFORMED, CHECK_PTS_ERROR,
     CHECK_RTP_DUPLICATE, CHECK_RTP_EXTENSION, CHECK_RTP_INVALID_PT, CHECK_RTP_LOSS_RATIO,
     CHECK_RTP_MARKER, CHECK_RTP_MISSING, CHECK_RTP_OUT_OF_ORDER, CHECK_RTP_PADDING,
     CHECK_RTP_REORDER, CHECK_RTP_SOURCE_RESTART, CHECK_RTP_SSRC_CHANGED, CHECK_RTP_TOO_OLD,
-    CHECK_SCHED_JITTER, CHECK_TS_PER_DATAGRAM, CHECK_TS_SYNC_LOSS, CHECK_VIDEO_MISSING,
+    CHECK_SCHED_JITTER, CHECK_SYNC_BYTE_ERROR, CHECK_TRANSPORT_ERROR, CHECK_TS_PER_DATAGRAM,
+    CHECK_TS_SYNC_LOSS, CHECK_VIDEO_MISSING,
 };
 use crate::clock::ProbeClock;
 use crate::config::{FecMode, ProbeConfig};
@@ -92,6 +94,29 @@ pub struct TickInput {
     /// Camada IP do segundo; `None` antes do primeiro datagrama ou quando o
     /// feed roda sem análise de rede (spec-14 §5).
     pub ip: Option<IpTick>,
+    /// Instantes das últimas tabelas PSI válidas recebidas pelo pipeline.
+    ///
+    /// `None` antes da primeira seção é desconhecido durante a grace window;
+    /// nunca é convertido em "ok" por omissão.
+    ///
+    /// SPEC-PROBE-TS-007 · SPEC-PROBE-TS-008 · SPEC-PROBE-TS-013
+    pub psi: PsiObservation,
+}
+
+/// Disponibilidade de PSI observada entre dois ticks da Probe.
+///
+/// Os instantes vêm do pipeline de tabelas depois do parse e CRC válidos; não
+/// há inferência baseada em pacote bruto ou em uma tabela malformada.
+///
+/// SPEC-PROBE-TS-007 · SPEC-PROBE-TS-008 · SPEC-PROBE-TS-013
+#[derive(Debug, Clone, Default)]
+pub struct PsiObservation {
+    /// `true` quando há um consumidor de PSI conectado ao pipeline. Sem isso,
+    /// ausência de timestamps é indisponibilidade, não falha.
+    pub source_active: bool,
+    pub pat_last_seen: Option<Instant>,
+    pub pmt_last_seen: BTreeMap<u16, Instant>,
+    pub cat_last_seen: Option<Instant>,
 }
 
 /// Motor de um feed.
@@ -424,7 +449,31 @@ impl ProbeEngine {
             degradation.stage_value(),
         ));
 
-        if input.connected {
+        if input.connected && self.cfg.transport.enabled {
+            for (pid, count) in &deltas.transport_errors_by_pid {
+                measurements.push(Measurement {
+                    check_id: CHECK_TRANSPORT_ERROR,
+                    context: pid_ctx(*pid),
+                    value: *count as f64,
+                    occurrences: *count,
+                });
+            }
+            for (pid, count) in &deltas.psi_malformed_by_pid {
+                measurements.push(Measurement {
+                    check_id: CHECK_PSI_MALFORMED,
+                    context: pid_ctx(*pid),
+                    value: *count as f64,
+                    occurrences: *count,
+                });
+            }
+            for (pid, count) in &deltas.pts_errors_by_pid {
+                measurements.push(Measurement {
+                    check_id: CHECK_PTS_ERROR,
+                    context: pid_ctx(*pid),
+                    value: *count as f64,
+                    occurrences: *count,
+                });
+            }
             for (pid, count) in &deltas.cc_by_pid {
                 measurements.push(Measurement {
                     check_id: CHECK_CC_ERROR,
@@ -461,6 +510,14 @@ impl ProbeEngine {
                 Measurement::counter(CHECK_TS_SYNC_LOSS, deltas.sync_loss as f64)
                     .with_context(net_ctx.clone()),
             );
+            measurements.push(
+                Measurement::counter(CHECK_SYNC_BYTE_ERROR, deltas.sync_byte_errors as f64)
+                    .with_context(net_ctx.clone()),
+            );
+            self.push_pid_rule_measurements(&input, &net_ctx, &mut measurements);
+            self.push_psi_measurements(&input, now, &mut measurements);
+        }
+        if input.connected {
             // O contador do `RtpStripper` só é usado quando **não** há camada IP
             // detalhada: com a spec-14 ligada, `rtp_missing`/`rtp_reorder` dizem
             // a mesma coisa com muito mais precisão, e manter os dois abriria
@@ -560,6 +617,87 @@ impl ProbeEngine {
 
         self.record_events(&events);
         events
+    }
+
+    /// Avalia somente regras explícitas do perfil; PID privado/desconhecido
+    /// sem regra não vira defeito por inferência.
+    ///
+    /// SPEC-PROBE-TS-009
+    fn push_pid_rule_measurements(
+        &self,
+        input: &TickInput,
+        net_ctx: &EventContext,
+        out: &mut Vec<Measurement>,
+    ) {
+        if self.cfg.transport.required_pids.is_empty()
+            && self.cfg.transport.forbidden_pids.is_empty()
+        {
+            return;
+        }
+
+        let observed: std::collections::BTreeSet<Pid> = input
+            .metrics
+            .as_ref()
+            .into_iter()
+            .flat_map(|m| m.pid_table.iter().map(|entry| entry.pid))
+            .collect();
+        for pid in &self.cfg.transport.required_pids {
+            if !observed.contains(pid) {
+                out.push(
+                    Measurement::gauge(CHECK_PID_ERROR, 1.0)
+                        .with_context(EventContext::pid(*pid).with_origin(net_ctx.origin)),
+                );
+            }
+        }
+        for pid in &self.cfg.transport.forbidden_pids {
+            if observed.contains(pid) {
+                out.push(
+                    Measurement::gauge(CHECK_PID_ERROR, 1.0)
+                        .with_context(EventContext::pid(*pid).with_origin(net_ctx.origin)),
+                );
+            }
+        }
+    }
+
+    /// Avalia ausência ou expiração de tabelas somente depois da grace window.
+    ///
+    /// SPEC-PROBE-TS-007 · SPEC-PROBE-TS-008 · SPEC-PROBE-TS-013
+    fn push_psi_measurements(&self, input: &TickInput, now: Instant, out: &mut Vec<Measurement>) {
+        if !input.psi.source_active {
+            return;
+        }
+        if now.duration_since(self.started_mono) < self.cfg.psi_grace() {
+            return;
+        }
+        let expired = |seen: Option<Instant>, limit: std::time::Duration| {
+            seen.is_none_or(|at| now.saturating_duration_since(at) > limit)
+        };
+        out.push(Measurement::gauge(
+            CHECK_PAT_ERROR,
+            f64::from(u8::from(expired(
+                input.psi.pat_last_seen,
+                self.cfg.pat_max_interval(),
+            ))),
+        ));
+        for service in &input.services {
+            let missing = expired(
+                input.psi.pmt_last_seen.get(&service.service_id).copied(),
+                self.cfg.pmt_max_interval(),
+            );
+            out.push(
+                Measurement::gauge(CHECK_PMT_ERROR, f64::from(u8::from(missing)))
+                    .with_context(EventContext::network().with_service(service.service_id)),
+            );
+        }
+        if self.cfg.transport.ca_required {
+            out.push(Measurement::gauge(
+                CHECK_CAT_ERROR,
+                f64::from(u8::from(expired(
+                    input.psi.cat_last_seen,
+                    self.cfg.pat_max_interval(),
+                ))),
+            ));
+        }
     }
 
     /// Leva a camada IP ao motor de checks.
@@ -765,11 +903,7 @@ impl ProbeEngine {
         for info in &input.services {
             let owned: Vec<&crate::check::OpenCheck> =
                 open.iter().filter(|o| info.owns(&o.context)).collect();
-            let worst = owned
-                .iter()
-                .map(|o| o.severity)
-                .chain(feed_wide)
-                .max();
+            let worst = owned.iter().map(|o| o.severity).chain(feed_wide).max();
 
             let applicable = Self::service_layers(info);
             let layer_health = self
@@ -1161,6 +1295,142 @@ mod tests {
             snapshot_state: SnapshotState::Ok,
             ..Default::default()
         }
+    }
+
+    /// SPEC-PROBE-TS-003/005/006 — os fatos promovidos do `ts` abrem checks
+    /// independentes, com contexto de PID quando a evidência o possui.
+    #[test]
+    fn spec_probe_ts_003_transport_facts_open_distinct_checks() {
+        let clock = Arc::new(TestClock::new());
+        let mut eng = engine(clock.clone());
+
+        let baseline = metrics(15_000.0, &[], 0);
+        eng.tick(connected_input(baseline));
+        clock.advance(Duration::from_secs(1));
+
+        let mut observed = metrics(15_000.0, &[], 1);
+        observed.errors.sync_byte_errors = 1;
+        observed.errors.transport_errors.insert(0x0100, 1);
+        observed.errors.psi_malformed.insert(0x0000, 1);
+        observed.errors.pts_errors.insert(100, 1);
+        let events = eng.tick(connected_input(observed));
+
+        assert!(events
+            .iter()
+            .any(|event| event.check_id == CHECK_TS_SYNC_LOSS));
+        assert!(events
+            .iter()
+            .any(|event| event.check_id == CHECK_SYNC_BYTE_ERROR));
+        assert!(events.iter().any(|event| {
+            event.check_id == CHECK_TRANSPORT_ERROR && event.context.pid == Some(0x0100)
+        }));
+        assert!(events.iter().any(|event| {
+            event.check_id == CHECK_PSI_MALFORMED && event.context.pid == Some(0x0000)
+        }));
+        assert!(events
+            .iter()
+            .any(|event| { event.check_id == CHECK_PTS_ERROR && event.context.pid == Some(100) }));
+    }
+
+    /// SPEC-PROBE-TS-009 — apenas regras explícitas classificam PIDs; PID
+    /// privado ou desconhecido não é defeito por mera presença.
+    #[test]
+    fn spec_probe_ts_009_pid_rules_are_declarative() {
+        let clock = Arc::new(TestClock::new());
+        let mut cfg = ProbeConfig::default();
+        cfg.transport.required_pids = vec![0x0200];
+        cfg.transport.forbidden_pids = vec![100];
+        let mut eng = ProbeEngine::new(
+            FeedIdentity {
+                slot: 0,
+                name: "f".into(),
+                url: "udp://@239.0.0.1:1234".into(),
+                fec: FecMode::Off,
+            },
+            cfg,
+            clock,
+            None,
+            None,
+        );
+
+        let events = eng.tick(connected_input(metrics(15_000.0, &[], 0)));
+        let pids: Vec<u16> = events
+            .iter()
+            .filter(|event| event.check_id == CHECK_PID_ERROR)
+            .filter_map(|event| event.context.pid)
+            .collect();
+        assert_eq!(pids.len(), 2);
+        assert!(pids.contains(&100));
+        assert!(pids.contains(&0x0200));
+    }
+
+    /// SPEC-PROBE-TS-007/008/013 — PAT/PMT/CAT só são avaliadas depois da
+    /// grace window; PMT mantém o contexto do serviço que a PAT anunciou.
+    #[test]
+    fn spec_probe_ts_007_psi_availability_uses_grace_and_service_context() {
+        let clock = Arc::new(TestClock::new());
+        let mut cfg = ProbeConfig::default();
+        cfg.transport.psi_grace_secs = 1.0;
+        cfg.transport.pat_max_interval_secs = 5.0;
+        cfg.transport.pmt_max_interval_secs = 5.0;
+        cfg.transport.ca_required = true;
+        let mut eng = ProbeEngine::new(
+            FeedIdentity {
+                slot: 0,
+                name: "f".into(),
+                url: "udp://@239.0.0.1:1234".into(),
+                fec: FecMode::Off,
+            },
+            cfg,
+            clock.clone(),
+            None,
+            None,
+        );
+        let service = ServiceInfo {
+            service_id: 42,
+            ..Default::default()
+        };
+        let fresh = Instant::now();
+        let input = TickInput {
+            metrics: Some(metrics(15_000.0, &[], 0)),
+            connected: true,
+            services: vec![service.clone()],
+            psi: PsiObservation {
+                source_active: true,
+                pat_last_seen: Some(fresh),
+                pmt_last_seen: BTreeMap::from([(42, fresh)]),
+                cat_last_seen: Some(fresh),
+            },
+            ..Default::default()
+        };
+
+        assert!(
+            eng.tick(input.clone()).is_empty(),
+            "grace suprime ausência inicial"
+        );
+        clock.advance(Duration::from_secs(1));
+        assert!(
+            eng.tick(input.clone()).is_empty(),
+            "PSI válida não abre alarme"
+        );
+
+        let absent_pmt_cat = TickInput {
+            psi: PsiObservation {
+                source_active: true,
+                pat_last_seen: Some(Instant::now()),
+                ..Default::default()
+            },
+            ..input
+        };
+        let events = eng.tick(absent_pmt_cat);
+        assert!(events.iter().any(|event| {
+            event.check_id == CHECK_PMT_ERROR && event.context.service_id == Some(42)
+        }));
+        assert!(events.iter().any(|event| event.check_id == CHECK_CAT_ERROR));
+        assert!(
+            !events.iter().any(|event| event.check_id == CHECK_PAT_ERROR),
+            "PAT fresca não pode ser confundida com PMT/CAT ausente"
+        );
     }
 
     /// Entrada com a PMT já conhecida e os bitrates A/V que a Probe deve

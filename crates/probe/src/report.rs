@@ -220,10 +220,7 @@ fn render_ip_section(html: &mut String, feed: &FeedSnapshot) {
         return;
     };
     let opt = |v: Option<f64>, unit: &str| {
-        v.map_or_else(
-            || "n/a".to_string(),
-            |x| format!("{x:.1} {unit}"),
-        )
+        v.map_or_else(|| "n/a".to_string(), |x| format!("{x:.1} {unit}"))
     };
 
     html.push_str("<h3>Rede</h3><ul class=\"health\">");
@@ -279,7 +276,11 @@ duplicados <b>{d}</b> · too old <b>{t}</b></li>\
             html,
             "<li>FEC: <b>{present}</b> · matriz <b>{matrix}</b> · fluxos <b>{streams}</b> · \
 overhead <b>{over}</b></li>",
-            present = if ip.fec.present { "presente" } else { "ausente" },
+            present = if ip.fec.present {
+                "presente"
+            } else {
+                "ausente"
+            },
             matrix = ip.fec.matrix_label(),
             streams = ip.fec.streams,
             over = ip
@@ -502,9 +503,9 @@ footer{margin-top:40px;padding-top:12px;border-top:1px solid #20262e;color:#5f6b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::Encapsulation;
     use crate::event::EventPhase;
     use crate::series::SeriesPoints;
+    use crate::session::Encapsulation;
     use crate::snapshot::EventRow;
     use std::collections::BTreeMap;
 
@@ -701,7 +702,10 @@ mod tests {
         };
         let html = render_run_report(&snapshot);
 
-        assert!(html.contains("<h3>Rede</h3>"), "o relatório precisa da camada IP");
+        assert!(
+            html.contains("<h3>Rede</h3>"),
+            "o relatório precisa da camada IP"
+        );
         assert!(html.contains("RTP+FEC"));
         assert!(html.contains("10.0.0.9"));
         assert!(html.contains("701.9 µs"));
@@ -733,7 +737,10 @@ mod tests {
         let html = render_run_report(&snapshot);
 
         assert!(html.contains("<h3>Rede</h3>"));
-        assert!(!html.contains("razão de perda"), "sem RTP, sem razão de perda");
+        assert!(
+            !html.contains("razão de perda"),
+            "sem RTP, sem razão de perda"
+        );
         assert!(!html.contains("FEC:"), "sem RTP, sem bloco de FEC");
     }
 
